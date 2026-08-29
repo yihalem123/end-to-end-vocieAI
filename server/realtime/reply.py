@@ -142,7 +142,7 @@ class ReplyController:
         registry.record_turn(**{k: v for k, v in timings.items() if k.endswith("_ms")})
         self.guard.on_agent_audio_end()
         text = " ".join(self._speaker.sentences)
-        self._state.replies.append({"text": text, "interrupted": False})
+        self._state.conversation.append({"role": "agent", "text": text, "interrupted": False})
         await self._send({"type": "agent", "text": text,
                           "interrupted": False, "audio": True})
 
@@ -157,7 +157,7 @@ class ReplyController:
         text = " ".join(sentences)
         if isinstance(self._engine, LlmEngine) and self._engine.last_ttft_ms:
             registry.record_turn(llm_ttft_ms=self._engine.last_ttft_ms)
-        self._state.replies.append({"text": text, "interrupted": False})
+        self._state.conversation.append({"role": "agent", "text": text, "interrupted": False})
         await self._send({"type": "agent", "text": text, "interrupted": False,
                           "audio": False})
 
@@ -176,7 +176,7 @@ class ReplyController:
         if self._speaker is None:
             return
         spoken, _ = self._speaker.truncate(played_samples)
-        self._state.replies.append({"text": spoken, "interrupted": True})
+        self._state.conversation.append({"role": "agent", "text": spoken, "interrupted": True})
         await self._send({"type": "agent", "text": spoken, "interrupted": True,
                           "audio": True})
 

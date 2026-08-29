@@ -17,15 +17,21 @@ transport-only; pipeline logic lives with the pipeline. The echo handler uses ra
 ws.receive() because only it accepts both text and binary in one loop; raw
 receive() reports disconnect as a message type, not an exception.
 """
+import asyncio
 import logging
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.config import Settings, get_settings
 from server.metrics import registry
+from server.postcall.report import render_html, reports as report_store, run_postcall
 from server.realtime.call import CallSession
+
+_postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +54,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def metrics() -> dict:
         return registry.snapshot()
 
+    @app.get("/calls")
+    async def calls() -> list[dict]:
+        return [{"call_id": cid,
+                 "score": rep.get("score"),
+                 "needs_review": rep.get("needs_review"),
+                 "knocked_out": rep.get("knocked_out"),
+                 "created_at": rep.get("created_at")}
+                for cid, rep in reversed(report_store.items())]
+
+    @app.get("/report/{call_id}")
+    async def report_json(call_id: str) -> dict:
+        if call_id not in report_store:
+            raise HTTPException(status_code=404, detail="no such call")
+        return report_store[call_id]
+
+    @app.get("/report/{call_id}/view")
+    async def report_view(call_id: str) -> HTMLResponse:
+        if call_id not in report_store:
+            raise HTTPException(status_code=404, detail="no such call")
+        return HTMLResponse(render_html(report_store[call_id]))
+
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:
         session = CallSession(ws, app.state.settings)
@@ -61,6 +88,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await ws.close(code=1011)
             except RuntimeError:
                 pass  # already closed
+        finally:
+            state = session.state
+            if state.conversation and app.state.settings.openai_api_key:
+                call_id = uuid.uuid4().hex[:12]
+                task = asyncio.create_task(run_postcall(
+                    call_id, state.conversation, state.turns, app.state.settings))
+                _postcall_tasks.add(task)
+                task.add_done_callback(_postcall_tasks.discard)
+                log.info("postcall started: /report/%s/view", call_id)
 
     @app.websocket("/ws/echo")
     async def ws_echo(ws: WebSocket) -> None:

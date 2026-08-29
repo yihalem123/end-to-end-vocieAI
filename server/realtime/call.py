@@ -64,7 +64,9 @@ class ClientChat:
 @dataclass
 class CallState:
     turns: list[TurnComplete] = field(default_factory=list)
-    replies: list[dict] = field(default_factory=list)
+    # Ordered conversation log — the post-call transcript source of truth.
+    # Entries: {"role": "caller"|"agent", "text": ..., "interrupted": bool?}
+    conversation: list[dict] = field(default_factory=list)
     frames_in: int = 0
     frames_dropped: int = 0
     vad_events_dropped: int = 0
@@ -104,8 +106,8 @@ class CallSession:
         finally:
             await replies.close()
             log.info(
-                "call ended: %d turns, %d replies, %d frames in, %d dropped",
-                len(self.state.turns), len(self.state.replies),
+                "call ended: %d turns, %d conversation entries, %d frames in, %d dropped",
+                len(self.state.turns), len(self.state.conversation),
                 self.state.frames_in, self.state.frames_dropped,
             )
 
@@ -198,6 +200,7 @@ class CallSession:
                 case ClientCleared(played_samples=played):
                     await self._replies.on_cleared(played)
                 case ClientChat(text=text):
+                    self.state.conversation.append({"role": "caller", "text": text})
                     await self._send({"type": "you", "text": text})
                     await self._replies.on_chat(text)
                 case None:
@@ -205,6 +208,8 @@ class CallSession:
             turn = turn or self._endpointer.tick(now)
             if turn is not None:
                 self.state.turns.append(turn)
+                self.state.conversation.append(
+                    {"role": "caller", "text": turn.transcript})
                 registry.record_turn(endpoint_delay_ms=turn.endpoint_delay * 1000)
                 await self._send({
                     "type": "turn",

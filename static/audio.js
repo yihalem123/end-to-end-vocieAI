@@ -152,6 +152,28 @@ function stop(reason) {
   ws = null; ctx = null; stream = null;
   els.btn.textContent = "Start";
   setStatus(reason || "stopped");
+  pollForReport(6);  // post-call extraction takes a few seconds
+}
+
+async function pollForReport(attemptsLeft) {
+  if (attemptsLeft <= 0) return;
+  try {
+    const calls = await fetch("/calls").then((r) => r.json());
+    if (calls.length && calls[0].call_id !== pollForReport.shown) {
+      pollForReport.shown = calls[0].call_id;
+      const div = document.createElement("div");
+      div.className = "line agent";
+      const a = document.createElement("a");
+      a.href = `/report/${calls[0].call_id}/view`;
+      a.target = "_blank";
+      a.textContent = `📋 call report ready (score ${calls[0].score ?? "?"})`;
+      div.appendChild(a);
+      els.convo.appendChild(div);
+      els.convo.scrollTop = els.convo.scrollHeight;
+      return;
+    }
+  } catch { /* server briefly busy; retry */ }
+  setTimeout(() => pollForReport(attemptsLeft - 1), 2500);
 }
 
 window.addEventListener("DOMContentLoaded", () => {
