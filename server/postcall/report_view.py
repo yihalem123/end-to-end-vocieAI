@@ -98,6 +98,11 @@ details[open].card summary::after { content:"▴" }
 .dl { padding:6px 11px; border-radius:100px; background:rgba(255,255,255,.03);
       border:1px solid; font:500 12px ui-monospace,Menlo,monospace; white-space:nowrap }
 .flags { padding:14px 32px; font:400 13px 'Space Grotesk'; color:rgba(232,233,240,.6) }
+.advisory { font:500 11px 'Space Grotesk'; letter-spacing:.06em;
+            text-transform:uppercase; color:#e5b96d }
+.ai-title { font:600 13px 'Space Grotesk'; color:#c3caff; margin-bottom:4px }
+.ai-text { font:400 13.5px/1.6 'Space Grotesk'; color:rgba(232,233,240,.75);
+           white-space:pre-line; max-width:860px }
 """
 
 
@@ -217,6 +222,22 @@ def _quality(report: dict) -> str:
             f'<div class="dl-body">{chips}</div></details>')
 
 
+def _ai_notes(report: dict) -> str:
+    """Configured advisory analyses — visually distinct, explicitly unscored."""
+    items = report.get("analyses") or []
+    if not items:
+        return ""
+    rows = "".join(
+        f'<div><div class="ai-title">{escape(str(a.get("title", "")))}</div>'
+        f'<div class="ai-text">{escape(str(a.get("text", "")))}</div></div>'
+        for a in items)
+    return ('<div class="card pad" style="border-style:dashed;'
+            'border-color:rgba(124,140,248,.3)">'
+            '<div class="card-head"><span class="label">AI notes</span>'
+            '<span class="advisory">advisory — not part of the score</span></div>'
+            f'{rows}</div>')
+
+
 def _unanchored(report: dict) -> str:
     """Evidence that could not be anchored to a conversation utterance must
     still be visible (quarantined goldens, missing ids): lossless fallback."""
@@ -283,6 +304,7 @@ def render_report_html(report: dict) -> str:
 </div>
 {_unanchored(report)}
 {_breakdown(report, big)}
+{_ai_notes(report)}
 {_audit(report)}
 {_quality(report)}
 </div></div></body></html>"""

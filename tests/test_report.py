@@ -37,7 +37,10 @@ def sample_report() -> dict:
     class Turn:
         endpoint_delay = 0.295
 
-    return build_report("abc123", conversation, [Turn()], extracted, result)
+    analyses = [{"id": "summary", "title": "Call summary",
+                 "text": "Candidate confirmed six and a half years of ICU work."}]
+    return build_report("abc123", conversation, [Turn()], extracted, result,
+                        analyses=analyses)
 
 
 def test_build_report_shape() -> None:
@@ -57,6 +60,9 @@ def test_render_html_includes_verdict_fields_and_transcript() -> None:
     assert "icu_years" in html and "6.5" in html
     assert "Six and a half." in html           # transcript replay
     assert "✓ verified 0.99" in html           # chip anchored to the utterance
+    assert "AI notes" in html                  # configured advisory analyses...
+    assert "advisory — not part of the score" in html  # ...explicitly unscored
+    assert "six and a half years of ICU work" in html
     assert "<script" not in html               # escaped, JS-free output
 
 

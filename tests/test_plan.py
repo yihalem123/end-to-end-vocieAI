@@ -145,3 +145,22 @@ def test_history_is_bounded_window() -> None:
         st.add_history("user" if i % 2 else "assistant", f"line {i}")
     assert len(st.recent_history(8)) == 8
     assert st.recent_history(8)[-1]["content"] == "line 29"
+
+
+def test_plan_analyses_are_configured_data() -> None:
+    plan = load_plan(PLAN_PATH)
+    assert [a.id for a in plan.analyses] == ["summary", "followups",
+                                            "interviewer_notes"]
+    assert all(a.title and a.instruction for a in plan.analyses)
+
+
+def test_plan_rejects_duplicate_analysis_ids(tmp_path) -> None:
+    bad = tmp_path / "bad.yaml"
+    bad.write_text(
+        "persona: p\nconsent: c\nsteps:\n  - field: a\n    type: str\n"
+        "analyses:\n  - {id: x, title: t, instruction: i}\n"
+        "  - {id: x, title: t2, instruction: i2}\n"
+        "scoring_version: v1\n"
+    )
+    with pytest.raises(ValueError, match="duplicate analysis"):
+        load_plan(bad)

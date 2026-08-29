@@ -37,6 +37,15 @@ class Step:
 
 
 @dataclass(frozen=True)
+class Analysis:
+    """One configured post-call ADVISORY analysis (plan is data): the LLM
+    writes it after the call; it is never an input to scores or knockouts."""
+    id: str
+    title: str
+    instruction: str
+
+
+@dataclass(frozen=True)
 class InterviewPlan:
     persona: str
     consent: str
@@ -44,6 +53,7 @@ class InterviewPlan:
     weights: dict[str, float]
     scoring_version: str
     language: str = "en"
+    analyses: tuple[Analysis, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -66,6 +76,12 @@ def load_plan(path: Path) -> InterviewPlan:
     for w in weights:
         if w not in step_fields:
             raise ValueError(f"weights reference unknown field {w!r}")
+    analyses = tuple(Analysis(id=str(a["id"]), title=str(a["title"]),
+                              instruction=str(a["instruction"]))
+                     for a in raw.get("analyses", []))
+    ids = [a.id for a in analyses]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"duplicate analysis id in {sorted(ids)}")
     return InterviewPlan(
         persona=raw["persona"],
         consent=raw["consent"],
@@ -73,6 +89,7 @@ def load_plan(path: Path) -> InterviewPlan:
         weights=weights,
         scoring_version=raw["scoring_version"],
         language=raw.get("language", "en"),
+        analyses=analyses,
     )
 
 

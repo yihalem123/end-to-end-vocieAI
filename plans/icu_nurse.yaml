@@ -36,6 +36,25 @@ steps:
   - field: pay_expectation
     type: str
     ask: "What hourly rate are you looking for?"
+# Post-call analyses: ADVISORY notes the LLM writes after the call. Rendered
+# in their own clearly-labeled report section; never part of score/knockouts.
+analyses:
+  - id: summary
+    title: "Call summary"
+    instruction: >
+      Summarize this screening call in 3-4 sentences: what was established,
+      how cooperative and clear the candidate was, and the overall outcome.
+  - id: followups
+    title: "Suggested follow-up questions"
+    instruction: >
+      List the 3 most useful follow-up questions a human interviewer should
+      ask next, each grounded in a gap, hedge, or ambiguity in this transcript.
+  - id: interviewer_notes
+    title: "Interviewer notes"
+    instruction: >
+      Note hesitations, hedged answers, contradictions, or communication
+      issues, each tied to what the candidate actually said. If there were
+      none, say so plainly.
 weights:
   icu_years: 0.4
   certifications: 0.3

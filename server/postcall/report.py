@@ -9,6 +9,7 @@ database is a production talking point, not a demo requirement. build_report()
 is pure so the report shape is unit-testable without the vendor call; the HTML
 view lives in report_view.py (the Call Report design canvas).
 """
+import asyncio
 import logging
 import time
 from collections import OrderedDict
@@ -17,6 +18,7 @@ from pathlib import Path
 
 from server.config import Settings
 from server.engine.plan import load_plan_cached
+from server.postcall.analyze import analyze_call
 from server.postcall.extract import Extracted, extract_call
 from server.postcall.report_view import render_report_html
 from server.postcall.score import ScoreResult, score_call
@@ -31,8 +33,10 @@ reports: OrderedDict[str, dict] = OrderedDict()
 def build_report(call_id: str, conversation: list[dict], turns: list,
                  extracted: dict[str, Extracted], result: ScoreResult,
                  session_state: str = SessionStatus.COMPLETED,
-                 tool_ledger: list[dict] | None = None) -> dict:
+                 tool_ledger: list[dict] | None = None,
+                 analyses: list[dict] | None = None) -> dict:
     return {
+        "analyses": list(analyses or []),
         "call_id": call_id,
         "session_state": session_state,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -83,11 +87,22 @@ async def run_postcall(call_id: str, conversation: list[dict], turns: list,
                        tool_ledger: list[dict] | None = None) -> None:
     try:
         plan = load_plan_cached(str(settings.plan_path))
-        extracted = await extract_call(settings, plan, conversation)
+
+        async def safe_analyses() -> list[dict]:
+            # Advisory notes must never fail the evidence pipeline.
+            try:
+                return await analyze_call(settings, plan, conversation)
+            except Exception:
+                log.exception("advisory analyses failed for %s", call_id)
+                return []
+
+        extracted, analyses = await asyncio.gather(
+            extract_call(settings, plan, conversation), safe_analyses())
         result = score_call(plan, extracted)
         report = build_report(
             call_id, conversation, turns, extracted, result,
-            session_state=SessionStatus.COMPLETED, tool_ledger=tool_ledger)
+            session_state=SessionStatus.COMPLETED, tool_ledger=tool_ledger,
+            analyses=analyses)
         if lifecycle is not None:
             lifecycle.transition(SessionStatus.COMPLETED)
         _store(call_id, report)
