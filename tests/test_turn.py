@@ -9,6 +9,7 @@ from server.engine.turn import (
     SentenceChunker,
     StreamAssembler,
     build_system_prompt,
+    fallback_line,
 )
 
 PLAN_PATH = Path(__file__).resolve().parents[1] / "plans" / "icu_nurse.yaml"
@@ -123,3 +124,26 @@ def test_system_prompt_contains_step_and_state() -> None:
     assert "Which state is your RN license in" in prompt      # current step's ask
     assert "consent" in prompt                                # filled field listed
     assert "pay_expectation" in prompt                        # remaining coverage listed
+
+
+def test_system_prompt_targets_first_unfilled_even_if_cursor_lags() -> None:
+    # Live regression: the model recorded answers without calling advance_step,
+    # so the prompt kept re-asking consent. The objective must track need.
+    state = InterviewState(load_plan(PLAN_PATH))
+    state.record("consent", True, quote="yes")
+    state.record("rn_license_state", "Texas", quote="Texas")
+    prompt = build_system_prompt(state)                       # cursor still at consent
+    assert "How many years of ICU experience" in prompt       # next ASKABLE step
+    assert "rn_license_active" in prompt                      # still listed as needed
+
+
+def test_fallback_line_speaks_the_plan_verbatim() -> None:
+    # Live regression: tools-only responses produced silent turns. The plan's
+    # own ask text is the deterministic never-silent fallback.
+    state = InterviewState(load_plan(PLAN_PATH))
+    state.record("consent", True, quote="yes")
+    assert fallback_line(state) == "Which state is your RN license in, and is it currently active?"
+    fill = {"bool": True, "float": 1.0, "list": ["x"], "str": "x"}
+    for s in state.plan.steps:
+        state.record(s.field, fill[s.type], quote="q")
+    assert "thank" in fallback_line(state).lower()            # done: wrap-up line

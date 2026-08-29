@@ -160,25 +160,48 @@ class StreamAssembler:
         return []
 
 
+def fallback_line(state: InterviewState) -> str:
+    """Deterministic reply when the model returns tools but no text (a silent
+    turn is never acceptable in voice). The plan's own words are the script."""
+    if state.knocked_out:
+        return ("Thanks for your time today. Unfortunately this role requires "
+                "that, so we won't move forward — but thank you for talking with me.")
+    step = state.next_askable
+    if step is not None:
+        return step.ask if step.ask else state.plan.consent
+    needed = state.next_needed
+    if needed is not None:  # only ask-less fields remain: confirm explicitly
+        return f"One more thing to confirm: {needed.field.replace('_', ' ')}?"
+    return "That's everything I needed — thank you for your time today!"
+
+
 def build_system_prompt(state: InterviewState) -> str:
     plan = state.plan
     filled = "\n".join(f"- {name}: {rec.value!r} (they said: \"{rec.quote}\")"
                        for name, rec in state.fields.items()) or "- none yet"
     remaining = ", ".join(s.field for s in plan.steps
                           if s.field not in state.fields) or "none"
-    step = state.current_step
-    ask = step.ask if step.ask else plan.consent
+    # Target NEED (first unfilled, askable step), not the cursor: the model may
+    # record answers without signaling advance_step, and must not re-ask
+    # stale steps. Ask-less steps are covered opportunistically or confirmed.
+    step = state.next_askable
     if state.knocked_out:
         objective = ("The caller did not pass a required check "
                      f"({state.knocked_out}). Politely wrap up the call now.")
-    elif state.done:
-        objective = "All questions are covered. Thank them and wrap up the call."
+    elif step is not None:
+        ask = step.ask if step.ask else plan.consent
+        objective = f'Next question to get answered: "{ask}"'
+    elif state.next_needed is not None:
+        objective = (f"Only {state.next_needed.field} still needs confirming — "
+                     "ask for it directly, then wrap up.")
     else:
-        objective = f'Current question to get answered: "{ask}"'
+        objective = "All questions are covered. Thank them and wrap up the call."
     return f"""{plan.persona}
 
 You are conducting a structured screening interview. Rules:
 - Ask ONE question at a time. Keep replies to one or two short sentences.
+- ALWAYS include a spoken reply for the caller. Never respond with only tool
+  calls — a silent turn is a broken phone call.
 - Every time the caller answers, call record_answer with the field name, the
   answer, and their VERBATIM words as the quote. If they volunteer other
   fields' answers, record those too.
@@ -244,7 +267,12 @@ class LlmEngine:
         tail = chunker.flush()
         if tail:
             yield tail
+        # Tools first so the fallback sees the state they just updated.
         self._apply_tools(assembler.tool_calls)
+        if not "".join(reply_parts).strip():
+            line = fallback_line(state)  # tools-only turn: never go silent
+            reply_parts.append(line)
+            yield line
         state.add_history("assistant", "".join(reply_parts))
 
     def _apply_tools(self, calls: list[ToolCall]) -> None:

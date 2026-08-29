@@ -91,6 +91,35 @@ def test_done_only_after_all_steps() -> None:
     assert st.done
 
 
+def test_next_needed_ignores_cursor_lag() -> None:
+    # The model may record answers without ever signaling advance_step; the
+    # prompt must still point at the first genuinely unanswered step.
+    st = make_state()
+    st.record("consent", True, quote="yes")
+    st.record("rn_license_state", "Texas", quote="Texas")
+    assert st.current_step.field == "consent"          # cursor never moved
+    assert st.next_needed is not None
+    assert st.next_needed.field == "rn_license_active"  # but the need is clear
+
+
+def test_next_needed_none_when_all_filled() -> None:
+    st = make_state()
+    fill = {"bool": True, "float": 1.0, "list": ["x"], "str": "x"}
+    for s in st.plan.steps:
+        assert st.record(s.field, fill[s.type], quote="q")
+    assert st.next_needed is None
+
+
+def test_next_askable_skips_askless_steps() -> None:
+    # rn_license_active has no ask text: it rides along with the license
+    # question, so it can never be the spoken objective itself.
+    st = make_state()
+    st.record("consent", True, quote="yes")
+    st.record("rn_license_state", "Texas", quote="Texas")
+    assert st.next_needed.field == "rn_license_active"
+    assert st.next_askable.field == "icu_years"
+
+
 def test_history_is_bounded_window() -> None:
     st = make_state()
     for i in range(30):

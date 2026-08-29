@@ -101,6 +101,25 @@ class InterviewState:
     def done(self) -> bool:
         return self.step_idx >= len(self.plan.steps)
 
+    @property
+    def next_needed(self) -> Step | None:
+        """First step with no recorded answer — tracks NEED, not the cursor.
+        The prompt targets need so a model that records answers without ever
+        signaling advance_step still gets pointed at the right question."""
+        return next((s for s in self.plan.steps if s.field not in self.fields), None)
+
+    @property
+    def next_askable(self) -> Step | None:
+        """First unfilled step that has words to ask with. Ask-less steps
+        (knockout companions like rn_license_active) are filled as side effects
+        of other questions and can't be the spoken objective themselves."""
+        for i, s in enumerate(self.plan.steps):
+            if s.field in self.fields:
+                continue
+            if s.ask is not None or i == 0:  # step 0 asks via plan.consent
+                return s
+        return None
+
     def record(self, field: str, value: Any, quote: str) -> bool:
         step = next((s for s in self.plan.steps if s.field == field), None)
         if step is None:
