@@ -11,9 +11,11 @@ create_app() builds the app so tests can construct fresh instances; the module-l
 `app` is what `uvicorn server.app:app` imports. Route registration order matters:
 /healthz and /ws/call are declared before the StaticFiles mount at "/" because the
 mount is a catch-all — anything declared after it would be shadowed. html=True makes
-the mount serve static/index.html for "/". /ws/call is a bare text echo in Phase 0:
-it proves the WebSocket upgrade path through uvicorn works before any audio exists;
-Phase 1 replaces the loop body with binary frame handling.
+the mount serve static/index.html for "/". /ws/call (Phase 1) echoes both message
+kinds: binary frames are the audio path (640-byte 20 ms PCM16 from the browser);
+text remains for control/debug. We use the low-level ws.receive() instead of
+receive_text()/receive_bytes() because only it lets one loop accept either kind —
+the typed helpers raise on a mismatched message type.
 """
 from pathlib import Path
 
@@ -35,8 +37,15 @@ def create_app() -> FastAPI:
         await ws.accept()
         try:
             while True:
-                text = await ws.receive_text()
-                await ws.send_text(text)
+                message = await ws.receive()
+                # Raw receive() does NOT raise WebSocketDisconnect (only the typed
+                # helpers do) — the disconnect arrives as a message we must handle.
+                if message["type"] == "websocket.disconnect":
+                    break
+                if message.get("bytes") is not None:
+                    await ws.send_bytes(message["bytes"])
+                elif message.get("text") is not None:
+                    await ws.send_text(message["text"])
         except WebSocketDisconnect:
             pass
 

@@ -18,6 +18,19 @@ def test_index_page_served() -> None:
     assert "text/html" in resp.headers["content-type"]
 
 
+def test_ws_call_echoes_binary_frames() -> None:
+    # Phase 1: the browser sends 20 ms PCM16 frames (640 bytes) as binary messages;
+    # the echo path must return them byte-identical and in order.
+    frame_a = bytes(range(256)) * 2 + bytes(128)  # 640 bytes, non-trivial payload
+    frame_b = bytes(reversed(frame_a))
+    client = TestClient(app)
+    with client.websocket_connect("/ws/call") as ws:
+        ws.send_bytes(frame_a)
+        assert ws.receive_bytes() == frame_a
+        ws.send_bytes(frame_b)
+        assert ws.receive_bytes() == frame_b
+
+
 def test_ws_call_echoes_text() -> None:
     client = TestClient(app)
     with client.websocket_connect("/ws/call") as ws:
