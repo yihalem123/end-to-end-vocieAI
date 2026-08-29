@@ -38,6 +38,12 @@ log = logging.getLogger(__name__)
 
 KEEPALIVE_IDLE_SEC = 4  # Deepgram closes after 10 s of silence; stay well under
 
+FINALIZE = "finalize"  # audio-queue control marker -> {"type":"Finalize"}.
+# Why: Deepgram's own endpointing finalizes short utterances ("Five.") only
+# after 1.5-3.5 s. Our local VAD knows the caller stopped ~100 ms in, so on
+# vad_stop we queue this marker and Deepgram flushes finals immediately —
+# measured endpoint_delay drops from ~1.5 s p50 to the fast-timer floor.
+
 
 @dataclass(frozen=True)
 class AsrPartial:
@@ -125,6 +131,9 @@ class DeepgramSession:
             if frame is None:  # end-of-call sentinel
                 await ws.send(json.dumps({"type": "CloseStream"}))
                 return
+            if frame is FINALIZE:  # VAD said speech stopped: flush finals now
+                await ws.send(json.dumps({"type": "Finalize"}))
+                continue
             await ws.send(frame)
 
     async def _recv_loop(self, ws) -> None:

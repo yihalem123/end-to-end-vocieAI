@@ -1,8 +1,17 @@
-"""Deepgram URL construction and message parsing (pure parts of asr.py)."""
+"""Deepgram URL construction, message parsing, and send-loop control frames."""
+import asyncio
 import json
 from urllib.parse import parse_qs, urlparse
 
-from server.realtime.asr import AsrFinal, AsrPartial, AsrUtteranceEnd, build_url, parse_message
+from server.realtime.asr import (
+    FINALIZE,
+    AsrFinal,
+    AsrPartial,
+    AsrUtteranceEnd,
+    DeepgramSession,
+    build_url,
+    parse_message,
+)
 
 
 def test_build_url_pins_the_planned_params() -> None:
@@ -57,3 +66,32 @@ def test_parse_ignores_metadata_and_empty_partials() -> None:
 def test_parse_garbage_returns_none() -> None:
     assert parse_message("not json at all") is None
     assert parse_message(json.dumps({"no": "type"})) is None
+
+
+class FakeWs:
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    async def send(self, data) -> None:
+        self.sent.append(data)
+
+
+def test_send_loop_control_frames() -> None:
+    # Latency fix (2026-08-31): short utterances ("Five.") took 1.5-3.5s to
+    # finalize on Deepgram's own endpointing. Our VAD knows when speech stopped,
+    # so a FINALIZE marker in the audio queue becomes {"type":"Finalize"},
+    # forcing finals to flush immediately. None still becomes CloseStream.
+    async def run() -> list:
+        ws = FakeWs()
+        session = DeepgramSession("key", asyncio.Queue())
+        audio: asyncio.Queue = asyncio.Queue()
+        audio.put_nowait(b"\x00" * 640)
+        audio.put_nowait(FINALIZE)
+        audio.put_nowait(None)
+        await session._send_loop(ws, audio)
+        return ws.sent
+
+    sent = asyncio.run(run())
+    assert sent[0] == b"\x00" * 640
+    assert json.loads(sent[1]) == {"type": "Finalize"}
+    assert json.loads(sent[2]) == {"type": "CloseStream"}

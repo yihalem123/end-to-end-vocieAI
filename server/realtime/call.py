@@ -24,7 +24,13 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 from server.config import Settings
 from server.metrics import registry
-from server.realtime.asr import AsrFinal, AsrPartial, AsrUtteranceEnd, DeepgramSession
+from server.realtime.asr import (
+    FINALIZE,
+    AsrFinal,
+    AsrPartial,
+    AsrUtteranceEnd,
+    DeepgramSession,
+)
 from server.realtime.endpoint import Endpointer, TurnComplete
 from server.realtime.reply import ReplyController
 from server.realtime.vad import SileroVad, VadEvent, VadStream
@@ -179,6 +185,7 @@ class CallSession:
                 case VadEvent(kind="stop", t=t):
                     self._endpointer.on_vad_stop(t)
                     self._replies.guard.on_vad_stop(t)
+                    self._offer_audio(FINALIZE)  # flush Deepgram finals now
                     await self._send({"type": "vad", "state": "silence"})
                 case AsrPartial(text=text):
                     await self._send({"type": "partial", "text": text})
