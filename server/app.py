@@ -28,8 +28,14 @@ from fastapi.staticfiles import StaticFiles
 
 from server.config import Settings, get_settings
 from server.metrics import registry
-from server.postcall.report import render_html, reports as report_store, run_postcall
+from server.postcall.report import (
+    render_html,
+    reports as report_store,
+    run_postcall,
+    store_terminal_report,
+)
 from server.realtime.call import CallSession
+from server.realtime.session import SessionStatus
 
 _postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
 
@@ -54,14 +60,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def metrics() -> dict:
         return registry.snapshot()
 
-    @app.get("/calls")
-    async def calls() -> list[dict]:
-        return [{"call_id": cid,
-                 "score": rep.get("score"),
-                 "needs_review": rep.get("needs_review"),
-                 "knocked_out": rep.get("knocked_out"),
-                 "created_at": rep.get("created_at")}
-                for cid, rep in reversed(report_store.items())]
+    @app.get("/metrics/{call_id}")
+    async def call_metrics(call_id: str) -> dict:
+        return registry.snapshot(call_id)
 
     @app.get("/report/{call_id}")
     async def report_json(call_id: str) -> dict:
@@ -78,26 +79,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:
         mode = ws.query_params.get("mode", "custom")
-        session = CallSession(ws, app.state.settings, mode=mode)
+        call_id = uuid.uuid4().hex
+        session = CallSession(ws, app.state.settings, call_id=call_id, mode=mode)
         try:
             await session.run()
         except Exception:
             # A vendor failure must not take uvicorn down with a bare traceback;
             # log it and close the socket so the client sees a clean end.
             log.exception("call session failed")
+            if session.state.session.status not in {
+                SessionStatus.CONSENT_REFUSED, SessionStatus.COMPLETED,
+                SessionStatus.FAILED, SessionStatus.CANCELLED,
+            }:
+                session.state.session.transition(SessionStatus.FAILED)
             try:
                 await ws.close(code=1011)
             except RuntimeError:
                 pass  # already closed
         finally:
             state = session.state
-            if state.conversation and app.state.settings.openai_api_key:
-                call_id = uuid.uuid4().hex[:12]
-                task = asyncio.create_task(run_postcall(
-                    call_id, state.conversation, state.turns, app.state.settings))
-                _postcall_tasks.add(task)
-                task.add_done_callback(_postcall_tasks.discard)
-                log.info("postcall started: /report/%s/view", call_id)
+            status = state.session.status
+            if status in {SessionStatus.DISCLOSURE, SessionStatus.AWAITING_CONSENT}:
+                state.session.transition(SessionStatus.CANCELLED)
+                store_terminal_report(call_id, state.conversation,
+                                      state.session.status, "call ended before consent")
+            elif status == SessionStatus.CONSENT_REFUSED:
+                store_terminal_report(call_id, state.conversation, status,
+                                      "candidate declined consent; no analysis performed")
+            elif status == SessionStatus.FAILED:
+                store_terminal_report(call_id, state.conversation, status,
+                                      "call failed before completion")
+            elif status in {SessionStatus.INTERVIEWING, SessionStatus.CLOSING}:
+                if not app.state.settings.openai_api_key:
+                    state.session.transition(SessionStatus.FAILED)
+                    store_terminal_report(call_id, state.conversation,
+                                          state.session.status,
+                                          "post-call extraction unavailable")
+                else:
+                    state.session.transition(SessionStatus.POST_PROCESSING)
+                    task = asyncio.create_task(run_postcall(
+                        call_id, state.conversation, state.turns, app.state.settings,
+                        lifecycle=state.session))
+                    _postcall_tasks.add(task)
+                    task.add_done_callback(_postcall_tasks.discard)
+                    log.info("postcall started: /report/%s/view", call_id)
 
     @app.websocket("/ws/echo")
     async def ws_echo(ws: WebSocket) -> None:

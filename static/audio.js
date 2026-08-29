@@ -17,11 +17,22 @@ const els = {};
 let ctx = null, ws = null, stream = null, running = false;
 let playbackNode = null;
 let sentCount = 0;
+let callId = null;
+const reportPolls = new Set();
+let agentInitiated = false;
+const pendingChats = [];
 
 function setStatus(text) { els.status.textContent = text; }
 
 function handleEvent(ev) {
   switch (ev.type) {
+    case "session":
+      callId = ev.call_id;
+      setStatus(`${ev.state} — call ${callId}`);
+      break;
+    case "session_state":
+      setStatus(`${ev.state} — call ${ev.call_id}`);
+      break;
     case "vad":
       els.vad.textContent = ev.state === "speech" ? "● speech" : "○ silence";
       els.vad.className = ev.state;
@@ -46,6 +57,10 @@ function handleEvent(ev) {
     }
     case "agent":
       addLine("agent", ev.text + (ev.interrupted ? " ⏹ (interrupted)" : ""));
+      if (!agentInitiated) {
+        agentInitiated = true;
+        flushPendingChats();
+      }
       break;
     case "you":  // echo of a chat (text-mode) message
       addLine("you", ev.text);
@@ -73,8 +88,9 @@ function addLine(who, text) {
 }
 
 async function refreshMetrics() {
+  if (!callId) return;
   try {
-    const snap = await fetch("/metrics").then((r) => r.json());
+    const snap = await fetch(`/metrics/${encodeURIComponent(callId)}`).then((r) => r.json());
     const rows = Object.entries(snap.stages).map(([stage, s]) =>
       `<tr><td>${stage}</td><td>${s.p50.toFixed(0)}</td><td>${s.p95.toFixed(0)}</td><td>${s.count}</td></tr>`);
     els.metrics.innerHTML =
@@ -87,6 +103,8 @@ function connectWs() {
   // The mode is fixed at connect time: flux = Deepgram model end-of-turn,
   // otherwise the custom VAD+endpointer stack. Metrics are tagged per mode.
   const mode = els.fluxMode.checked ? "flux" : "custom";
+  callId = null;
+  agentInitiated = false;
   ws = new WebSocket(`ws://${location.host}/ws/call?mode=${mode}`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
@@ -99,7 +117,12 @@ function connectWs() {
         { type: "audio", generation_id: generationId, audio }, [audio]);
     }
   };
-  ws.onclose = () => { if (running) stop("server closed"); ws = null; };
+  ws.onclose = () => {
+    const closedCallId = callId;
+    if (running) stop("server closed");
+    else startReportPoll(closedCallId);
+    ws = null;
+  };
   ws.onerror = () => setStatus("websocket error (is the server running?)");
   return ws;
 }
@@ -107,13 +130,21 @@ function connectWs() {
 function sendChat() {
   const text = els.chatText.value.trim();
   if (!text) return;
+  pendingChats.push(text);
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     connectWs();
-    ws.onopen = () => { setStatus("text mode"); ws.send(JSON.stringify({ type: "chat", text })); };
-  } else {
-    ws.send(JSON.stringify({ type: "chat", text }));
+    ws.onopen = () => setStatus("text mode — waiting for disclosure");
+  } else if (agentInitiated) {
+    flushPendingChats();
   }
   els.chatText.value = "";
+}
+
+function flushPendingChats() {
+  if (!agentInitiated || ws?.readyState !== WebSocket.OPEN) return;
+  while (pendingChats.length) {
+    ws.send(JSON.stringify({ type: "chat", text: pendingChats.shift() }));
+  }
 }
 
 async function start() {
@@ -162,6 +193,7 @@ async function start() {
 }
 
 function stop(reason) {
+  const finishedCallId = callId;
   running = false;
   ws?.close();
   stream?.getTracks().forEach((t) => t.stop());
@@ -170,28 +202,38 @@ function stop(reason) {
   els.btn.textContent = "Start";
   els.fluxMode.disabled = false;
   setStatus(reason || "stopped");
-  pollForReport(6);  // post-call extraction takes a few seconds
+  startReportPoll(finishedCallId);
 }
 
-async function pollForReport(attemptsLeft) {
-  if (attemptsLeft <= 0) return;
+function startReportPoll(sessionCallId) {
+  if (!sessionCallId || reportPolls.has(sessionCallId)) return;
+  reportPolls.add(sessionCallId);
+  pollForReport(sessionCallId, 6);
+}
+
+async function pollForReport(sessionCallId, attemptsLeft) {
+  if (attemptsLeft <= 0) {
+    reportPolls.delete(sessionCallId);
+    return;
+  }
   try {
-    const calls = await fetch("/calls").then((r) => r.json());
-    if (calls.length && calls[0].call_id !== pollForReport.shown) {
-      pollForReport.shown = calls[0].call_id;
+    const response = await fetch(`/report/${encodeURIComponent(sessionCallId)}`);
+    if (response.ok) {
+      const report = await response.json();
       const div = document.createElement("div");
       div.className = "line agent";
       const a = document.createElement("a");
-      a.href = `/report/${calls[0].call_id}/view`;
+      a.href = `/report/${encodeURIComponent(sessionCallId)}/view`;
       a.target = "_blank";
-      a.textContent = `📋 call report ready (score ${calls[0].score ?? "?"})`;
+      a.textContent = `📋 your call report ready (score ${report.score ?? "not scored"})`;
       div.appendChild(a);
       els.convo.appendChild(div);
       els.convo.scrollTop = els.convo.scrollHeight;
+      reportPolls.delete(sessionCallId);
       return;
     }
   } catch { /* server briefly busy; retry */ }
-  setTimeout(() => pollForReport(attemptsLeft - 1), 2500);
+  setTimeout(() => pollForReport(sessionCallId, attemptsLeft - 1), 2500);
 }
 
 window.addEventListener("DOMContentLoaded", () => {

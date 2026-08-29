@@ -47,6 +47,13 @@ def test_ws_call_without_key_reports_error() -> None:
     bare = create_app(Settings(_env_file=None, deepgram_api_key=""))
     client = TestClient(bare)
     with client.websocket_connect("/ws/call") as ws:
-        msg = json.loads(ws.receive_text())
-        assert msg["type"] == "error"
-        assert "DEEPGRAM_API_KEY" in msg["message"]
+        session = json.loads(ws.receive_text())
+        assert session["type"] == "session"
+        assert len(session["call_id"]) == 32
+        failed = json.loads(ws.receive_text())
+        assert failed == {"type": "session_state", "state": "failed",
+                          "call_id": session["call_id"]}
+        error = json.loads(ws.receive_text())
+        assert error["type"] == "error"
+        assert error["call_id"] == session["call_id"]
+        assert "DEEPGRAM_API_KEY" in error["message"]

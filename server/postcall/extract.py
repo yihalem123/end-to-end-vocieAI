@@ -1,4 +1,4 @@
-"""Post-call evidence extraction: transcript -> {value, quote, confidence}. Phase 5a.
+"""Post-call evidence extraction: caller utterances -> verified typed fields.
 
 ## How this works
 After the call ends we re-extract every plan field from the FULL transcript in
@@ -7,12 +7,10 @@ schema is built from the plan, so "plan is data" holds here too). The live
 engine's record_answer captures are a real-time convenience; this pass is the
 authoritative one because it sees the whole conversation and every correction.
 
-Then the part the LLM is not trusted with: verify_and_coerce() checks each
-QUOTE against the transcript with normalized matching (case, punctuation and
-whitespace insensitive). A quote that does not appear in the transcript zeroes
-that field's confidence — the model cannot manufacture evidence (CLAUDE.md hard
-rule). Values are coerced to the step's declared type; a value that will not
-coerce also zeroes confidence. score.py consumes only these verified fields.
+Then the deterministic trust boundary checks each quote against the one caller
+utterance id named by the extraction. Agent words are never evidence. Missing,
+fabricated, ambiguous, low-confidence, or contradictory evidence remains visible
+in the report but score.py cannot use it for a score or knockout.
 """
 import json
 import re
@@ -32,6 +30,9 @@ class Extracted:
     value: Any
     quote: str
     confidence: float
+    utterance_id: str | None = None
+    verified: bool = False
+    contradictory: bool = False
 
 
 def render_transcript(entries: list[dict]) -> str:
@@ -39,8 +40,10 @@ def render_transcript(entries: list[dict]) -> str:
     lines = []
     for e in entries:
         speaker = "CALLER" if e["role"] == "caller" else "AGENT"
+        identity = (f" [{e['utterance_id']}]" if e["role"] == "caller"
+                    and e.get("utterance_id") else "")
         suffix = " [cut off by caller]" if e.get("interrupted") else ""
-        lines.append(f"{speaker}: {e['text']}{suffix}")
+        lines.append(f"{speaker}{identity}: {e['text']}{suffix}")
     return "\n".join(lines)
 
 
@@ -55,19 +58,24 @@ _VALUE_DESCRIPTIONS = {
 
 
 def build_schema(plan: InterviewPlan) -> dict:
-    """Strict Structured Outputs schema: one {value, quote, confidence} per field."""
+    """Strict schema with value, caller quote/id, confidence, and contradiction."""
     def per_field(step) -> dict:
         return {
             "type": "object",
             "additionalProperties": False,
-            "required": ["value", "quote", "confidence"],
+            "required": ["value", "quote", "utterance_id", "confidence",
+                         "contradictory"],
             "properties": {
                 "value": {"type": ["string", "null"],
                           "description": _VALUE_DESCRIPTIONS[step.type]},
                 "quote": {"type": ["string", "null"],
-                          "description": "VERBATIM caller words supporting the value."},
+                           "description": "VERBATIM caller words supporting the value."},
+                "utterance_id": {"type": ["string", "null"],
+                                 "description": "The CALLER utterance id containing the quote."},
                 "confidence": {"type": "number",
-                               "description": "0-1: how clearly the transcript supports it."},
+                                "description": "0-1: how clearly the transcript supports it."},
+                "contradictory": {"type": "boolean",
+                                  "description": "True if caller evidence conflicts or is corrected ambiguously."},
             },
         }
 
@@ -83,35 +91,53 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
-def verify_and_coerce(raw: dict, transcript: str, plan: InterviewPlan) -> dict[str, Extracted]:
-    """The deterministic trust boundary: quotes must exist in the transcript."""
-    haystack = _normalize(transcript)
+def verify_and_coerce(raw: dict, entries: list[dict],
+                      plan: InterviewPlan) -> dict[str, Extracted]:
+    """Trust boundary: evidence must name a caller utterance containing the quote."""
+    caller_utterances = {
+        str(entry["utterance_id"]): _normalize(str(entry.get("text", "")))
+        for entry in entries
+        if entry.get("role") == "caller" and entry.get("utterance_id")
+    }
     out: dict[str, Extracted] = {}
     for step in plan.steps:
         entry = raw.get(step.field) or {}
         value, quote = entry.get("value"), entry.get("quote") or ""
+        utterance_id = entry.get("utterance_id")
+        utterance_key = str(utterance_id) if utterance_id is not None else None
+        contradictory = bool(entry.get("contradictory", False))
         confidence = max(0.0, min(1.0, float(entry.get("confidence") or 0.0)))
         if value is None:
             continue  # never answered: absent, not zero-confidence noise
-        if not quote or _normalize(quote) not in haystack:
-            confidence = 0.0  # unverifiable evidence => worthless evidence
+        verified = bool(
+            quote and utterance_key in caller_utterances
+            and _normalize(quote) in caller_utterances[utterance_key]
+        )
+        if not verified:
+            confidence = 0.0
         try:
             coerced = _coerce(value, step.type)
         except (TypeError, ValueError):
             coerced, confidence = None, 0.0
-        out[step.field] = Extracted(value=coerced, quote=quote, confidence=confidence)
+        out[step.field] = Extracted(
+            value=coerced, quote=quote, confidence=confidence,
+            utterance_id=utterance_key,
+            verified=verified, contradictory=contradictory,
+        )
     return out
 
 
 async def extract_call(settings: Settings, plan: InterviewPlan,
-                       transcript: str) -> dict[str, Extracted]:
+                       entries: list[dict]) -> dict[str, Extracted]:
+    transcript = render_transcript(entries)
     body = {
         "model": settings.extract_model,
         "instructions": (
             "Extract the screening answers from this call transcript. For every "
             "field: the answer, the caller's verbatim supporting words, and your "
-            "confidence. Use null for anything the caller never answered. Never "
-            "paraphrase quotes — copy the caller's words exactly."
+            "confidence, the caller utterance id containing that quote, and whether "
+            "the caller gave contradictory evidence. Use null for unanswered fields. "
+            "Never use AGENT words as evidence or paraphrase caller quotes."
         ),
         "input": transcript,
         "text": {"format": {"type": "json_schema", "name": "screening_extraction",
@@ -130,4 +156,4 @@ async def extract_call(settings: Settings, plan: InterviewPlan,
         for item in data["output"] if item["type"] == "message"
         for content in item["content"] if content["type"] == "output_text"
     )
-    return verify_and_coerce(json.loads(text), transcript, plan)
+    return verify_and_coerce(json.loads(text), entries, plan)

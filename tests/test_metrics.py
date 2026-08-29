@@ -44,3 +44,13 @@ def test_registry_history_is_bounded() -> None:
     assert snap["turns"] == 50                            # lifetime count keeps counting
     assert snap["stages"]["endpoint_delay_ms"]["count"] == 10  # window is bounded
     assert snap["stages"]["endpoint_delay_ms"]["p50"] == 44.5  # only recent values
+
+
+def test_registry_filters_metrics_by_stable_call_id() -> None:
+    reg = MetricsRegistry()
+    reg.record_turn("call-a", endpoint_delay_ms=100)
+    reg.record_turn("call-b", endpoint_delay_ms=900)
+    snap = reg.snapshot("call-a")
+    assert snap["call_id"] == "call-a"
+    assert snap["turns"] == 1
+    assert snap["stages"]["endpoint_delay_ms"]["p50"] == 100

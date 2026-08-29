@@ -103,6 +103,11 @@ class GenerationSupervisor:
             self._current = None
             self._task = None
 
+    async def wait_for(self, token: GenerationToken) -> None:
+        """Wait for the currently owned worker without exposing its task."""
+        task = self._task if self._current == token else None
+        await self.wait_cancelled(task)
+
     async def close(self) -> None:
         self._pending_clear = None
         await self.cancel_current()

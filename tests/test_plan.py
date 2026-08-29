@@ -14,7 +14,7 @@ def make_state() -> InterviewState:
 
 def test_load_real_plan() -> None:
     plan = load_plan(PLAN_PATH)
-    assert plan.scoring_version == "icu-nurse-v1"
+    assert plan.scoring_version == "icu-nurse-v2"
     assert [s.field for s in plan.steps][:3] == ["consent", "rn_license_state",
                                                 "rn_license_active"]
     assert plan.steps[0].knockout == {"equals": False}
@@ -85,14 +85,22 @@ def test_knockout_detected_on_record() -> None:
     st.request_advance()
     st.record("rn_license_state", "Ohio", quote="Ohio")
     st.record("rn_license_active", False, quote="it lapsed")
-    assert st.knocked_out == "rn_license_active"
+    assert st.knocked_out is None  # live LLM capture is provisional, never adverse
+
+
+def test_ambiguous_boolean_is_nullable_not_false() -> None:
+    st = make_state()
+    assert st.record("consent", "maybe", quote="maybe") is False
+    assert "consent" not in st.fields
+    assert st.record("consent", "not sure", quote="not sure") is False
+    assert "consent" not in st.fields
 
 
 def test_done_only_after_all_steps() -> None:
     st = make_state()
     answers = {
         "consent": True, "rn_license_state": "Texas", "rn_license_active": True,
-        "icu_years": 5, "certifications": ["CCRN"], "shift_availability": "nights",
+        "icu_years": 5, "certifications": ["CCRN"], "shift_availability": True,
         "earliest_start": "two weeks", "pay_expectation": "55/hr",
     }
     for field, value in answers.items():

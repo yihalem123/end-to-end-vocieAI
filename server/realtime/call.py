@@ -34,6 +34,7 @@ from server.realtime.asr import (
 from server.realtime.endpoint import Endpointer, TurnComplete
 from server.realtime.flux import FluxEndOfTurn, FluxSession, FluxStartOfTurn, FluxUpdate
 from server.realtime.reply import ReplyController
+from server.realtime.session import SessionLifecycle, SessionStatus, classify_consent
 from server.realtime.vad import SileroRuntime, SileroVad, VadEvent, VadStream
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,8 @@ class ClientChat:
 
 @dataclass
 class CallState:
+    call_id: str
+    session: SessionLifecycle
     turns: list[TurnComplete] = field(default_factory=list)
     # Ordered conversation log — the post-call transcript source of truth.
     # Entries: {"role": "caller"|"agent", "text": ..., "interrupted": bool?}
@@ -90,7 +93,8 @@ class CallState:
 
 
 class CallSession:
-    def __init__(self, ws: WebSocket, settings: Settings, mode: str = "custom") -> None:
+    def __init__(self, ws: WebSocket, settings: Settings, call_id: str,
+                 mode: str = "custom") -> None:
         self._ws = ws
         self._settings = settings
         # "custom": v1 ASR + our VAD-anchored endpointer (the built story).
@@ -99,22 +103,28 @@ class CallSession:
         # needs ~100ms local onset detection; network events are too late).
         self.mode = mode if mode in ("custom", "flux") else "custom"
         self._metric_prefix = "flux_" if self.mode == "flux" else ""
-        self.state = CallState()
+        self.state = CallState(call_id=call_id, session=SessionLifecycle(call_id))
         self._audio_to_asr: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_FRAMES)
         self._events: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self._endpointer = Endpointer()
         self._last_vad_stop_t: float | None = None
         self._next_turn_id = 0
+        self._close_when_idle = False
 
     async def run(self) -> None:
         await self._ws.accept()
+        await self._send({"type": "session", "call_id": self.state.call_id,
+                          "state": self.state.session.status})
         if not self._settings.deepgram_api_key:
+            self.state.session.transition(SessionStatus.FAILED)
+            await self._send_state()
             await self._send({"type": "error", "message": "DEEPGRAM_API_KEY is not set"})
             await self._ws.close()
             return
         replies = ReplyController(self._send, self._ws.send_bytes,
                                   self._settings, self.state,
-                                  metric_prefix=self._metric_prefix)
+                                  metric_prefix=self._metric_prefix,
+                                  call_id=self.state.call_id)
         self._replies = replies
         # Only immutable ONNX resources are shared. Recurrent state, context,
         # carry, gate and reset lifetime belong exclusively to this call.
@@ -144,7 +154,12 @@ class CallSession:
             )
 
     async def _send(self, payload: dict) -> None:
+        payload.setdefault("call_id", self.state.call_id)
         await self._ws.send_text(json.dumps(payload))
+
+    async def _send_state(self) -> None:
+        await self._send({"type": "session_state",
+                          "state": self.state.session.status})
 
     # --- inbound: audio frames and client JSON ---
 
@@ -223,6 +238,9 @@ class CallSession:
     # --- pipeline events -> endpointer + guard -> replies ---
 
     async def _event_loop(self) -> None:
+        await self._replies.on_script(self._replies.interview.plan.consent, turn_id=0)
+        self.state.session.transition(SessionStatus.AWAITING_CONSENT)
+        await self._send_state()
         while True:
             try:
                 event = await asyncio.wait_for(self._events.get(), timeout=TICK_SEC)
@@ -260,10 +278,7 @@ class CallSession:
                     await self._replies.on_playback_overflow(generation, played)
                 case ClientChat(text=text):
                     turn_id = self._new_turn_id()
-                    self.state.conversation.append(
-                        {"role": "caller", "text": text, "turn_id": turn_id})
-                    await self._send({"type": "you", "text": text, "turn_id": turn_id})
-                    await self._replies.on_chat(text, turn_id)
+                    await self._commit_caller_text(text, turn_id, turn=None)
                 case FluxUpdate(transcript=text):
                     if text:  # Flux emits empty updates during silence
                         await self._send({"type": "partial", "text": text})
@@ -282,19 +297,65 @@ class CallSession:
             if turn is not None:
                 turn_id = self._new_turn_id()
                 self.state.turns.append(turn)
-                self.state.conversation.append(
-                    {"role": "caller", "text": turn.transcript,
-                     "turn_id": turn_id})
                 registry.record_turn(
+                    self.state.call_id,
                     **{f"{self._metric_prefix}endpoint_delay_ms":
                        turn.endpoint_delay * 1000})
-                await self._send({
-                    "type": "turn",
-                    "turn_id": turn_id,
-                    "transcript": turn.transcript,
-                    "endpoint_delay_ms": round(turn.endpoint_delay * 1000),
-                    "reason": turn.reason,
-                })
-                await self._replies.on_turn(turn, turn_id)
+                await self._commit_caller_text(turn.transcript, turn_id, turn=turn)
             if self._replies.guard.tick(now):
                 await self._replies.interrupt_current()
+            if (self.state.session.status == SessionStatus.INTERVIEWING
+                    and self._replies.interview.next_needed is None
+                    and self._replies.is_idle):
+                self.state.session.transition(SessionStatus.CLOSING)
+                await self._send_state()
+            if self._close_when_idle and self._replies.is_idle:
+                await self._ws.close(code=1000)
+                return
+
+    async def _commit_caller_text(self, text: str, turn_id: int,
+                                  turn: TurnComplete | None) -> None:
+        utterance_id = f"{self.state.call_id}:u{turn_id}"
+        self.state.conversation.append({
+            "role": "caller", "text": text, "turn_id": turn_id,
+            "utterance_id": utterance_id, "call_id": self.state.call_id,
+        })
+        if turn is None:
+            await self._send({"type": "you", "text": text, "turn_id": turn_id,
+                              "utterance_id": utterance_id})
+        else:
+            await self._send({
+                "type": "turn", "turn_id": turn_id,
+                "utterance_id": utterance_id, "transcript": text,
+                "endpoint_delay_ms": round(turn.endpoint_delay * 1000),
+                "reason": turn.reason,
+            })
+
+        status = self.state.session.status
+        if status == SessionStatus.AWAITING_CONSENT:
+            consent = classify_consent(text)
+            if consent is None:
+                await self._replies.on_script(
+                    "I need a clear yes or no before continuing. Do you consent?",
+                    turn_id,
+                )
+                return
+            self._replies.interview.record("consent", consent, quote=text)
+            if not consent:
+                self.state.session.transition(SessionStatus.CONSENT_REFUSED)
+                await self._send_state()
+                await self._replies.on_script(
+                    "Understood. I will not continue the screening. Thank you.",
+                    turn_id,
+                )
+                self._close_when_idle = True
+                return
+            self.state.session.transition(SessionStatus.INTERVIEWING)
+            await self._send_state()
+        elif status != SessionStatus.INTERVIEWING:
+            return
+
+        if turn is None:
+            await self._replies.on_chat(text, turn_id)
+        else:
+            await self._replies.on_turn(turn, turn_id)

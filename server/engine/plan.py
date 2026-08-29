@@ -10,10 +10,8 @@ InterviewState is the source of truth for one conversation: recorded fields
 and bounded history. Advancement is LLM-signaled but ENGINE-VALIDATED:
 request_advance() refuses unless the current step's field is recorded, then
 moves the cursor forward past any step already filled by volunteered info. The
-LLM can propose flow; it cannot skip coverage — that's the reconciliation of
-the user's "LLM-signaled" design pick with CLAUDE.md's coverage rule. Knockouts
-fire the moment a disqualifying value is recorded (e.g. license inactive), so
-the caller isn't dragged through questions that no longer matter.
+LLM can propose flow; it cannot skip coverage. Live captures remain provisional:
+only caller-utterance-verified post-call evidence may produce a score or knockout.
 """
 import re
 from dataclasses import dataclass, field as dc_field
@@ -25,7 +23,7 @@ import yaml
 _TYPES = {"bool", "str", "float", "list"}
 
 
-_SCORING_RULES = {"min_full", "expected", "contains_any", "answered"}
+_SCORING_RULES = {"min_full", "expected", "equals", "answered"}
 
 
 @dataclass(frozen=True)
@@ -80,9 +78,18 @@ def load_plan(path: Path) -> InterviewPlan:
 def _coerce(value: Any, type_name: str) -> Any:
     match type_name:
         case "bool":
+            if value is None:
+                return None
             if isinstance(value, bool):
                 return value
-            return str(value).strip().lower() in ("true", "yes", "y", "1")
+            normalized = str(value).strip().lower()
+            if normalized in ("true", "yes", "y", "1"):
+                return True
+            if normalized in ("false", "no", "n", "0"):
+                return False
+            if normalized in ("unknown", "unsure", "not sure", "ambiguous", ""):
+                return None
+            raise ValueError(f"ambiguous boolean {value!r}")
         case "float":
             if isinstance(value, (int, float)):
                 return float(value)
@@ -143,9 +150,11 @@ class InterviewState:
             coerced = _coerce(value, step.type)
         except (TypeError, ValueError):
             return False
+        if coerced is None:
+            return False  # nullable/unknown stays unanswered; it never becomes false
         self.fields[field] = Recorded(value=coerced, quote=quote)
-        if step.knockout is not None and coerced == step.knockout.get("equals"):
-            self.knocked_out = field
+        # Live LLM tool captures are provisional. Only post-call caller-utterance
+        # verification may produce a candidate knockout.
         return True
 
     def request_advance(self) -> bool:

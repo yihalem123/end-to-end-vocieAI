@@ -117,10 +117,11 @@ async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENC
 
 class ReplyController:
     def __init__(self, send_json, send_bytes, settings: Settings, state,
-                 metric_prefix: str = "") -> None:
+                 metric_prefix: str = "", call_id: str = "unassigned") -> None:
         self._send = send_json
         self._send_bytes = send_bytes
         self._metric_prefix = metric_prefix  # "flux_" tags the A/B in /metrics
+        self._call_id = call_id
         self._state = state  # realtime CallState: conversation log lives there
         self.guard = BargeInGuard()
         self._supervisor = GenerationSupervisor()
@@ -135,14 +136,17 @@ class ReplyController:
             self._speaker = Speaker(self._send_audio, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
         self._filler_idx = 0
+        plan = load_plan(Path(settings.plan_path))
+        self.interview = InterviewState(plan)
         self._engine: LlmEngine | StubEngine
         if settings.openai_api_key:
-            plan = load_plan(Path(settings.plan_path))
-            self.interview = InterviewState(plan)
             self._engine = LlmEngine(settings, self.interview)
         else:
-            self.interview = None
             self._engine = StubEngine()
+
+    @property
+    def is_idle(self) -> bool:
+        return self._supervisor.current is None
 
     async def _send_audio(self, generation_id: int, frame: bytes) -> None:
         token = self._supervisor.current
@@ -180,16 +184,22 @@ class ReplyController:
         self.guard.on_agent_audio_start()
 
     async def _speak_reply(self, token: GenerationToken, turn: TurnComplete) -> None:
-        assert self._speaker is not None
-        is_current = lambda: self._supervisor.is_current(token)
         sentences = self._sentences_for(token, turn.transcript)
         if wants_filler(self.interview):
             filler = FILLERS[self._filler_idx % len(FILLERS)]
             self._filler_idx += 1
             sentences = overlap_stream(filler, sentences)
+        await self._deliver_voice(
+            token, sentences, turn.commit_t, turn.vad_stop_t, record_metrics=True)
+
+    async def _deliver_voice(self, token: GenerationToken, sentences,
+                             commit_t: float, vad_stop_t: float,
+                             record_metrics: bool) -> None:
+        assert self._speaker is not None
+        is_current = lambda: self._supervisor.is_current(token)
         try:
             timings = await self._speaker.speak(
-                sentences, turn.commit_t, turn.vad_stop_t,
+                sentences, commit_t, vad_stop_t,
                 token.generation_id, is_current)
             if not is_current():
                 return
@@ -217,19 +227,16 @@ class ReplyController:
             self._drained.pop(token.generation_id, None)
         if not is_current():
             return
-        if isinstance(self._engine, LlmEngine) and self._engine.last_ttft_ms:
+        if (record_metrics and isinstance(self._engine, LlmEngine)
+                and self._engine.last_ttft_ms):
             timings["llm_ttft_ms"] = self._engine.last_ttft_ms
-        registry.record_turn(**{self._metric_prefix + k: v
-                                for k, v in timings.items() if k.endswith("_ms")})
+        if record_metrics:
+            registry.record_turn(
+                self._call_id,
+                **{self._metric_prefix + k: v
+                   for k, v in timings.items() if k.endswith("_ms")})
         text = self._speaker.text(token.generation_id)
-        self._state.conversation.append({
-            "role": "agent", "text": text, "interrupted": False,
-            "turn_id": token.turn_id, "generation_id": token.generation_id,
-        })
-        await self._send({"type": "agent", "text": text,
-                          "interrupted": False, "audio": True,
-                          "turn_id": token.turn_id,
-                          "generation_id": token.generation_id})
+        await self._append_agent(token, text, audio=True)
         self.guard.on_agent_audio_end()
         self._active_voice_generation = None
 
@@ -247,14 +254,43 @@ class ReplyController:
         text = " ".join(sentences)
         if isinstance(self._engine, LlmEngine) and self._engine.last_ttft_ms:
             registry.record_turn(
+                self._call_id,
                 **{self._metric_prefix + "llm_ttft_ms": self._engine.last_ttft_ms})
+        await self._append_agent(token, text, audio=False)
+
+    async def _append_agent(self, token: GenerationToken, text: str,
+                            audio: bool) -> None:
+        if not self._supervisor.is_current(token):
+            return
         self._state.conversation.append({
             "role": "agent", "text": text, "interrupted": False,
             "turn_id": token.turn_id, "generation_id": token.generation_id,
+            "call_id": self._call_id,
         })
         await self._send({"type": "agent", "text": text, "interrupted": False,
-                          "audio": False, "turn_id": token.turn_id,
+                          "audio": audio, "turn_id": token.turn_id,
                           "generation_id": token.generation_id})
+
+    async def on_script(self, text: str, turn_id: int) -> None:
+        """Deliver deterministic disclosure/consent/closing copy without an LLM."""
+        await self._replace_current()
+        if self._speaker is None:
+            await self._supervisor.start(
+                turn_id, lambda token: self._append_agent(token, text, audio=False))
+            return
+
+        async def one_sentence():
+            yield text
+
+        now = asyncio.get_running_loop().time()
+        token = await self._supervisor.start(
+            turn_id,
+            lambda owned: self._deliver_voice(
+                owned, one_sentence(), now, now, record_metrics=False),
+        )
+        self._drained[token.generation_id] = asyncio.Event()
+        self._active_voice_generation = token.generation_id
+        self.guard.on_agent_audio_start()
 
     # --- text mode (chat box drives the engine without audio) ---
 
@@ -301,6 +337,7 @@ class ReplyController:
             self._state.conversation.append({
                 "role": "agent", "text": spoken, "interrupted": True,
                 "turn_id": token.turn_id, "generation_id": token.generation_id,
+                "call_id": self._call_id,
             })
             await self._send({"type": "agent", "text": spoken, "interrupted": True,
                               "audio": True, "turn_id": token.turn_id,

@@ -26,20 +26,23 @@ def percentile(values: list[float], pct: float) -> float:
 
 class MetricsRegistry:
     def __init__(self, max_turns: int = 500) -> None:
-        self._turns: deque[dict[str, float]] = deque(maxlen=max_turns)
+        self._turns: deque[tuple[str | None, dict[str, float]]] = deque(maxlen=max_turns)
         self._lifetime = 0
 
-    def record_turn(self, **stages: float) -> None:
-        self._turns.append(dict(stages))
+    def record_turn(self, call_id: str | None = None, **stages: float) -> None:
+        self._turns.append((call_id, dict(stages)))
         self._lifetime += 1
 
-    def snapshot(self) -> dict:
+    def snapshot(self, call_id: str | None = None) -> dict:
         by_stage: dict[str, list[float]] = {}
-        for turn in self._turns:
+        selected = [(owner, turn) for owner, turn in self._turns
+                    if call_id is None or owner == call_id]
+        for _, turn in selected:
             for stage, value in turn.items():
                 by_stage.setdefault(stage, []).append(value)
         return {
-            "turns": self._lifetime,
+            "call_id": call_id,
+            "turns": self._lifetime if call_id is None else len(selected),
             "stages": {
                 stage: {
                     "count": len(values),

@@ -85,7 +85,6 @@ class PlaybackTracker:
 # a LEGITIMATE fast commit ("Yeah." then silence is a finished answer). The
 # scripted PAUSE between parts is the one thing under test.
 RAMBLER = [
-    Answer(["Hello?"]),
     # Ends mid-clause ("if"): an UNAMBIGUOUS continuation. "Yeah, sure." plus a
     # pause is legitimately committable (sentence-final prosody, complete
     # affirmative) — the contract only promises to hold clear mid-thought pauses.
@@ -159,6 +158,7 @@ async def main() -> int:
 
     turns: list[dict] = []
     vad_stops = 0
+    call_id: str | None = None
     agent_events = asyncio.Queue()
     playback = PlaybackTracker()
     print(f"mode: {MODE}")
@@ -169,6 +169,9 @@ async def main() -> int:
                     playback.on_audio(msg)  # strips generation header and counts PCM
                     continue
                 ev = json.loads(msg)
+                if ev["type"] == "session":
+                    nonlocal call_id
+                    call_id = ev["call_id"]
                 ack = playback.acknowledgement(ev)
                 if ack is not None:
                     await ws.send(json.dumps(ack))
@@ -184,6 +187,8 @@ async def main() -> int:
                     await agent_events.put(ev)
 
         reader_task = asyncio.create_task(reader())
+        # The agent must initiate with disclosure before the caller consents.
+        await asyncio.wait_for(agent_events.get(), timeout=45)
         for i, answer in enumerate(RAMBLER):
             await stream_answer(ws, answer, cache)
             try:
@@ -196,10 +201,10 @@ async def main() -> int:
             await reader_task
 
     await asyncio.sleep(12)  # post-call extraction
+    assert call_id is not None
     async with httpx.AsyncClient() as client:
-        calls = (await client.get(f"http://{SERVER}/calls")).json()
         report = (await client.get(
-            f"http://{SERVER}/report/{calls[0]['call_id']}")).json()
+            f"http://{SERVER}/report/{call_id}")).json()
 
     failures: list[str] = []
     if len(turns) != len(RAMBLER):

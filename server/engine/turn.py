@@ -10,10 +10,9 @@ StreamAssembler turns that event soup into text deltas + completed ToolCalls.
 
 Tools are ONE-WAY state mutations (record_answer, advance_step): we never send
 tool outputs back, so one request per turn — no second round trip, which is the
-latency trick that makes tool use viable in a voice loop. It also makes multiple
-calls per response cancellation-safe (a barge-in that kills the turn mid-stream
-leaves recorded fields recorded and the advance validated or not — state stays
-consistent), so parallel tool calls stay enabled.
+latency trick that makes tool use viable in a voice loop. These live captures
+are provisional interview memory only; post-call caller-utterance verification
+is the sole authority for scores and knockouts.
 
 LlmEngine.respond() is an async generator of SENTENCES: text deltas stream into
 the chunker (abbreviation + decimal guards) and each complete sentence is

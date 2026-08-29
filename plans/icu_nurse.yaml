@@ -5,7 +5,8 @@ persona: >
 language: en
 consent: >
   Hi, this is Sarah, an AI assistant calling for Horizon Staffing about the ICU nurse
-  role. This call is recorded. Is now a good time?
+  role. I will transcribe what you say and analyze the transcript for this screening.
+  No audio recording is stored. Do you consent to continue now?
 steps:
   - field: consent
     type: bool
@@ -25,9 +26,9 @@ steps:
     ask: "Which certifications do you hold — BLS, ACLS, CCRN?"
     scoring: { expected: [BLS, ACLS, CCRN] }   # fraction of expected certs held
   - field: shift_availability
-    type: str
-    ask: "This role is night shifts. Which shifts can you work?"
-    scoring: { contains_any: [night, any shift, flexible] }
+    type: bool
+    ask: "This role requires night shifts. Are you available to work nights?"
+    scoring: { equals: true }
   - field: earliest_start
     type: str
     ask: "When is the earliest you could start?"
@@ -40,4 +41,4 @@ weights:
   certifications: 0.3
   shift_availability: 0.2
   earliest_start: 0.1
-scoring_version: icu-nurse-v1
+scoring_version: icu-nurse-v2

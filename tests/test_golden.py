@@ -18,8 +18,7 @@ PLAN = load_plan(ROOT / "plans" / "icu_nurse.yaml")
 
 def replay(name: str):
     golden = json.loads((ROOT / "tests" / "golden" / f"{name}.json").read_text("utf-8"))
-    transcript = render_transcript(golden["entries"])
-    verified = verify_and_coerce(golden["raw_extraction"], transcript, PLAN)
+    verified = verify_and_coerce(golden["raw_extraction"], golden["entries"], PLAN)
     return verified, score_call(PLAN, verified)
 
 
@@ -27,17 +26,18 @@ def test_cooperative_candidate() -> None:
     verified, result = replay("cooperative")
     assert verified["icu_years"].value == 6.5
     assert verified["consent"].value is True
-    assert all(e.confidence > 0.5 for e in verified.values())  # quotes all verified
+    # Frozen pre-Phase-2 output has no caller utterance ids and is quarantined.
+    assert all(not e.verified for e in verified.values())
     assert result.knocked_out is None
-    assert result.needs_review is False
-    assert result.score >= 0.85
-    assert result.scoring_version == "icu-nurse-v1"
+    assert result.needs_review is True
+    assert result.score is None
+    assert result.scoring_version == "icu-nurse-v2"
 
 
 def test_knockout_rambler() -> None:
     verified, result = replay("knockout_rambler")
     assert verified["rn_license_active"].value is False   # correction understood
-    assert result.knocked_out == "rn_license_active"
-    assert result.score == 0.0
+    assert result.knocked_out is None  # no utterance id => cannot disqualify
+    assert result.score is None
     assert result.needs_review is True
-    assert any("knockout" in r for r in result.reasons)
+    assert any("evidence not verified" in r for r in result.reasons)

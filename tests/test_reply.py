@@ -141,6 +141,7 @@ def test_voice_pipeline_finalizes_when_client_never_acks(monkeypatch) -> None:
         controller._drained = {}
         controller._active_voice_generation = None
         controller._metric_prefix = ""
+        controller._call_id = "test-call"
         controller._state = SimpleNamespace(conversation=[])
         controller.guard = BargeInGuard()
         controller.interview = None
