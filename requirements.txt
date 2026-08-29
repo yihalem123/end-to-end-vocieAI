@@ -3,4 +3,7 @@ uvicorn[standard]
 pydantic-settings
 httpx
 httpx2
+numpy
+onnxruntime
+websockets
 pytest
