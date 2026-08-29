@@ -1,36 +1,53 @@
-/* Main-thread audio glue: mic -> capture worklet -> WS -> playback worklet.
+/* Main-thread audio glue: mic -> capture worklet -> WS -> server pipeline.
 
 ## How this works
-The main thread never touches raw audio samples — it only moves ArrayBuffers
-between three parties:
-  1. capture-processor posts a 640-byte frame  -> we ws.send() it (binary)
-  2. the server echoes it back                 -> ws.onmessage fires
-  3. we post the buffer into playback-processor -> it reaches the speakers
-RTT is measured with a FIFO of send timestamps: WebSocket messages are ordered,
-and the server echoes 1-for-1, so the Nth frame back matches the Nth timestamp —
-no sequence numbers needed *for the echo phase*. performance.now() gives
-monotonic sub-ms time.
-
-Gotchas worth defending in an interview:
-- AudioContext must be created/resumed inside a user gesture (the Start click) —
-  browsers block autoplaying audio contexts.
-- getUserMedia requires a secure context: https OR localhost. Our localhost dev
-  setup is exactly the carve-out.
-- echoCancellation stays ON so the mic doesn't re-capture what the speakers play
-  (still: use headphones — AEC is tuned for far-end voices, not your own echo).
-- ws.binaryType = "arraybuffer": the default is Blob, which would force an async
-  read on every frame.
+Phase 2: the server no longer echoes. Upstream is unchanged — the capture worklet
+posts 640-byte PCM16 frames and we ws.send() them. Downstream is now two kinds of
+message, split on type:
+  - JSON text: pipeline events {vad, partial, final, turn} driving the UI.
+    Partials OVERWRITE one gray line (each supersedes the last); finals APPEND
+    permanently; a turn event closes out the utterance with its endpoint_delay —
+    the number this phase exists to measure.
+  - binary ArrayBuffer: audio for the playback worklet (nothing sends it in
+    Phase 2; the path stays live because Phase 3 TTS uses it).
+Still true from Phase 1: AudioContext needs a user gesture; getUserMedia needs
+localhost/https; binaryType "arraybuffer" avoids per-frame Blob reads.
 */
 
-const els = {
-  btn: null, status: null, sent: null, recv: null, rtt: null,
-};
+const els = {};
 let ctx = null, ws = null, stream = null, running = false;
-let sentCount = 0, recvCount = 0;
-const sendTimes = [];   // FIFO of performance.now() per outbound frame
-const rttWindow = [];   // last N round-trip times, for a rolling average
+let sentCount = 0;
 
 function setStatus(text) { els.status.textContent = text; }
+
+function handleEvent(ev) {
+  switch (ev.type) {
+    case "vad":
+      els.vad.textContent = ev.state === "speech" ? "● speech" : "○ silence";
+      els.vad.className = ev.state;
+      break;
+    case "partial":
+      els.partial.textContent = ev.text;
+      break;
+    case "final": {
+      els.partial.textContent = "";
+      const span = document.createElement("span");
+      span.textContent = ev.text + " ";
+      els.finals.appendChild(span);
+      break;
+    }
+    case "turn": {
+      const li = document.createElement("li");
+      li.textContent = `${ev.endpoint_delay_ms} ms (${ev.reason}) — "${ev.transcript}"`;
+      els.turns.prepend(li);
+      els.finals.textContent = "";  // turn committed; clear the working line
+      break;
+    }
+    case "error":
+      setStatus(`server error: ${ev.message}`);
+      break;
+  }
+}
 
 async function start() {
   setStatus("requesting mic…");
@@ -38,40 +55,31 @@ async function start() {
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
   });
 
-  ctx = new AudioContext(); // hardware rate (usually 48k); worklets resample
+  ctx = new AudioContext();
   await ctx.audioWorklet.addModule("/capture-processor.js");
   await ctx.audioWorklet.addModule("/playback-processor.js");
 
   const source = ctx.createMediaStreamSource(stream);
   const capture = new AudioWorkletNode(ctx, "capture-processor");
   const playback = new AudioWorkletNode(ctx, "playback-processor");
-  source.connect(capture);          // mic into the capture worklet
-  playback.connect(ctx.destination); // playback worklet to the speakers
-  // capture is NOT connected to destination — frames leave via port, not audio graph.
+  source.connect(capture);
+  playback.connect(ctx.destination);
 
   ws = new WebSocket(`ws://${location.host}/ws/call`);
   ws.binaryType = "arraybuffer";
 
   ws.onopen = () => {
-    setStatus(`live — context ${ctx.sampleRate} Hz, frames 20 ms`);
+    setStatus(`live — context ${ctx.sampleRate} Hz`);
     capture.port.onmessage = (e) => {
       if (ws.readyState !== WebSocket.OPEN) return;
-      sendTimes.push(performance.now());
       ws.send(e.data);
       els.sent.textContent = ++sentCount;
     };
   };
 
   ws.onmessage = (e) => {
-    const t0 = sendTimes.shift();
-    if (t0 !== undefined) {
-      rttWindow.push(performance.now() - t0);
-      if (rttWindow.length > 50) rttWindow.shift();
-      const avg = rttWindow.reduce((a, b) => a + b, 0) / rttWindow.length;
-      els.rtt.textContent = avg.toFixed(1);
-    }
-    playback.port.postMessage(e.data, [e.data]); // transfer into the audio thread
-    els.recv.textContent = ++recvCount;
+    if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
+    else playback.port.postMessage(e.data, [e.data]);
   };
 
   ws.onclose = () => { if (running) stop("server closed"); };
@@ -84,20 +92,17 @@ async function start() {
 function stop(reason) {
   running = false;
   ws?.close();
-  stream?.getTracks().forEach((t) => t.stop()); // release the mic (tab indicator off)
+  stream?.getTracks().forEach((t) => t.stop());
   ctx?.close();
   ws = null; ctx = null; stream = null;
-  sendTimes.length = 0; rttWindow.length = 0;
   els.btn.textContent = "Start";
   setStatus(reason || "stopped");
 }
 
 window.addEventListener("DOMContentLoaded", () => {
-  els.btn = document.getElementById("toggle");
-  els.status = document.getElementById("status");
-  els.sent = document.getElementById("sent");
-  els.recv = document.getElementById("recv");
-  els.rtt = document.getElementById("rtt");
+  for (const id of ["btn", "status", "sent", "vad", "partial", "finals", "turns"]) {
+    els[id] = document.getElementById(id);
+  }
   els.btn.addEventListener("click", () => {
     if (running) stop();
     else start().catch((err) => setStatus(`failed: ${err.message}`));

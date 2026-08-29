@@ -1,32 +1,43 @@
-"""FastAPI app factory. Built in Phase 0 (see PLAN.md).
+"""FastAPI app factory. Phases 0-2.
 
-Endpoints (target):
+Endpoints:
   GET  /            -> static/index.html test console
   GET  /healthz
-  WS   /ws/call     -> browser leg (16k PCM16 frames)   [Phase 1+]
+  WS   /ws/call     -> the call pipeline: VAD + ASR + endpointer (Phase 2)
+  WS   /ws/echo     -> byte-identical echo, kept as a latency diagnostic (Phase 1)
   GET  /metrics     -> per-stage latency percentiles     [Phase 3]
 
 ## How this works
-create_app() builds the app so tests can construct fresh instances; the module-level
-`app` is what `uvicorn server.app:app` imports. Route registration order matters:
-/healthz and /ws/call are declared before the StaticFiles mount at "/" because the
-mount is a catch-all — anything declared after it would be shadowed. html=True makes
-the mount serve static/index.html for "/". /ws/call (Phase 1) echoes both message
-kinds: binary frames are the audio path (640-byte 20 ms PCM16 from the browser);
-text remains for control/debug. We use the low-level ws.receive() instead of
-receive_text()/receive_bytes() because only it lets one loop accept either kind —
-the typed helpers raise on a mismatched message type.
+create_app(settings) builds the app; tests inject Settings(_env_file=None, ...) to
+avoid touching real keys, while the module-level `app` (what uvicorn imports)
+reads .env. Route registration order matters: specific routes are declared before
+the StaticFiles mount at "/" because the mount is a catch-all. /ws/call hands the
+socket straight to CallSession (server/realtime/call.py) — the app layer stays
+transport-only; pipeline logic lives with the pipeline. The echo handler uses raw
+ws.receive() because only it accepts both text and binary in one loop; raw
+receive() reports disconnect as a message type, not an exception.
 """
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
+from server.config import Settings, get_settings
+from server.realtime.call import CallSession
+
+log = logging.getLogger(__name__)
+
+# uvicorn configures its own loggers but leaves root at WARNING; without this,
+# the pipeline's log.info lines (call summaries, reconnects) are invisible.
+logging.basicConfig(level=logging.INFO)
+
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
-def create_app() -> FastAPI:
+def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="screener")
+    app.state.settings = settings if settings is not None else get_settings()
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -34,12 +45,24 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:
+        session = CallSession(ws, app.state.settings)
+        try:
+            await session.run()
+        except Exception:
+            # A vendor failure must not take uvicorn down with a bare traceback;
+            # log it and close the socket so the client sees a clean end.
+            log.exception("call session failed")
+            try:
+                await ws.close(code=1011)
+            except RuntimeError:
+                pass  # already closed
+
+    @app.websocket("/ws/echo")
+    async def ws_echo(ws: WebSocket) -> None:
         await ws.accept()
         try:
             while True:
                 message = await ws.receive()
-                # Raw receive() does NOT raise WebSocketDisconnect (only the typed
-                # helpers do) — the disconnect arrives as a message we must handle.
                 if message["type"] == "websocket.disconnect":
                     break
                 if message.get("bytes") is not None:
