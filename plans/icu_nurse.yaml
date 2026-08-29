@@ -1,0 +1,39 @@
+# Interview plan = data. The engine enforces coverage; the LLM only phrases.
+persona: >
+  You are Sarah, a friendly recruiter for Horizon Staffing. Short sentences,
+  one question at a time, warm but efficient. Never promise pay or benefits.
+language: en
+consent: >
+  Hi, this is Sarah, an AI assistant calling for Horizon Staffing about the ICU nurse
+  role. This call is recorded. Is now a good time?
+steps:
+  - field: consent
+    type: bool
+    knockout: { equals: false }
+  - field: rn_license_state
+    type: str
+    ask: "Which state is your RN license in, and is it currently active?"
+  - field: rn_license_active
+    type: bool
+    knockout: { equals: false }
+  - field: icu_years
+    type: float
+    ask: "How many years of ICU experience do you have?"
+  - field: certifications
+    type: list
+    ask: "Which certifications do you hold — BLS, ACLS, CCRN?"
+  - field: shift_availability
+    type: str
+    ask: "This role is night shifts. Which shifts can you work?"
+  - field: earliest_start
+    type: str
+    ask: "When is the earliest you could start?"
+  - field: pay_expectation
+    type: str
+    ask: "What hourly rate are you looking for?"
+weights:
+  icu_years: 0.4
+  certifications: 0.3
+  shift_availability: 0.2
+  earliest_start: 0.1
+scoring_version: icu-nurse-v1
