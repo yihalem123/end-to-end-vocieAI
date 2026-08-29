@@ -7,24 +7,41 @@ state machine — every method takes an explicit timestamp and returns a value, 
 sleeps, no tasks — so the whole policy is unit-testable with fake clocks; the
 caller (call.py) drives tick() from a ~50 ms loop with real time.
 
-Policy (from PLAN.md): when VAD reports silence (on_vad_stop) we arm a deadline —
-vad_stop + 250 ms if the accumulated transcript "looks complete" (ends in
-terminal punctuation), else vad_stop + 1200 ms of extra patience. Each ASR final
-re-arms the deadline from the SAME vad_stop anchor, because finals lag speech: a
-punctuated final arriving 150 ms after silence upgrades the pending slow wait to
-the fast one without restarting the clock. Deepgram's UtteranceEnd commits
-immediately (its own word-gap evidence). VAD start disarms everything — the
-caller resumed. Commits require non-empty text (a cough triggers VAD, not a turn)
-and reset state for the next turn. endpoint_delay = commit time - vad_stop: the
+Policy: when VAD reports silence (on_vad_stop) we arm a deadline anchored at
+vad_stop, with THREE patience tiers judged from the accumulated transcript:
+- complete (ends in terminal punctuation)            -> +250 ms   ("fast")
+- incomplete                                          -> +1.5 s    ("slow")
+- trailing (last word is a conjunction/preposition/
+  filler: "and", "to", "um" — the thought is clearly
+  still in flight)                                    -> +2.5 s    ("trailing")
+Each ASR final re-arms the deadline from the SAME vad_stop anchor, because
+finals lag speech: a punctuated final arriving 150 ms after silence upgrades a
+pending slow wait to fast without restarting the clock. Deepgram's UtteranceEnd
+(1 s word gap) commits immediately ONLY when the text looks complete — it is
+evidence, not a command; tuned 2026-08-30 after live turns like "…though. And"
+were cut off 157 ms after silence. The trailing-word check is the cheap lexical
+version of semantic turn detection (the managed alternative: Deepgram Flux's
+model-integrated end-of-turn). VAD start disarms everything — the caller
+resumed. Commits require non-empty text (a cough triggers VAD, not a turn) and
+reset state for the next turn. endpoint_delay = commit time - vad_stop: the
 per-turn cost of this policy, our first-class metric.
 """
 from dataclasses import dataclass
 
 _TERMINAL = (".", "!", "?")
+_TRAILING_WORDS = frozenset(
+    "and but or so to of in on at with for from the a an um uh like because "
+    "if when while my your our their his her its i".split()
+)
 
 
 def looks_complete(text: str) -> bool:
     return text.rstrip().endswith(_TERMINAL)
+
+
+def looks_trailing(text: str) -> bool:
+    words = text.rstrip().rstrip(",;:").split()
+    return bool(words) and words[-1].lower().strip(",;:") in _TRAILING_WORDS
 
 
 @dataclass(frozen=True)
@@ -33,13 +50,15 @@ class TurnComplete:
     endpoint_delay: float  # seconds from vad_stop to commit
     vad_stop_t: float
     commit_t: float
-    reason: str  # "fast" | "slow" | "utterance_end"
+    reason: str  # "fast" | "slow" | "trailing" | "utterance_end"
 
 
 class Endpointer:
-    def __init__(self, fast_sec: float = 0.25, slow_sec: float = 1.20) -> None:
+    def __init__(self, fast_sec: float = 0.25, slow_sec: float = 1.50,
+                 trailing_sec: float = 2.50) -> None:
         self.fast_sec = fast_sec
         self.slow_sec = slow_sec
+        self.trailing_sec = trailing_sec
         self._finals: list[str] = []
         self._vad_stop_t: float | None = None  # None = speaking or idle, nothing armed
 
@@ -64,10 +83,18 @@ class Endpointer:
         self._reset()
         return turn
 
+    def _tier(self) -> tuple[float, str]:
+        text = self.transcript
+        if looks_complete(text):
+            return self.fast_sec, "fast"
+        if looks_trailing(text):
+            return self.trailing_sec, "trailing"
+        return self.slow_sec, "slow"
+
     def _deadline(self) -> float | None:
         if self._vad_stop_t is None:
             return None
-        patience = self.fast_sec if looks_complete(self.transcript) else self.slow_sec
+        patience, _ = self._tier()
         return self._vad_stop_t + patience
 
     # --- events ---
@@ -86,11 +113,15 @@ class Endpointer:
         # from the current transcript, still anchored at vad_stop.
 
     def on_utterance_end(self, t: float) -> TurnComplete | None:
+        # Evidence, not a command: a 1 s word gap on a clearly unfinished
+        # thought ("…though. And") means thinking, not done. The timers decide.
+        if not looks_complete(self.transcript):
+            return None
         return self._commit(t, "utterance_end")
 
     def tick(self, t: float) -> TurnComplete | None:
         deadline = self._deadline()
         if deadline is None or t < deadline:
             return None
-        reason = "fast" if looks_complete(self.transcript) else "slow"
+        _, reason = self._tier()
         return self._commit(t, reason)

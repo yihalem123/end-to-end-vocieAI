@@ -1,12 +1,13 @@
-"""Endpointer state machine: fast/slow timers, UtteranceEnd, cancellation."""
+"""Endpointer state machine: patience tiers, UtteranceEnd, cancellation."""
 from server.realtime.endpoint import Endpointer
 
 FAST = 0.25
-SLOW = 1.20
+SLOW = 1.50
+TRAILING = 2.50
 
 
 def make() -> Endpointer:
-    return Endpointer(fast_sec=FAST, slow_sec=SLOW)
+    return Endpointer(fast_sec=FAST, slow_sec=SLOW, trailing_sec=TRAILING)
 
 
 def test_fast_commit_for_complete_sentence() -> None:
@@ -25,12 +26,26 @@ def test_fast_commit_for_complete_sentence() -> None:
 def test_incomplete_text_waits_for_slow_timer() -> None:
     ep = make()
     ep.on_vad_start(t=0.0)
-    ep.on_asr_final("I worked at", t=1.0)                # trailing off, no punctuation
+    ep.on_asr_final("I've been a nurse for three", t=1.0)  # unpunctuated, mid-list
     ep.on_vad_stop(t=1.0)
     assert ep.tick(t=1.0 + FAST + 0.1) is None           # fast timer must NOT fire
     turn = ep.tick(t=1.0 + SLOW + 0.01)
     assert turn is not None
     assert turn.reason == "slow"
+
+
+def test_trailing_word_gets_extra_patience() -> None:
+    # Live regression (2026-08-30): "Since I was telling you that, it's really
+    # great to" was cut at the slow timer. A dangling function word means the
+    # thought is still in flight — longest patience tier.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("Since I was telling you that, it's really great to", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None           # slow tier must NOT fire
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)
+    assert turn is not None
+    assert turn.reason == "trailing"
 
 
 def test_vad_start_cancels_pending_commit() -> None:
@@ -47,15 +62,30 @@ def test_vad_start_cancels_pending_commit() -> None:
     assert turn.transcript == "I worked at Kaiser. And then at Stanford."
 
 
-def test_utterance_end_commits_immediately() -> None:
+def test_utterance_end_commits_complete_text_immediately() -> None:
     ep = make()
     ep.on_vad_start(t=0.0)
-    ep.on_asr_final("Yes", t=1.0)                        # no punctuation -> slow path
+    ep.on_asr_final("Yes, I can.", t=1.0)
     ep.on_vad_stop(t=1.0)
-    turn = ep.on_utterance_end(t=1.4)                    # Deepgram is confident: commit
+    turn = ep.on_utterance_end(t=1.4)                    # word gap + complete: commit
     assert turn is not None
     assert turn.reason == "utterance_end"
     assert abs(turn.endpoint_delay - 0.4) < 1e-9
+
+
+def test_utterance_end_defers_to_timers_on_incomplete_text() -> None:
+    # Live regression (2026-08-30): "But I'm not I'm not sure, though. And" was
+    # committed 157 ms after vad_stop because UtteranceEnd bypassed the
+    # completeness check. UtteranceEnd is evidence, not a command.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("But I'm not I'm not sure, though. And", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.on_utterance_end(t=1.16) is None           # trailing "And": wait
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)              # patience, then commit
+    assert turn is not None
+    assert turn.reason == "trailing"
 
 
 def test_late_final_upgrades_slow_to_fast() -> None:
