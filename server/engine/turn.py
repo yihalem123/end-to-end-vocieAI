@@ -38,6 +38,10 @@ from server.engine.plan import InterviewState
 log = logging.getLogger(__name__)
 
 RESPONSES_URL = "https://api.openai.com/v1/responses"
+# Stage timeouts: connect bounds the handshake, read bounds the gap between
+# streamed chunks — a stalled stream fails typed instead of hanging a turn.
+ENGINE_CONNECT_TIMEOUT_SEC = 10.0
+ENGINE_READ_TIMEOUT_SEC = 20.0
 _ABBREVIATIONS = ("dr.", "st.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "vs.", "etc.")
 _TERMINAL = ".!?"
 
@@ -110,6 +114,10 @@ class SentenceChunker:
 
 class EngineStreamError(RuntimeError):
     """The Responses stream reported a failure event (arrives inside HTTP 200)."""
+
+
+class EngineTimeout(EngineStreamError):
+    """The provider exceeded a stage timeout (connect or inter-chunk read)."""
 
 
 @dataclass
@@ -221,15 +229,35 @@ class LlmEngine:
         self._settings = settings
         self.state = state
         self.last_ttft_ms: float | None = None
-        self._client = httpx.AsyncClient(timeout=30)
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(
+            30.0, connect=ENGINE_CONNECT_TIMEOUT_SEC,
+            read=ENGINE_READ_TIMEOUT_SEC))
 
     async def close(self) -> None:
         await self._client.aclose()
+
+    async def _stream_lines(self, body: dict):
+        """SSE lines with provider timeouts mapped to a typed EngineTimeout."""
+        try:
+            async with self._client.stream(
+                "POST", RESPONSES_URL, json=body,
+                headers={"Authorization": f"Bearer {self._settings.openai_api_key}"},
+            ) as resp:
+                if resp.status_code != 200:
+                    detail = (await resp.aread()).decode(errors="replace")[:300]
+                    raise RuntimeError(f"responses api {resp.status_code}: {detail}")
+                async for line in resp.aiter_lines():
+                    yield line
+        except httpx.TimeoutException as exc:
+            raise EngineTimeout(
+                f"engine stage timeout ({exc.__class__.__name__})") from exc
 
     async def respond(
         self,
         user_text: str,
         is_current: Callable[[], bool] | None = None,
+        turn_id: int | None = None,
+        generation_id: int | None = None,
     ) -> AsyncIterator[str]:
         """Yield reply sentences as they stream; apply tool calls as they land."""
         current = is_current or (lambda: True)
@@ -252,35 +280,29 @@ class LlmEngine:
         reply_parts: list[str] = []
         t0 = time.monotonic()
         self.last_ttft_ms = None
-        async with self._client.stream(
-            "POST", RESPONSES_URL, json=body,
-            headers={"Authorization": f"Bearer {self._settings.openai_api_key}"},
-        ) as resp:
-            if resp.status_code != 200:
-                detail = (await resp.aread()).decode(errors="replace")[:300]
-                raise RuntimeError(f"responses api {resp.status_code}: {detail}")
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload == "[DONE]":
-                    break
-                event = json.loads(payload)
-                if self.last_ttft_ms is None:
-                    self.last_ttft_ms = (time.monotonic() - t0) * 1000
-                for delta in assembler.feed(event):
-                    if not current():
-                        return
-                    reply_parts.append(delta)
-                    for sentence in chunker.push(delta):
-                        yield sentence
+        async for line in self._stream_lines(body):
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            event = json.loads(payload)
+            if self.last_ttft_ms is None:
+                self.last_ttft_ms = (time.monotonic() - t0) * 1000
+            for delta in assembler.feed(event):
+                if not current():
+                    return
+                reply_parts.append(delta)
+                for sentence in chunker.push(delta):
+                    yield sentence
         if not current():
             return
         tail = chunker.flush()
         if tail:
             yield tail
         # Tools first so the fallback sees the state they just updated.
-        self._apply_tools(assembler.tool_calls, current)
+        self._apply_tools(assembler.tool_calls, current,
+                          turn_id=turn_id, generation_id=generation_id)
         if not current():
             return
         if not "".join(reply_parts).strip():
@@ -295,23 +317,46 @@ class LlmEngine:
         self,
         calls: list[ToolCall],
         is_current: Callable[[], bool] | None = None,
+        turn_id: int | None = None,
+        generation_id: int | None = None,
     ) -> None:
+        """Validate, apply, and LEDGER every tool call. Failures are returned
+        to orchestration as ledger entries (and warnings), never swallowed;
+        duplicate tool_call_ids are idempotently skipped."""
         current = is_current or (lambda: True)
+        ledger = self.state.tool_ledger
+        seen = {e["tool_call_id"] for e in ledger if e.get("tool_call_id")}
         for call in calls:
             if not current():
                 return
+            entry = {"tool_call_id": call.call_id, "name": call.name,
+                     "turn_id": turn_id, "generation_id": generation_id,
+                     "arguments": call.arguments, "applied": False, "reason": ""}
+            ledger.append(entry)
+            if call.call_id and call.call_id in seen:
+                entry["reason"] = "duplicate tool_call_id (idempotent skip)"
+                continue
+            seen.add(call.call_id)
             if call.arguments is None:
+                entry["reason"] = "malformed arguments"
                 log.warning("malformed tool args for %s; skipped", call.name)
                 continue
             if call.name == "record_answer":
-                if not current():
-                    return
-                ok = self.state.record(call.arguments.get("field", ""),
-                                       call.arguments.get("value"),
-                                       call.arguments.get("quote", ""))
-                if not ok:
+                quote = str(call.arguments.get("quote") or "").strip()
+                if not quote:
+                    entry["reason"] = "empty quote: evidence required before mutation"
+                    log.warning("record_answer without quote rejected: %s",
+                                call.arguments)
+                    continue
+                entry["applied"] = self.state.record(
+                    call.arguments.get("field", ""),
+                    call.arguments.get("value"), quote)
+                if not entry["applied"]:
+                    entry["reason"] = "rejected by state validation"
                     log.warning("record_answer rejected: %s", call.arguments)
             elif call.name == "advance_step":
-                if not current():
-                    return
-                self.state.request_advance()
+                entry["applied"] = self.state.request_advance()
+                if not entry["applied"]:
+                    entry["reason"] = "current step not yet covered"
+            else:
+                entry["reason"] = "unknown tool"

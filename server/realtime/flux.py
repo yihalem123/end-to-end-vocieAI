@@ -13,17 +13,21 @@ commit. eot_threshold (0.7 default) is the one knob: higher = more patient.
 TurnResumed/EagerEndOfTurn belong to eager mode (speculative LLM start), the
 documented stretch. Session mechanics mirror asr.DeepgramSession: same audio
 queue contract (frames / FINALIZE ignored / None -> CloseStream), same
-reconnect-once, same bounded drop-newest event delivery.
+reconnect-once with epochs and typed AsrUnavailable, same bounded shutdown,
+same EventBuffer delivery (Updates replaceable, EndOfTurn never dropped).
 """
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
 import websockets
 
-from server.realtime.asr import FINALIZE
+from server.realtime.asr import (CONNECT_TIMEOUT_SEC, FINALIZE,
+                                 SHUTDOWN_TIMEOUT_SEC, AsrReconnected,
+                                 AsrUnavailable)
 
 log = logging.getLogger(__name__)
 
@@ -88,18 +92,33 @@ class FluxSession:
             try:
                 await self._run_once(audio)
                 return
-            except (websockets.ConnectionClosedError, OSError) as exc:
+            except (websockets.ConnectionClosedError, OSError, TimeoutError) as exc:
                 log.warning("flux connection lost (attempt %d): %s", attempt, exc)
                 if attempt == 2:
-                    raise
+                    raise AsrUnavailable("speech recognition unavailable") from exc
+                self._events_out.put_nowait(AsrReconnected(epoch=attempt + 1))
 
     async def _run_once(self, audio: asyncio.Queue) -> None:
         async with websockets.connect(
-            self._url, additional_headers={"Authorization": f"Token {self._api_key}"}
+            self._url, additional_headers={"Authorization": f"Token {self._api_key}"},
+            open_timeout=CONNECT_TIMEOUT_SEC,
         ) as ws:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._send_loop(ws, audio))
-                tg.create_task(self._recv_loop(ws))
+            await self._pump(ws, audio)
+
+    async def _pump(self, ws, audio: asyncio.Queue) -> None:
+        """Same bounded-shutdown contract as DeepgramSession._pump."""
+        recv = asyncio.create_task(self._recv_loop(ws))
+        try:
+            await self._send_loop(ws, audio)
+            try:
+                await asyncio.wait_for(asyncio.shield(recv), SHUTDOWN_TIMEOUT_SEC)
+            except TimeoutError:
+                log.warning("flux shutdown flush timed out; forcing close")
+        finally:
+            if not recv.done():
+                recv.cancel()
+            with suppress(asyncio.CancelledError):
+                await recv
 
     async def _send_loop(self, ws, audio: asyncio.Queue) -> None:
         while True:

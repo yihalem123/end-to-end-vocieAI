@@ -19,6 +19,7 @@ receive() reports disconnect as a message type, not an exception.
 """
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 import uuid
 from pathlib import Path
 
@@ -34,7 +35,8 @@ from server.postcall.report import (
     run_postcall,
     store_terminal_report,
 )
-from server.realtime.call import CallSession
+from server.engine.plan import load_plan_cached
+from server.realtime.call import CallSession, _get_vad_runtime
 from server.realtime.session import SessionStatus
 
 _postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
@@ -49,8 +51,21 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    app = FastAPI(title="screener")
-    app.state.settings = settings if settings is not None else get_settings()
+    resolved = settings if settings is not None else get_settings()
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Fail fast at boot: a broken plan file or missing VAD model must
+        # surface at startup, not on call #1. Both loads are cached, so the
+        # first call pays nothing.
+        app.state.plan = load_plan_cached(str(resolved.plan_path))
+        _get_vad_runtime()
+        log.info("startup warm: plan %r validated, vad runtime loaded",
+                 resolved.plan_path)
+        yield
+
+    app = FastAPI(title="screener", lifespan=lifespan)
+    app.state.settings = resolved
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -119,7 +134,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     state.session.transition(SessionStatus.POST_PROCESSING)
                     task = asyncio.create_task(run_postcall(
                         call_id, state.conversation, state.turns, app.state.settings,
-                        lifecycle=state.session))
+                        lifecycle=state.session,
+                        tool_ledger=session.tool_ledger))
                     _postcall_tasks.add(task)
                     task.add_done_callback(_postcall_tasks.discard)
                     log.info("postcall started: /report/%s/view", call_id)

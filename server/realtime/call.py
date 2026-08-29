@@ -3,9 +3,9 @@
 ## How this works
 One CallSession per WebSocket, three long-lived tasks under a TaskGroup:
 - _recv_loop (master): browser frames -> VAD (via asyncio.to_thread; the event
-  loop never blocks on ONNX) -> bounded ASR queue (DROP-OLDEST, counted). VAD
-  transitions and client JSON messages ("cleared" acks, "chat" text-mode input)
-  land on one internal event queue.
+  loop never blocks on ONNX) -> bounded ASR audio queue (DROP-OLDEST, counted).
+  VAD transitions and client JSON acks land on the EventBuffer, where stale
+  partials are replaceable and finals/acks are never dropped (events.py).
 - DeepgramSession.run: audio queue -> Deepgram -> typed ASR events, same queue.
 - _event_loop: single consumer. Feeds the Endpointer and ticks the barge-in
   guard (sync state machines + real time). Committed turns and chat messages go
@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -28,10 +29,13 @@ from server.realtime.asr import (
     FINALIZE,
     AsrFinal,
     AsrPartial,
+    AsrReconnected,
+    AsrUnavailable,
     AsrUtteranceEnd,
     DeepgramSession,
 )
 from server.realtime.endpoint import Endpointer, TurnComplete
+from server.realtime.events import EventBuffer
 from server.realtime.flux import FluxEndOfTurn, FluxSession, FluxStartOfTurn, FluxUpdate
 from server.realtime.reply import ReplyController
 from server.realtime.session import SessionLifecycle, SessionStatus, classify_consent
@@ -45,7 +49,7 @@ TICK_SEC = 0.05
 # (~0.5-1.5 s), and a 1 s queue ate the caller's greeting (found by the
 # simulated caller: VAD fired, zero transcripts, 54 drops). 5 s costs 160 KB.
 AUDIO_QUEUE_FRAMES = 250
-EVENT_QUEUE_SIZE = 200
+EVENT_REPLACEABLE_LIMIT = 64  # stale partials evictable; finals/acks never drop
 
 _shared_vad_runtime: SileroRuntime | None = None  # immutable model resources only
 
@@ -105,7 +109,7 @@ class CallSession:
         self._metric_prefix = "flux_" if self.mode == "flux" else ""
         self.state = CallState(call_id=call_id, session=SessionLifecycle(call_id))
         self._audio_to_asr: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_FRAMES)
-        self._events: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
+        self._events = EventBuffer(replaceable_limit=EVENT_REPLACEABLE_LIMIT)
         self._endpointer = Endpointer()
         self._last_vad_stop_t: float | None = None
         self._next_turn_id = 0
@@ -145,12 +149,23 @@ class CallSession:
                 events.cancel()
         except* WebSocketDisconnect:
             pass
+        except* AsrUnavailable:
+            # Typed provider failure: tell the caller and end cleanly instead
+            # of surfacing a bare traceback through the app layer.
+            log.error("asr unavailable; ending call %s", self.state.call_id)
+            self.state.session.transition(SessionStatus.FAILED)
+            with suppress(Exception):
+                await self._send({"type": "error",
+                                  "message": "speech recognition unavailable"})
+                await self._ws.close(code=1011)
         finally:
             await replies.close()
             log.info(
-                "call ended: %d turns, %d conversation entries, %d frames in, %d dropped",
+                "call ended: %d turns, %d conversation entries, %d frames in, "
+                "%d dropped, %d stale partials replaced",
                 len(self.state.turns), len(self.state.conversation),
                 self.state.frames_in, self.state.frames_dropped,
+                self._events.replaced,
             )
 
     async def _send(self, payload: dict) -> None:
@@ -225,11 +240,15 @@ class CallSession:
             self._audio_to_asr.put_nowait(frame)
 
     def _offer_event(self, event) -> None:
-        try:
-            self._events.put_nowait(event)
-        except asyncio.QueueFull:
-            self.state.vad_events_dropped += 1
-            log.error("pipeline event dropped — event queue full")
+        # EventBuffer never raises: stale partials are evicted under pressure,
+        # finals/VAD/client acks are always admitted (see events.py).
+        self._events.put_nowait(event)
+
+    @property
+    def tool_ledger(self) -> list[dict]:
+        """Audit trail of the engine's tool calls for the post-call report."""
+        interview = getattr(getattr(self, "_replies", None), "interview", None)
+        return list(getattr(interview, "tool_ledger", []) or [])
 
     def _new_turn_id(self) -> int:
         self._next_turn_id += 1
@@ -268,6 +287,13 @@ class CallSession:
                         await self._send({"type": "final", "text": text})
                 case AsrUtteranceEnd():
                     turn = self._endpointer.on_utterance_end(now)
+                case AsrReconnected(epoch=epoch):
+                    # Continuity: accumulated finals survive; next partial
+                    # supersedes any stale one. The caller sees a brief notice.
+                    log.warning("asr reconnected (epoch %d) call %s",
+                                epoch, self.state.call_id)
+                    await self._send({"type": "notice",
+                                      "text": "transcription reconnected"})
                 case ClientCleared(generation_id=generation, played_samples=played):
                     await self._replies.on_cleared(generation, played)
                 case ClientPlaybackDrained(generation_id=generation):

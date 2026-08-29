@@ -162,3 +162,51 @@ def test_voice_pipeline_finalizes_when_client_never_acks(monkeypatch) -> None:
         assert not controller.guard.agent_speaking
 
     asyncio.run(run())
+
+
+def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatch) -> None:
+    """P3.4: a failed generation must fail closed — never a second, conflicting
+    reply after audio already went out, and never a silent double-append."""
+    class ExplodingSpeaker:
+        async def speak(self, *_args):
+            raise RuntimeError("provider died mid-reply")
+
+        def text(self, _generation_id: int) -> str:  # pragma: no cover
+            return "never"
+
+    async def run() -> None:
+        sent: list[dict] = []
+        done = asyncio.Event()
+
+        async def send(event: dict) -> None:
+            sent.append(event)
+            if event["type"] == "error":
+                done.set()
+
+        controller = object.__new__(reply_module.ReplyController)
+        controller._send = send
+        controller._speaker = ExplodingSpeaker()
+        controller._supervisor = GenerationSupervisor()
+        controller._drained = {}
+        controller._active_voice_generation = None
+        controller._metric_prefix = ""
+        controller._state = SimpleNamespace(conversation=[])
+        controller.guard = BargeInGuard()
+        controller.interview = None
+        controller._filler_idx = 0
+        controller._engine = StubEngine()
+        now = time.monotonic()
+        turn = TurnComplete("Hello.", 0.1, now, now, "test")
+        token = await controller._supervisor.start(
+            1, lambda owned: controller._speak_reply(owned, turn))
+        controller._drained[token.generation_id] = asyncio.Event()
+        controller._active_voice_generation = token.generation_id
+        controller.guard.on_agent_audio_start()
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+        await asyncio.sleep(0.05)  # would catch any trailing duplicate reply
+
+        assert [e["type"] for e in sent] == ["error"]
+        assert controller._state.conversation == []   # nothing fabricated
+        assert not controller.guard.agent_speaking
+
+    asyncio.run(run())

@@ -16,7 +16,7 @@ from html import escape
 from pathlib import Path
 
 from server.config import Settings
-from server.engine.plan import load_plan
+from server.engine.plan import load_plan_cached
 from server.postcall.extract import Extracted, extract_call
 from server.postcall.score import ScoreResult, score_call
 from server.realtime.session import SessionLifecycle, SessionStatus
@@ -29,7 +29,8 @@ reports: OrderedDict[str, dict] = OrderedDict()
 
 def build_report(call_id: str, conversation: list[dict], turns: list,
                  extracted: dict[str, Extracted], result: ScoreResult,
-                 session_state: str = SessionStatus.COMPLETED) -> dict:
+                 session_state: str = SessionStatus.COMPLETED,
+                 tool_ledger: list[dict] | None = None) -> dict:
     return {
         "call_id": call_id,
         "session_state": session_state,
@@ -46,6 +47,7 @@ def build_report(call_id: str, conversation: list[dict], turns: list,
                    "contradictory": e.contradictory}
             for name, e in extracted.items()
         },
+        "tool_ledger": list(tool_ledger or []),
         "turn_count": len(turns),
         "endpoint_delays_ms": [round(t.endpoint_delay * 1000) for t in turns],
         "conversation": conversation,
@@ -76,14 +78,15 @@ def store_terminal_report(call_id: str, conversation: list[dict],
 
 
 async def run_postcall(call_id: str, conversation: list[dict], turns: list,
-                       settings: Settings, lifecycle: SessionLifecycle | None = None) -> None:
+                       settings: Settings, lifecycle: SessionLifecycle | None = None,
+                       tool_ledger: list[dict] | None = None) -> None:
     try:
-        plan = load_plan(Path(settings.plan_path))
+        plan = load_plan_cached(str(settings.plan_path))
         extracted = await extract_call(settings, plan, conversation)
         result = score_call(plan, extracted)
         report = build_report(
             call_id, conversation, turns, extracted, result,
-            session_state=SessionStatus.COMPLETED)
+            session_state=SessionStatus.COMPLETED, tool_ledger=tool_ledger)
         if lifecycle is not None:
             lifecycle.transition(SessionStatus.COMPLETED)
         _store(call_id, report)

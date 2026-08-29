@@ -15,10 +15,13 @@ correct by construction):
   None sentinel in the queue means end-of-call: send {"type":"CloseStream"} so
   Deepgram flushes its final transcripts before we hang up.
 - _recv_loop parses each message into a typed event and pushes it to events_out
-  (bounded; if the consumer stalls we drop-newest and count, never block the
-  socket reader).
-run() retries ONCE on an abnormal close — enough for a network blip, while a
-systematic failure (bad key) surfaces immediately instead of retry-looping.
+  (the EventBuffer: stale partials are replaceable under pressure; finals and
+  control events are never dropped — see events.py). Never blocks the reader.
+run() retries ONCE on an abnormal close (each attempt is a connection epoch; a
+reconnect emits AsrReconnected so the consumer can surface it), then fails with
+the typed AsrUnavailable. Shutdown is bounded: after CloseStream the receiver
+gets SHUTDOWN_TIMEOUT_SEC to drain finals before being cancelled — a hung
+provider cannot hold call teardown hostage.
 
 Design note (interview): this is Deepgram v1 + our own endpointer (endpoint.py)
 by deliberate choice. Deepgram's newer Flux model (v2/listen) has model-integrated
@@ -29,6 +32,7 @@ the point.
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
@@ -37,6 +41,12 @@ import websockets
 log = logging.getLogger(__name__)
 
 KEEPALIVE_IDLE_SEC = 4  # Deepgram closes after 10 s of silence; stay well under
+CONNECT_TIMEOUT_SEC = 10   # bound the handshake: fail typed, not hung
+SHUTDOWN_TIMEOUT_SEC = 5   # after CloseStream: how long we wait for final flush
+
+
+class AsrUnavailable(RuntimeError):
+    """The ASR provider could not be reached or kept failing after a retry."""
 
 FINALIZE = "finalize"  # audio-queue control marker -> {"type":"Finalize"}.
 # Why: Deepgram's own endpointing finalizes short utterances ("Five.") only
@@ -61,7 +71,15 @@ class AsrUtteranceEnd:
     pass
 
 
-AsrEvent = AsrPartial | AsrFinal | AsrUtteranceEnd
+@dataclass(frozen=True)
+class AsrReconnected:
+    """The stream restarted on a new connection epoch. Continuity policy:
+    accumulated endpointer finals survive; the next partial supersedes any
+    stale one (partials are replaceable by design — see events.py)."""
+    epoch: int
+
+
+AsrEvent = AsrPartial | AsrFinal | AsrUtteranceEnd | AsrReconnected
 
 
 def build_url() -> str:
@@ -108,22 +126,38 @@ class DeepgramSession:
         self.dropped_events = 0
 
     async def run(self, audio: asyncio.Queue) -> None:
-        for attempt in (1, 2):  # reconnect-once policy
+        for attempt in (1, 2):  # reconnect-once policy, each attempt = an epoch
             try:
                 await self._run_once(audio)
                 return
-            except (websockets.ConnectionClosedError, OSError) as exc:
+            except (websockets.ConnectionClosedError, OSError, TimeoutError) as exc:
                 log.warning("deepgram connection lost (attempt %d): %s", attempt, exc)
                 if attempt == 2:
-                    raise
+                    raise AsrUnavailable("speech recognition unavailable") from exc
+                self._events_out.put_nowait(AsrReconnected(epoch=attempt + 1))
 
     async def _run_once(self, audio: asyncio.Queue) -> None:
         async with websockets.connect(
-            self._url, additional_headers={"Authorization": f"Token {self._api_key}"}
+            self._url, additional_headers={"Authorization": f"Token {self._api_key}"},
+            open_timeout=CONNECT_TIMEOUT_SEC,
         ) as ws:
-            async with asyncio.TaskGroup() as tg:
-                tg.create_task(self._send_loop(ws, audio))
-                tg.create_task(self._recv_loop(ws))
+            await self._pump(ws, audio)
+
+    async def _pump(self, ws, audio: asyncio.Queue) -> None:
+        """Sender drives; after the CloseStream sentinel the receiver gets a
+        bounded window to drain finals — a hung provider cannot hold teardown."""
+        recv = asyncio.create_task(self._recv_loop(ws))
+        try:
+            await self._send_loop(ws, audio)
+            try:
+                await asyncio.wait_for(asyncio.shield(recv), SHUTDOWN_TIMEOUT_SEC)
+            except TimeoutError:
+                log.warning("asr shutdown flush timed out; forcing close")
+        finally:
+            if not recv.done():
+                recv.cancel()
+            with suppress(asyncio.CancelledError):
+                await recv
 
     async def _send_loop(self, ws, audio: asyncio.Queue) -> None:
         while True:

@@ -45,10 +45,16 @@ FRAME_BYTES = 640  # 20 ms of 16 kHz PCM16
 DEFAULT_MODEL = "eleven_flash_v2_5"
 INACTIVITY_TIMEOUT_SEC = 180  # max allowed; the connection must outlive silences
 TTS_CONTEXT_QUEUE_SIZE = 32   # provider chunks; overflow fails this context closed
+TTS_CHUNK_TIMEOUT_SEC = 15    # max wait for the provider's next chunk
+TTS_CONNECT_TIMEOUT_SEC = 10
 
 
 class TtsBufferOverflow(RuntimeError):
     """The consumer could not keep up with provider audio for one context."""
+
+
+class TtsTimeout(RuntimeError):
+    """The provider stopped delivering audio for one context in time."""
 
 
 def build_url(voice_id: str, model_id: str = DEFAULT_MODEL) -> str:
@@ -123,7 +129,8 @@ class MultiContextTts:
             if self._ws is not None and self._reader is not None and not self._reader.done():
                 return
             self._ws = await websockets.connect(
-                self._url, additional_headers={"xi-api-key": self._api_key}
+                self._url, additional_headers={"xi-api-key": self._api_key},
+                open_timeout=TTS_CONNECT_TIMEOUT_SEC,
             )
             self._reader = asyncio.create_task(self._read_loop(self._ws))
 
@@ -175,7 +182,13 @@ class MultiContextTts:
             await self._ws.send(json.dumps({"text": "", "flush": True, "context_id": ctx}))
             await self._ws.send(json.dumps({"context_id": ctx, "close_context": True}))
             while True:
-                item = await queue.get()
+                try:
+                    item = await asyncio.wait_for(queue.get(),
+                                                  timeout=TTS_CHUNK_TIMEOUT_SEC)
+                except TimeoutError as exc:
+                    raise TtsTimeout(
+                        f"no tts audio for context {ctx} within "
+                        f"{TTS_CHUNK_TIMEOUT_SEC}s") from exc
                 if isinstance(item, Exception):
                     raise item
                 audio, is_final = item

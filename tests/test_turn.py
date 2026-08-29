@@ -165,3 +165,47 @@ def test_stale_generation_cannot_apply_tool_side_effects() -> None:
 
     assert state.fields == {}
     assert state.step_idx == 0
+
+
+# --- Phase 3: tool execution ledger ---
+
+def _engine_with_state():
+    from pathlib import Path
+    from server.config import Settings
+    from server.engine.plan import InterviewState, load_plan
+    from server.engine.turn import LlmEngine
+    plan = load_plan(Path(__file__).resolve().parents[1] / "plans" / "icu_nurse.yaml")
+    state = InterviewState(plan)
+    return LlmEngine(Settings(_env_file=None, openai_api_key="k"), state), state
+
+
+def _tc(call_id, name, args):
+    from server.engine.turn import ToolCall
+    return ToolCall(name=name, call_id=call_id, arguments=args)
+
+
+def test_ledger_records_applied_and_rejected_calls() -> None:
+    engine, state = _engine_with_state()
+    engine._apply_tools([
+        _tc("c1", "record_answer", {"field": "consent", "value": "true", "quote": "yes go ahead"}),
+        _tc("c2", "record_answer", {"field": "not_a_field", "value": "x", "quote": "q"}),
+        _tc("c3", "record_answer", {"field": "icu_years", "value": "5", "quote": ""}),
+        _tc("c4", "advance_step", {}),
+    ], turn_id=3, generation_id=7)
+    ledger = state.tool_ledger
+    assert [e["applied"] for e in ledger] == [True, False, False, True]
+    assert ledger[1]["reason"] == "rejected by state validation"
+    assert "quote" in ledger[2]["reason"]          # evidence required before mutation
+    assert state.fields.keys() == {"consent"}      # empty-quote record never mutated
+    assert all(e["turn_id"] == 3 and e["generation_id"] == 7 for e in ledger)
+
+
+def test_ledger_skips_duplicate_tool_call_ids() -> None:
+    engine, state = _engine_with_state()
+    call = _tc("dup", "record_answer",
+               {"field": "consent", "value": "true", "quote": "yes"})
+    engine._apply_tools([call])
+    engine._apply_tools([call])                    # replayed delivery
+    applied = [e for e in state.tool_ledger if e["applied"]]
+    skipped = [e for e in state.tool_ledger if "duplicate" in e["reason"]]
+    assert len(applied) == 1 and len(skipped) == 1

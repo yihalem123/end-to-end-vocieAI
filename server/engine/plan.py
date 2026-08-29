@@ -15,6 +15,7 @@ only caller-utterance-verified post-call evidence may produce a score or knockou
 """
 import re
 from dataclasses import dataclass, field as dc_field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,13 @@ def load_plan(path: Path) -> InterviewPlan:
     )
 
 
+@lru_cache(maxsize=4)
+def load_plan_cached(path_str: str) -> InterviewPlan:
+    """Process-wide plan cache: plans are immutable data, loaded once. The app
+    lifespan warms this at startup so a broken plan fails the boot, not call #1."""
+    return load_plan(Path(path_str))
+
+
 def _coerce(value: Any, type_name: str) -> Any:
     match type_name:
         case "bool":
@@ -114,6 +122,9 @@ class InterviewState:
         self.history: list[dict[str, str]] = []
         self.step_idx = 0
         self.knocked_out: str | None = None
+        # Audit trail of every tool call the model attempted: applied or not,
+        # with the reason — orchestration and the post-call report read this.
+        self.tool_ledger: list[dict] = []
 
     @property
     def current_step(self) -> Step:

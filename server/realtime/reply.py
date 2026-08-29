@@ -26,7 +26,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from server.config import Settings
-from server.engine.plan import InterviewState, load_plan
+from server.engine.plan import InterviewState, load_plan_cached
 from server.engine.stub import StubEngine
 from server.engine.turn import LlmEngine
 from server.metrics import registry
@@ -136,7 +136,7 @@ class ReplyController:
             self._speaker = Speaker(self._send_audio, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
         self._filler_idx = 0
-        plan = load_plan(Path(settings.plan_path))
+        plan = load_plan_cached(str(settings.plan_path))
         self.interview = InterviewState(plan)
         self._engine: LlmEngine | StubEngine
         if settings.openai_api_key:
@@ -159,7 +159,9 @@ class ReplyController:
         if not is_current():
             return
         if isinstance(self._engine, LlmEngine):
-            async for sentence in self._engine.respond(transcript, is_current=is_current):
+            async for sentence in self._engine.respond(
+                    transcript, is_current=is_current,
+                    turn_id=token.turn_id, generation_id=token.generation_id):
                 if not is_current():
                     return
                 yield sentence

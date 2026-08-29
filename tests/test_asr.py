@@ -7,6 +7,7 @@ from server.realtime.asr import (
     FINALIZE,
     AsrFinal,
     AsrPartial,
+    AsrReconnected,
     AsrUtteranceEnd,
     DeepgramSession,
     build_url,
@@ -70,11 +71,20 @@ def test_parse_garbage_returns_none() -> None:
 
 
 class FakeWs:
-    def __init__(self) -> None:
+    def __init__(self, hang_recv: bool = False) -> None:
         self.sent: list = []
+        self._hang_recv = hang_recv
 
     async def send(self, data) -> None:
         self.sent.append(data)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._hang_recv:
+            await asyncio.Event().wait()  # a server that never closes
+        raise StopAsyncIteration
 
 
 def test_send_loop_control_frames() -> None:
@@ -96,3 +106,44 @@ def test_send_loop_control_frames() -> None:
     assert sent[0] == b"\x00" * 640
     assert json.loads(sent[1]) == {"type": "Finalize"}
     assert json.loads(sent[2]) == {"type": "CloseStream"}
+
+
+def test_shutdown_is_bounded_when_provider_never_closes(monkeypatch) -> None:
+    # After CloseStream the receive loop waits for Deepgram to close; a hung
+    # provider must not hold the call teardown hostage.
+    import server.realtime.asr as asr_module
+    monkeypatch.setattr(asr_module, "SHUTDOWN_TIMEOUT_SEC", 0.05)
+
+    async def run() -> None:
+        session = DeepgramSession("key", asyncio.Queue())
+        audio: asyncio.Queue = asyncio.Queue()
+        audio.put_nowait(None)  # immediate hangup
+        await asyncio.wait_for(session._pump(FakeWs(hang_recv=True), audio),
+                               timeout=1.0)
+
+    asyncio.run(run())  # completing at all IS the assertion
+
+
+def test_reconnect_emits_epoch_event() -> None:
+    # The consumer learns the stream restarted (continuity: accumulated finals
+    # survive; the next partial replaces any stale one).
+    async def run() -> list:
+        events: asyncio.Queue = asyncio.Queue()
+        session = DeepgramSession("key", events)
+        attempts = []
+
+        async def flaky(audio):
+            attempts.append(1)
+            if len(attempts) == 1:
+                from websockets.exceptions import ConnectionClosedError
+                raise ConnectionClosedError(None, None)
+
+        session._run_once = flaky
+        await session.run(asyncio.Queue())
+        out = []
+        while not events.empty():
+            out.append(events.get_nowait())
+        return out
+
+    out = asyncio.run(run())
+    assert out == [AsrReconnected(epoch=2)]

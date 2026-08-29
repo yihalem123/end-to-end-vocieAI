@@ -2,6 +2,8 @@
 import asyncio
 import base64
 import json
+
+import pytest
 from urllib.parse import parse_qs, urlparse
 
 from server.realtime.tts import (
@@ -102,3 +104,40 @@ def test_multi_context_queue_overflow_fails_closed() -> None:
     item = queue.get_nowait()
     assert isinstance(item, TtsBufferOverflow)
     assert queue.empty()  # buffered stale audio was discarded, not replayed later
+
+
+def test_synthesize_times_out_typed_when_provider_stalls(monkeypatch) -> None:
+    import asyncio
+    from server.realtime import tts as tts_module
+
+    monkeypatch.setattr(tts_module, "TTS_CHUNK_TIMEOUT_SEC", 0.01)
+
+    class SilentWs:
+        def __init__(self) -> None:
+            self.sent: list = []
+
+        async def send(self, data) -> None:
+            self.sent.append(data)
+
+    async def run() -> None:
+        client = object.__new__(tts_module.MultiContextTts)
+        client._api_key = "k"
+        client._url = "wss://unused"
+        client._ws = SilentWs()
+        client._queues = {}
+        client._counter = 0
+        client._connect_lock = asyncio.Lock()
+        client._reader = asyncio.create_task(asyncio.sleep(3600))
+
+        async def no_connect() -> None:
+            return None
+
+        client.ensure_connected = no_connect
+        try:
+            with pytest.raises(tts_module.TtsTimeout):
+                async for _ in client.synthesize("hello"):
+                    raise AssertionError("no audio should arrive")
+        finally:
+            client._reader.cancel()
+
+    asyncio.run(run())

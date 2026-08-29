@@ -57,3 +57,17 @@ def test_ws_call_without_key_reports_error() -> None:
         assert error["type"] == "error"
         assert error["call_id"] == session["call_id"]
         assert "DEEPGRAM_API_KEY" in error["message"]
+
+
+def test_lifespan_warms_plan_and_vad_and_fails_fast_on_bad_plan(tmp_path) -> None:
+    import pytest
+    from server.app import create_app
+    from server.config import Settings
+
+    with TestClient(create_app(Settings(_env_file=None))) as client:
+        assert client.app.state.plan.scoring_version  # warmed at startup
+
+    bad = Settings(_env_file=None, plan_path=str(tmp_path / "missing.yaml"))
+    with pytest.raises(Exception):
+        with TestClient(create_app(bad)):
+            pass  # startup itself must fail, not call #1
