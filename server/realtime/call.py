@@ -34,7 +34,7 @@ from server.realtime.asr import AsrFinal, AsrPartial, AsrUtteranceEnd, DeepgramS
 from server.realtime.bargein import BargeInGuard
 from server.realtime.endpoint import Endpointer, TurnComplete
 from server.realtime.speaker import Speaker
-from server.realtime.tts import TtsSession
+from server.realtime.tts import MultiContextTts
 from server.realtime.vad import SileroVad, VadEvent, VadStream
 
 log = logging.getLogger(__name__)
@@ -86,10 +86,15 @@ class CallSession:
             await self._send({"type": "error", "message": "DEEPGRAM_API_KEY is not set"})
             await self._ws.close()
             return
+        tts: MultiContextTts | None = None
+        prewarm: asyncio.Task | None = None
         if self._settings.elevenlabs_api_key:
-            tts = TtsSession(self._settings.elevenlabs_api_key,
-                             self._settings.elevenlabs_voice_id)
+            tts = MultiContextTts(self._settings.elevenlabs_api_key,
+                                  self._settings.elevenlabs_voice_id)
             self._speaker = Speaker(self._ws.send_bytes, tts)
+            # Pay the ~800 ms handshake during call setup, not inside the first
+            # reply's ttfb. The caller hasn't even said hello yet.
+            prewarm = asyncio.create_task(tts.ensure_connected())
         vad_model = _get_vad()
         vad_model.reset()
         self._vad = VadStream(vad=vad_model)
@@ -106,6 +111,10 @@ class CallSession:
         finally:
             if self._speak_task is not None and not self._speak_task.done():
                 self._speak_task.cancel()
+            if prewarm is not None and not prewarm.done():
+                prewarm.cancel()
+            if tts is not None:
+                await tts.close()
             log.info(
                 "call ended: %d turns, %d replies, %d frames in, %d dropped",
                 len(self.state.turns), len(self.state.replies),

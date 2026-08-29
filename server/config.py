@@ -17,7 +17,9 @@ class Settings(BaseSettings):
     deepgram_api_key: str = ""
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
-    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # "Rachel", a premade voice
+    # "Sarah", a premade voice available to free API accounts. (The classic
+    # "Rachel" id is a library voice now — the API rejects it on free tiers.)
+    elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
     turn_model: str = "gpt-5.6-luna"
 
 

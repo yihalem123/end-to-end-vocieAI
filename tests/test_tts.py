@@ -3,7 +3,13 @@ import base64
 import json
 from urllib.parse import parse_qs, urlparse
 
-from server.realtime.tts import FrameChunker, build_url, parse_tts_message
+from server.realtime.tts import (
+    FrameChunker,
+    build_multi_url,
+    build_url,
+    parse_multi_message,
+    parse_tts_message,
+)
 
 
 def test_build_url_pins_model_and_format() -> None:
@@ -36,6 +42,30 @@ def test_parse_empty_audio_field() -> None:
     audio, is_final = parse_tts_message(json.dumps({"audio": None, "isFinal": None}))
     assert audio == b""
     assert is_final is False
+
+
+def test_build_multi_url_pins_agent_options() -> None:
+    url = build_multi_url(voice_id="v1")
+    parsed = urlparse(url)
+    assert parsed.path == "/v1/text-to-speech/v1/multi-stream-input"
+    q = parse_qs(parsed.query)
+    assert q["model_id"] == ["eleven_flash_v2_5"]
+    assert q["output_format"] == ["pcm_16000"]
+    assert q["auto_mode"] == ["true"]           # full sentences: skip chunk buffering
+    assert q["inactivity_timeout"] == ["180"]   # survive silences between replies
+
+
+def test_parse_multi_message_routes_by_context() -> None:
+    pcm = b"\x0a\x0b" * 10
+    raw = json.dumps({"audio": base64.b64encode(pcm).decode(), "contextId": "c3"})
+    ctx, audio, is_final = parse_multi_message(raw)
+    assert (ctx, audio, is_final) == ("c3", pcm, False)
+
+
+def test_parse_multi_final_message() -> None:
+    ctx, audio, is_final = parse_multi_message(
+        json.dumps({"isFinal": True, "contextId": "c3"}))
+    assert (ctx, audio, is_final) == ("c3", b"", True)
 
 
 def test_frame_chunker_reslices_to_640_bytes() -> None:
