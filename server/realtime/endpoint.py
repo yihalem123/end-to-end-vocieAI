@@ -77,6 +77,19 @@ class Endpointer:
     def transcript(self) -> str:
         return " ".join(self._finals)
 
+    @property
+    def armed(self) -> bool:
+        """Caller is silent and a commit deadline is running."""
+        return self._vad_stop_t is not None
+
+    @property
+    def pending_complete(self) -> bool:
+        """Armed (caller silent) with a complete-looking transcript: the fast
+        tier will commit at its deadline. Downstream may start SPECULATIVE
+        generation now — audio release still waits for the actual commit."""
+        return (self._vad_stop_t is not None and bool(self.transcript)
+                and looks_complete(self.transcript))
+
     def _reset(self) -> None:
         self._finals = []
         self._vad_stop_t = None

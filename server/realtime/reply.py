@@ -39,13 +39,21 @@ from server.realtime.tts import MultiContextTts
 
 log = logging.getLogger(__name__)
 
+
+def _spoken_eq(a: str, b: str) -> bool:
+    """Punctuation/case-insensitive equality: a speculation seeded from an
+    interim transcript must still promote when the final only adds a period."""
+    import re
+    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+    return norm(a) == norm(b)
+
 # Perceived-latency filler, ON DEMAND: at turn commit we give the engine a
 # patience window; if its first sentence arrives in time the caller hears only
 # the real reply, and only a slow turn gets covered by an acknowledgment.
 # Rotated for variety; skipped on the first exchange (an "Okay." before the
 # greeting reads wrong).
 FILLERS = ("Okay.", "Got it.", "Alright.", "Thanks.")
-FILLER_PATIENCE_SEC = 0.6
+FILLER_PATIENCE_SEC = 0.45
 SENTENCE_QUEUE_SIZE = 8  # bounded LLM -> TTS handoff; producer backpressures
 DRAIN_ACK_MARGIN_SEC = 1.0
 DRAIN_ACK_MAX_SEC = 5.0
@@ -126,6 +134,7 @@ class ReplyController:
         self.guard = BargeInGuard()
         self._supervisor = GenerationSupervisor()
         self._drained: dict[int, asyncio.Event] = {}
+        self._spec: dict | None = None  # in-flight speculative generation
         self._active_voice_generation: int | None = None
         self._tts: MultiContextTts | None = None
         self._prewarm: asyncio.Task | None = None
@@ -174,6 +183,24 @@ class ReplyController:
     # --- voice path ---
 
     async def on_turn(self, turn: TurnComplete, turn_id: int) -> None:
+        spec = self._spec
+        if (spec is not None
+                and self._supervisor.is_current(spec["token"])
+                and spec["token"].turn_id == turn_id
+                and _spoken_eq(spec["transcript"], turn.transcript)):
+            # PROMOTE: the guessed turn is the committed turn. The generation
+            # has been running since vad_stop; fill the timing anchors and
+            # release the audio gate — everything downstream is already warm.
+            self._spec = None
+            token = spec["token"]
+            log.info("speculation PROMOTED gen=%d", token.generation_id)
+            spec["anchors"]["commit_t"] = turn.commit_t
+            spec["anchors"]["vad_stop_t"] = turn.vad_stop_t
+            self._drained[token.generation_id] = asyncio.Event()
+            self._active_voice_generation = token.generation_id
+            self.guard.on_agent_audio_start()
+            spec["release"].set()
+            return
         await self._replace_current()
         if self._speaker is None:
             await self._supervisor.start(
@@ -186,23 +213,28 @@ class ReplyController:
         self.guard.on_agent_audio_start()
 
     async def _speak_reply(self, token: GenerationToken, turn: TurnComplete) -> None:
-        sentences = self._sentences_for(token, turn.transcript)
+        sentences = self._voiced_sentences(token, turn.transcript)
+        await self._deliver_voice(
+            token, sentences,
+            {"commit_t": turn.commit_t, "vad_stop_t": turn.vad_stop_t},
+            record_metrics=True)
+
+    def _voiced_sentences(self, token: GenerationToken, transcript: str):
+        sentences = self._sentences_for(token, transcript)
         if wants_filler(self.interview):
             filler = FILLERS[self._filler_idx % len(FILLERS)]
             self._filler_idx += 1
             sentences = overlap_stream(filler, sentences)
-        await self._deliver_voice(
-            token, sentences, turn.commit_t, turn.vad_stop_t, record_metrics=True)
+        return sentences
 
     async def _deliver_voice(self, token: GenerationToken, sentences,
-                             commit_t: float, vad_stop_t: float,
-                             record_metrics: bool) -> None:
+                             anchors: dict, record_metrics: bool,
+                             release: asyncio.Event | None = None) -> None:
         assert self._speaker is not None
         is_current = lambda: self._supervisor.is_current(token)
         try:
             timings = await self._speaker.speak(
-                sentences, commit_t, vad_stop_t,
-                token.generation_id, is_current)
+                sentences, anchors, token.generation_id, is_current, release)
             if not is_current():
                 return
             await self._send({"type": "audio_end", "turn_id": token.turn_id,
@@ -288,7 +320,8 @@ class ReplyController:
         token = await self._supervisor.start(
             turn_id,
             lambda owned: self._deliver_voice(
-                owned, one_sentence(), now, now, record_metrics=False),
+                owned, one_sentence(),
+                {"commit_t": now, "vad_stop_t": now}, record_metrics=False),
         )
         self._drained[token.generation_id] = asyncio.Event()
         self._active_voice_generation = token.generation_id
@@ -303,7 +336,41 @@ class ReplyController:
 
     # --- barge-in ---
 
+    async def speculate(self, transcript: str, turn_id: int) -> None:
+        """Start LLM+TTS for the expected turn BEFORE the endpointer commits.
+        Safe by construction: audio is release-gated, tools apply only at
+        stream end under an is_current check, and the supervisor cancels the
+        generation if the caller resumes or the transcript changes."""
+        if self._speaker is None or not isinstance(self._engine, LlmEngine):
+            return
+        if self._spec is not None:
+            if _spoken_eq(self._spec["transcript"], transcript):
+                return  # already speculating on effectively this turn
+            await self.cancel_speculation()  # transcript grew: guess is stale
+        if self._supervisor.current is not None:
+            return  # a real reply is active; never preempt it on a guess
+        release = asyncio.Event()
+        anchors = {"commit_t": 0.0, "vad_stop_t": 0.0}
+        spec = {"transcript": transcript, "release": release, "anchors": anchors}
+        log.info("speculation START %r", transcript[:60])
+        spec_token_holder = None
+        spec["token"] = await self._supervisor.start(
+            turn_id,
+            lambda owned: self._deliver_voice(
+                owned, self._voiced_sentences(owned, transcript),
+                anchors, record_metrics=True, release=release))
+        self._spec = spec
+
+    async def cancel_speculation(self) -> None:
+        spec = self._spec
+        self._spec = None
+        if spec is not None and self._supervisor.is_current(spec["token"]):
+            log.info("speculation CANCELLED %r", spec["transcript"][:60])
+            await self._supervisor.cancel_current()
+
     async def _replace_current(self) -> None:
+        if self._spec is not None:
+            await self.cancel_speculation()
         if self._supervisor.current is None:
             return
         if self._active_voice_generation is not None:

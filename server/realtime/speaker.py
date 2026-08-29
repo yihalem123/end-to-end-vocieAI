@@ -51,9 +51,14 @@ class Speaker:
         self.samples_sent_total = 0  # observability only; acks are per generation
         self._records: dict[int, PlaybackRecord] = {}
 
-    async def speak(self, sentences: AsyncIterable[str], commit_t: float,
-                    vad_stop_t: float, generation_id: int,
-                    is_current: Callable[[], bool]) -> dict:
+    async def speak(self, sentences: AsyncIterable[str], anchors: dict,
+                    generation_id: int, is_current: Callable[[], bool],
+                    release: asyncio.Event | None = None) -> dict:
+        """`anchors` carries commit_t/vad_stop_t and is read at measurement
+        time — for a SPECULATIVE generation they are filled at promotion.
+        `release` (when given) gates the FIRST audio send: LLM and TTS run
+        warm behind it, but nothing reaches the caller until the endpointer
+        actually commits and the controller sets the event."""
         # Streaming input: sentences arrive as the LLM writes them, so sentence
         # one is playing while sentence three is still being generated.
         record = PlaybackRecord()
@@ -70,13 +75,15 @@ class Speaker:
                 chunker = FrameChunker()
                 async for chunk in self._tts.synthesize(sentence):
                     self._require_current(is_current)
-                    if "tts_ttfb_ms" not in timings:
-                        timings["tts_ttfb_ms"] = (time.monotonic() - commit_t) * 1000
                     for frame in chunker.push(chunk):
                         if pace_start is None:
+                            if release is not None:
+                                await release.wait()  # commit-gated: no early audio
+                                self._require_current(is_current)
                             pace_start = time.monotonic()
-                            timings["first_audio_ms"] = (pace_start - commit_t) * 1000
-                            timings["turn_latency_ms"] = (pace_start - vad_stop_t) * 1000
+                            timings["tts_ttfb_ms"] = (pace_start - anchors["commit_t"]) * 1000
+                            timings["first_audio_ms"] = (pace_start - anchors["commit_t"]) * 1000
+                            timings["turn_latency_ms"] = (pace_start - anchors["vad_stop_t"]) * 1000
                         frames_sent = await self._send_paced(
                             frame, pace_start, frames_sent, generation_id, is_current)
                 tail = chunker.flush()

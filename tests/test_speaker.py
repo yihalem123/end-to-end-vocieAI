@@ -49,7 +49,7 @@ def test_generation_invalidated_during_send_stops_further_audio() -> None:
 
         speaker = Speaker(send, FakeTts())
         with pytest.raises(asyncio.CancelledError):
-            await speaker.speak(sentences(), 0.0, 0.0, 7, lambda: current)
+            await speaker.speak(sentences(), {"commit_t": 0.0, "vad_stop_t": 0.0}, 7, lambda: current)
         assert [generation for generation, _ in sent] == [7]
 
     asyncio.run(run())
@@ -61,7 +61,7 @@ def test_truncation_is_scoped_to_generation_sample_count() -> None:
             pass
 
         speaker = Speaker(send, FakeTts())
-        await speaker.speak(sentences(), 0.0, 0.0, 8, lambda: True)
+        await speaker.speak(sentences(), {"commit_t": 0.0, "vad_stop_t": 0.0}, 8, lambda: True)
         assert speaker.truncate(8, 1) == ("", -1)
         assert speaker.truncate(8, 320) == ("First sentence.", 0)
         assert speaker.truncate(99, 320) == ("", -1)

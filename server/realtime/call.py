@@ -43,7 +43,7 @@ from server.realtime.vad import SileroRuntime, SileroVad, VadEvent, VadStream
 
 log = logging.getLogger(__name__)
 
-TICK_SEC = 0.05
+TICK_SEC = 0.025
 # 5 s of audio toward ASR before drop-oldest kicks in. Sized for STARTUP, not
 # steady state: the first utterance races the Deepgram connect handshake
 # (~0.5-1.5 s), and a 1 s queue ate the caller's greeting (found by the
@@ -271,6 +271,7 @@ class CallSession:
                 case VadEvent(kind="start", t=t):
                     self._endpointer.on_vad_start(t)
                     self._replies.guard.on_vad_start(t)
+                    await self._replies.cancel_speculation()  # guess voided
                     await self._send({"type": "vad", "state": "speech"})
                 case VadEvent(kind="stop", t=t):
                     self._endpointer.on_vad_stop(t)
@@ -328,6 +329,16 @@ class CallSession:
                     **{f"{self._metric_prefix}endpoint_delay_ms":
                        turn.endpoint_delay * 1000})
                 await self._commit_caller_text(turn.transcript, turn_id, turn=turn)
+            if (turn is None and self.mode == "custom"
+                    and self.state.session.status == SessionStatus.INTERVIEWING
+                    and self._endpointer.pending_complete):
+                # Final-seeded speculation only: interim text keeps trickling in
+                # for ~400 ms after silence, so partial-seeded guesses churn
+                # (measured: cancel/restart per partial, zero net gain). Once
+                # the punctuated final lands the text is stable and the head
+                # start is real. Audio stays commit-gated either way.
+                await self._replies.speculate(
+                    self._endpointer.transcript, self._next_turn_id + 1)
             if self._replies.guard.tick(now):
                 await self._replies.interrupt_current()
             if (self.state.session.status == SessionStatus.INTERVIEWING

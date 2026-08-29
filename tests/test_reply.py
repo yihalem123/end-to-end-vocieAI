@@ -210,3 +210,156 @@ def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatc
         assert not controller.guard.agent_speaking
 
     asyncio.run(run())
+
+
+# --- speculative generation: commit-gated audio release ---
+
+class FakeLlm(reply_module.LlmEngine):
+    """isinstance-compatible engine double; no network, records transcripts."""
+    def __init__(self):  # noqa: super().__init__ deliberately skipped
+        self.transcripts = []
+        self.last_ttft_ms = None
+
+    async def respond(self, transcript, **_kw):
+        self.transcripts.append(transcript)
+        yield f"Reply to: {transcript}"
+
+
+class GatedSpeaker:
+    def __init__(self, events):
+        self.events = events
+
+    async def speak(self, sentences, anchors, generation_id, is_current, release=None):
+        async for _ in sentences:
+            pass
+        self.events.append("engine-done")
+        if release is not None:
+            await release.wait()
+        self.events.append(("released", anchors["commit_t"]))
+        return {"_playback_remaining_sec": 0.0}
+
+    def text(self, generation_id):
+        return "Spoken reply."
+
+
+def _controller(events, engine):
+    controller = object.__new__(reply_module.ReplyController)
+    controller._send = events["send"]
+    controller._speaker = GatedSpeaker(events["log"])
+    controller._supervisor = GenerationSupervisor()
+    controller._drained = {}
+    controller._spec = None
+    controller._active_voice_generation = None
+    controller._metric_prefix = ""
+    controller._call_id = "test-call"
+    controller._state = SimpleNamespace(conversation=[])
+    controller.guard = BargeInGuard()
+    controller.interview = None
+    controller._filler_idx = 0
+    controller._engine = engine
+    return controller
+
+
+def _spec_env(monkeypatch):
+    monkeypatch.setattr(reply_module, "DRAIN_ACK_MARGIN_SEC", 0.01)
+    monkeypatch.setattr(reply_module, "DRAIN_ACK_MAX_SEC", 0.02)
+
+
+def test_speculation_promotes_without_restart_and_gates_audio(monkeypatch) -> None:
+    _spec_env(monkeypatch)
+
+    async def run() -> None:
+        sent, log = [], []
+        done = asyncio.Event()
+
+        async def send(ev):
+            sent.append(ev)
+            if ev["type"] == "agent":
+                done.set()
+
+        controller = _controller({"send": send, "log": log}, FakeLlm())
+        now = time.monotonic()
+        await controller.speculate("Hello there.", turn_id=5)
+        spec_generation = controller._spec["token"].generation_id
+        await asyncio.sleep(0.05)  # engine+tts run warm...
+        assert "engine-done" in log
+        assert not any(isinstance(e, tuple) for e in log)  # ...but NO audio released
+
+        turn = TurnComplete("Hello there.", 0.05, now, now + 0.25, "fast")
+        await controller.on_turn(turn, 5)
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+        released = [e for e in log if isinstance(e, tuple)]
+        assert released == [("released", turn.commit_t)]  # anchors from the commit
+        assert controller._supervisor._next_generation_id == spec_generation  # no restart
+        assert controller._state.conversation[0]["text"] == "Spoken reply."
+
+    asyncio.run(run())
+
+
+def test_speculation_mismatch_cancels_and_runs_fresh(monkeypatch) -> None:
+    _spec_env(monkeypatch)
+
+    async def run() -> None:
+        sent, log = [], []
+        done = asyncio.Event()
+
+        async def send(ev):
+            sent.append(ev)
+            if ev["type"] == "agent":
+                done.set()
+
+        engine = FakeLlm()
+        controller = _controller({"send": send, "log": log}, engine)
+        now = time.monotonic()
+        await controller.speculate("I think maybe.", turn_id=5)
+        await asyncio.sleep(0.02)
+        turn = TurnComplete("I think maybe not.", 0.05, now, now + 0.25, "fast")
+        await controller.on_turn(turn, 5)
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+        assert engine.transcripts == ["I think maybe.", "I think maybe not."]
+        assert controller._spec is None
+        # exactly one release, for the fresh (non-gated) generation
+        assert len([e for e in log if isinstance(e, tuple)]) == 1
+
+    asyncio.run(run())
+
+
+def test_caller_resume_cancels_speculation_silently() -> None:
+    async def run() -> None:
+        log = []
+
+        async def send(_ev):
+            raise AssertionError("nothing should reach the client")
+
+        controller = _controller({"send": send, "log": log}, FakeLlm())
+        await controller.speculate("Yes.", turn_id=3)
+        await asyncio.sleep(0.02)
+        await controller.cancel_speculation()
+        assert controller._supervisor.current is None
+        assert not any(isinstance(e, tuple) for e in log)  # no audio ever released
+        assert controller._state.conversation == []
+
+    asyncio.run(run())
+
+
+def test_on_script_speaks_and_finalizes(monkeypatch) -> None:
+    # Regression: on_script kept the old speak/deliver signature after the
+    # anchors refactor and every scripted (disclosure/consent) reply crashed.
+    _spec_env(monkeypatch)
+
+    async def run() -> None:
+        sent, log = [], []
+        done = asyncio.Event()
+
+        async def send(ev):
+            sent.append(ev)
+            if ev["type"] == "agent":
+                done.set()
+
+        controller = _controller({"send": send, "log": log}, FakeLlm())
+        await controller.on_script("Hi, this call is transcribed.", turn_id=0)
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+        assert [e["type"] for e in sent] == ["audio_end", "agent"]
+        assert len([e for e in log if isinstance(e, tuple)]) == 1  # audio released
+
+    asyncio.run(run())

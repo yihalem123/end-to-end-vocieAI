@@ -149,3 +149,15 @@ def test_state_resets_between_turns() -> None:
     second = ep.tick(t=3.0 + FAST + 0.01)
     assert second is not None
     assert second.transcript == "Second answer."         # no bleed from turn one
+
+
+def test_pending_complete_gates_speculation() -> None:
+    ep = make()
+    assert ep.pending_complete is False
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("I have five years.", t=1.0)
+    assert ep.pending_complete is False        # still speaking: not armed
+    ep.on_vad_stop(t=1.1)
+    assert ep.pending_complete is True         # armed + complete: speculate
+    ep.on_asr_final("And also", t=1.2)
+    assert ep.pending_complete is False        # transcript no longer complete

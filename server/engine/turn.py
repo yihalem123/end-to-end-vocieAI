@@ -182,7 +182,25 @@ def fallback_line(state: InterviewState) -> str:
     return "That's everything I needed — thank you for your time today!"
 
 
-def build_system_prompt(state: InterviewState) -> str:
+def build_instructions(plan) -> str:
+    """The STATIC per-call prefix (persona + rules). Kept byte-identical across
+    turns so provider prompt caching can hit; everything that changes per turn
+    lives in build_state_block and travels as an input message instead."""
+    return f"""{plan.persona}
+
+You are conducting a structured screening interview. Rules:
+- Ask ONE question at a time. Keep replies to one or two short sentences.
+- ALWAYS include a spoken reply for the caller. Never respond with only tool
+  calls — a silent turn is a broken phone call.
+- Every time the caller answers, call record_answer with the field name, the
+  answer, and their VERBATIM words as the quote. If they volunteer other
+  fields' answers, record those too.
+- When the current question is fully answered, call advance_step.
+- Never invent answers. Never promise pay, benefits, or hiring decisions.
+- A system message states what has been recorded and the next question."""
+
+
+def build_state_block(state: InterviewState) -> str:
     plan = state.plan
     # Quotes are truncated in the PROMPT only (full text stays in state for
     # post-call verification) — the prompt must not grow with caller verbosity.
@@ -199,29 +217,28 @@ def build_system_prompt(state: InterviewState) -> str:
                      f"({state.knocked_out}). Politely wrap up the call now.")
     elif step is not None:
         ask = step.ask if step.ask else plan.consent
-        objective = f'Next question to get answered: "{ask}"'
+        # Typed value hint: without it the model records "Nights" for a bool
+        # field, validation rejects it, and the agent re-asks (bench finding).
+        hint = {"bool": " (record the answer as true or false)",
+                "float": " (record the answer as a number)",
+                "list": " (record as comma-separated items)"}.get(step.type, "")
+        objective = f'Next question to get answered: "{ask}"{hint}'
     elif state.next_needed is not None:
         objective = (f"Only {state.next_needed.field} still needs confirming — "
                      "ask for it directly, then wrap up.")
     else:
         objective = "All questions are covered. Thank them and wrap up the call."
-    return f"""{plan.persona}
-
-You are conducting a structured screening interview. Rules:
-- Ask ONE question at a time. Keep replies to one or two short sentences.
-- ALWAYS include a spoken reply for the caller. Never respond with only tool
-  calls — a silent turn is a broken phone call.
-- Every time the caller answers, call record_answer with the field name, the
-  answer, and their VERBATIM words as the quote. If they volunteer other
-  fields' answers, record those too.
-- When the current question is fully answered, call advance_step.
-- Never invent answers. Never promise pay, benefits, or hiring decisions.
-
-Recorded so far:
+    return f"""Recorded so far:
 {filled}
 Fields still needed: {remaining}
 
 {objective}"""
+
+
+def build_system_prompt(state: InterviewState) -> str:
+    """Composition kept for tests and offline inspection; the live request
+    sends the two halves separately for cacheability."""
+    return build_instructions(state.plan) + "\n\n" + build_state_block(state)
 
 
 class LlmEngine:
@@ -264,11 +281,14 @@ class LlmEngine:
         if not current():
             return
         state = self.state
-        state.add_history("user", user_text)
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
-            "instructions": build_system_prompt(state),
-            "input": state.recent_history(8),
+            # Static prefix in instructions (cache-friendly); per-turn state
+            # rides as a system input message ahead of the history window.
+            "instructions": build_instructions(state.plan),
+            "input": ([{"role": "system", "content": build_state_block(state)}]
+                      + state.recent_history(8)
+                      + [{"role": "user", "content": user_text}]),
             "tools": TOOLS,
             "stream": True,
             "store": False,
@@ -311,6 +331,9 @@ class LlmEngine:
             yield line
         if not current():
             return
+        # Persisted only now, under the same ownership gate as the tools: a
+        # discarded speculative generation leaves no phantom history entries.
+        state.add_history("user", user_text)
         state.add_history("assistant", "".join(reply_parts))
 
     def _apply_tools(
