@@ -16,6 +16,7 @@ localhost/https; binaryType "arraybuffer" avoids per-frame Blob reads.
 
 const els = {};
 let ctx = null, ws = null, stream = null, running = false;
+let playbackNode = null;
 let sentCount = 0;
 
 function setStatus(text) { els.status.textContent = text; }
@@ -41,12 +42,39 @@ function handleEvent(ev) {
       li.textContent = `${ev.endpoint_delay_ms} ms (${ev.reason}) — "${ev.transcript}"`;
       els.turns.prepend(li);
       els.finals.textContent = "";  // turn committed; clear the working line
+      addLine("you", ev.transcript);
       break;
     }
+    case "agent":
+      addLine("agent", ev.text + (ev.interrupted ? " ⏹ (interrupted)" : ""));
+      break;
+    case "clear":
+      // Barge-in: flush the playback queue NOW; the worklet reports how many
+      // samples were actually heard and we relay that to the server.
+      playbackNode?.port.postMessage("clear");
+      break;
     case "error":
       setStatus(`server error: ${ev.message}`);
       break;
   }
+}
+
+function addLine(who, text) {
+  const div = document.createElement("div");
+  div.className = `line ${who}`;
+  div.textContent = `${who === "agent" ? "🤖" : "🧑"} ${text}`;
+  els.convo.appendChild(div);
+  els.convo.scrollTop = els.convo.scrollHeight;
+}
+
+async function refreshMetrics() {
+  try {
+    const snap = await fetch("/metrics").then((r) => r.json());
+    const rows = Object.entries(snap.stages).map(([stage, s]) =>
+      `<tr><td>${stage}</td><td>${s.p50.toFixed(0)}</td><td>${s.p95.toFixed(0)}</td><td>${s.count}</td></tr>`);
+    els.metrics.innerHTML =
+      `<tr><th>stage</th><th>p50 ms</th><th>p95 ms</th><th>n</th></tr>` + rows.join("");
+  } catch { /* server restarting; try again next tick */ }
 }
 
 async function start() {
@@ -62,8 +90,14 @@ async function start() {
   const source = ctx.createMediaStreamSource(stream);
   const capture = new AudioWorkletNode(ctx, "capture-processor");
   const playback = new AudioWorkletNode(ctx, "playback-processor");
+  playbackNode = playback;
   source.connect(capture);
   playback.connect(ctx.destination);
+  playback.port.onmessage = (e) => {
+    if (e.data?.type === "cleared" && ws?.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "cleared", played_samples: e.data.played }));
+    }
+  };
 
   ws = new WebSocket(`ws://${location.host}/ws/call`);
   ws.binaryType = "arraybuffer";
@@ -100,11 +134,13 @@ function stop(reason) {
 }
 
 window.addEventListener("DOMContentLoaded", () => {
-  for (const id of ["btn", "status", "sent", "vad", "partial", "finals", "turns"]) {
+  for (const id of ["btn", "status", "sent", "vad", "partial", "finals", "turns",
+                    "convo", "metrics"]) {
     els[id] = document.getElementById(id);
   }
   els.btn.addEventListener("click", () => {
     if (running) stop();
     else start().catch((err) => setStatus(`failed: ${err.message}`));
   });
+  setInterval(refreshMetrics, 2000);
 });

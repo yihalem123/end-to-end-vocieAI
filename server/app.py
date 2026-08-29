@@ -5,7 +5,7 @@ Endpoints:
   GET  /healthz
   WS   /ws/call     -> the call pipeline: VAD + ASR + endpointer (Phase 2)
   WS   /ws/echo     -> byte-identical echo, kept as a latency diagnostic (Phase 1)
-  GET  /metrics     -> per-stage latency percentiles     [Phase 3]
+  GET  /metrics     -> per-stage latency percentiles (Phase 3)
 
 ## How this works
 create_app(settings) builds the app; tests inject Settings(_env_file=None, ...) to
@@ -24,6 +24,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from server.config import Settings, get_settings
+from server.metrics import registry
 from server.realtime.call import CallSession
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics() -> dict:
+        return registry.snapshot()
 
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:

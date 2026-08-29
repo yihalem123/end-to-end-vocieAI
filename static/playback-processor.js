@@ -28,10 +28,16 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.queue = [];   // Int16Array frames, FIFO
     this.cursor = 0.0; // fractional read position within queue[0]
     this.stride = IN_RATE / sampleRate; // source samples per output tick (<1 = upsample)
+    this.played = 0;   // total SOURCE samples fully played (underrun zeros excluded)
     this.port.onmessage = (e) => {
       if (e.data === "clear") {
+        // Report how far playback actually got BEFORE dropping the queue: the
+        // server maps this onto sentence marks to truncate the transcript.
+        const played = this.played + Math.floor(this.cursor);
         this.queue.length = 0;
         this.cursor = 0.0;
+        this.played = played; // partial frame is gone; fold it into the total
+        this.port.postMessage({ type: "cleared", played });
       } else {
         this.queue.push(new Int16Array(e.data));
       }
@@ -51,6 +57,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       if (this.cursor >= frame.length) {
         this.queue.shift();
         this.cursor -= frame.length;
+        this.played += frame.length;
       }
     }
     return true;

@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     deepgram_api_key: str = ""
     openai_api_key: str = ""
     elevenlabs_api_key: str = ""
+    elevenlabs_voice_id: str = "21m00Tcm4TlvDq8ikWAM"  # "Rachel", a premade voice
     turn_model: str = "gpt-5.6-luna"
 
 

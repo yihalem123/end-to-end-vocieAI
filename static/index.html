@@ -14,19 +14,31 @@
     #transcript { border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; margin: 1rem 0;
                   min-height: 3.5rem; }
     #partial { color: #999; }
-    h2 { font-size: 1rem; margin-bottom: 0.25rem; }
+    summary { font-size: 1rem; font-weight: 600; margin: 0.5rem 0 0.25rem; cursor: pointer; }
     #turns { font-variant-numeric: tabular-nums; }
+    #convo { max-height: 14rem; overflow-y: auto; margin: 0.5rem 0; }
+    .line { padding: 0.15rem 0; } .line.agent { color: #06c; }
+    #metrics { border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    #metrics td, #metrics th { border: 1px solid #ddd; padding: 0.2rem 0.6rem; text-align: right; }
+    #metrics th:first-child, #metrics td:first-child { text-align: left; }
     .meta { color: #666; font-size: 0.9rem; }
   </style>
 </head>
 <body>
   <h1>Screener console</h1>
-  <p>Phase 2: speak a sentence, watch it transcribe live, and see how fast the
-     endpointer commits your turn after you stop.</p>
+  <p>Phase 3: a spoken screening with the stub agent — talk, get answered, and
+     interrupt it mid-sentence to test barge-in.</p>
   <button id="btn">Start</button><span id="status">idle</span><span id="vad"></span>
   <div id="transcript"><span id="finals"></span><span id="partial"></span></div>
-  <h2>Turns (endpoint_delay)</h2>
-  <ul id="turns"></ul>
+  <div id="convo"></div>
+  <details open>
+    <summary>Turns (endpoint_delay)</summary>
+    <ul id="turns"></ul>
+  </details>
+  <details open>
+    <summary>Metrics (p50/p95, live)</summary>
+    <table id="metrics"></table>
+  </details>
   <p class="meta">frames sent: <span id="sent">0</span></p>
   <script src="/audio.js"></script>
 </body>
