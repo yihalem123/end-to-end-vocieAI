@@ -34,7 +34,12 @@ from dataclasses import dataclass
 _TERMINAL = (".", "!", "?")
 _TRAILING_WORDS = frozenset(
     "and but or so to of in on at with for from the a an um uh like because "
-    "if when while my your our their his her its i".split()
+    "if when while my your our their his her its i "
+    # Copulas/auxiliaries: unpunctuated "...my license is" is nearly always a
+    # thought in flight. (Punctuated finals take the fast tier before this
+    # check, so "I said that." is unaffected.) Found by the simulated caller.
+    "is are was were am be been being has have had will would shall can "
+    "could should may might must do does did that".split()
 )
 
 

@@ -74,6 +74,10 @@ def build_url() -> str:
         "endpointing": "300",
         "utterance_end_ms": "1000",
         "punctuate": "true",
+        # Transcribe "um"/"uh" instead of dropping them: hesitations are the
+        # endpointer's trailing-word evidence (found by the simulated caller —
+        # a dropped "um" let the fast tier split a mid-thought pause).
+        "filler_words": "true",
     }
     return f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
 

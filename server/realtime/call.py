@@ -38,7 +38,11 @@ from server.realtime.vad import SileroVad, VadEvent, VadStream
 log = logging.getLogger(__name__)
 
 TICK_SEC = 0.05
-AUDIO_QUEUE_FRAMES = 50   # 1 s of audio backlog toward ASR, then drop-oldest
+# 5 s of audio toward ASR before drop-oldest kicks in. Sized for STARTUP, not
+# steady state: the first utterance races the Deepgram connect handshake
+# (~0.5-1.5 s), and a 1 s queue ate the caller's greeting (found by the
+# simulated caller: VAD fired, zero transcripts, 54 drops). 5 s costs 160 KB.
+AUDIO_QUEUE_FRAMES = 250
 EVENT_QUEUE_SIZE = 200
 
 _shared_vad: SileroVad | None = None  # model loaded once per process, not per call

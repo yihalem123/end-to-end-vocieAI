@@ -29,6 +29,7 @@ def test_build_url_pins_the_planned_params() -> None:
     assert q["endpointing"] == ["300"]
     assert q["utterance_end_ms"] == ["1000"]
     assert q["punctuate"] == ["true"]         # endpointer's looks_complete needs it
+    assert q["filler_words"] == ["true"]      # "um" is trailing-word evidence
 
 
 def _results(transcript: str, is_final: bool, speech_final: bool = False) -> str:
