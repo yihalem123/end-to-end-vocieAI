@@ -352,14 +352,26 @@ async function pollForReport(sessionCallId, attemptsLeft) {
   setTimeout(() => pollForReport(sessionCallId, attemptsLeft - 1), 2500);
 }
 
+function applyTheme(theme) {
+  // Light is the main theme; "dark" rides on one attribute + the token table.
+  document.documentElement.dataset.theme = theme;
+  els.themeToggle.classList.toggle("on", theme === "dark");
+  try { localStorage.setItem("theme", theme); } catch { /* private mode */ }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   for (const id of ["btn", "endBtn", "muteBtn", "status", "statusDot", "stage",
                     "eqBars", "idleBlock", "incallBlock", "timer", "convo",
                     "convoEmpty", "chatText", "chatSend", "fluxMode",
                     "fluxToggle", "metricsToggle", "latencyPanel", "latGrid",
-                    "e2e"]) {
+                    "e2e", "themeToggle"]) {
     els[id] = document.getElementById(id);
   }
+  let saved = "light";
+  try { saved = localStorage.getItem("theme") || "light"; } catch { /* ok */ }
+  applyTheme(saved);
+  els.themeToggle.addEventListener("click", () =>
+    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
   // The live partial rides in the transcript as a ghost card, updated in place.
   const ghost = document.createElement("div");
   ghost.className = "card ghost";

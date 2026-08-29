@@ -14,11 +14,32 @@
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    /* Light is the main theme (design: "Asandia Demo — light"); dark is the
+       toggle. Every color below is a token so the switch is one attribute. */
     :root {
-      --bg: #0a0b10; --panel: #0d0e15; --line: rgba(255,255,255,.08);
-      --ink: #e8e9f0; --dim: rgba(232,233,240,.55); --faint: rgba(232,233,240,.35);
-      --accent: #7c8cf8; --accent-soft: #a3aefb; --amber: #e5a848;
-      --green: #6ee787; --red: #e5484d; --idle: #5b6178;
+      --bg: #f6f7fb; --panel: #eef0f6; --card2: rgba(16,18,30,.04);
+      --line: rgba(16,18,30,.14); --line-soft: rgba(16,18,30,.09);
+      --ink: #171923; --strong: #171923;
+      --dim: rgba(23,25,35,.6); --dim2: rgba(23,25,35,.5); --faint: rgba(23,25,35,.38);
+      --accent: #5b6ae8; --accent-soft: #4c5ae0; --acc-chip: #3a46b8;
+      --acc-bg: rgba(91,106,232,.08); --acc-border: rgba(91,106,232,.35);
+      --on-acc: #ffffff;
+      --amber: #b07714; --green: #1a9e4b; --red: #d13438; --red-bg: rgba(209,52,56,.15);
+      --idle: #8a90a6; --eq-idle: #c6cadb;
+      --report-bg: rgba(26,158,75,.08); --report-border: rgba(26,158,75,.3);
+    }
+    :root[data-theme="dark"] {
+      --bg: #0a0b10; --panel: #0d0e15; --card2: rgba(255,255,255,.04);
+      --line: rgba(255,255,255,.12); --line-soft: rgba(255,255,255,.08);
+      --ink: #e8e9f0; --strong: #f2f3fa;
+      --dim: rgba(232,233,240,.55); --dim2: rgba(232,233,240,.5);
+      --faint: rgba(232,233,240,.35);
+      --accent: #7c8cf8; --accent-soft: #a3aefb; --acc-chip: #c3caff;
+      --acc-bg: rgba(124,140,248,.08); --acc-border: rgba(124,140,248,.25);
+      --on-acc: #0c0d12;
+      --amber: #e5a848; --green: #6ee787; --red: #e5484d; --red-bg: rgba(229,72,77,.25);
+      --idle: #5b6178; --eq-idle: #3d4361;
+      --report-bg: rgba(110,231,135,.07); --report-border: rgba(110,231,135,.25);
     }
     html, body { height: 100%; }
     body { background: var(--bg); color: var(--ink);
@@ -30,9 +51,9 @@
 
     /* ── left column ─────────────────────────────────────────── */
     .main { flex: 1; display: flex; flex-direction: column;
-            border-right: 1px solid var(--line); min-width: 0; }
+            border-right: 1px solid var(--line-soft); min-width: 0; }
     header { display: flex; align-items: center; justify-content: space-between;
-             padding: 20px 28px; border-bottom: 1px solid var(--line); }
+             padding: 20px 28px; border-bottom: 1px solid var(--line-soft); }
     .brand { display: flex; align-items: center; gap: 10px; }
     .brand .mark { width: 24px; height: 24px; border-radius: 7px;
                    background: linear-gradient(135deg, #7c8cf8, #4c5ae0); }
@@ -41,13 +62,13 @@
 
     .pill-toggle { display: flex; align-items: center; gap: 8px;
                    padding: 6px 8px 6px 12px; border-radius: 100px;
-                   border: 1px solid rgba(255,255,255,.12);
-                   background: rgba(255,255,255,.04); }
-    .pill-toggle:hover { border-color: rgba(255,255,255,.28); }
+                   border: 1px solid var(--line);
+                   background: var(--card2); }
+    .pill-toggle:hover { border-color: var(--acc-border); }
     .pill-toggle:disabled { opacity: .45; cursor: default; }
-    .pill-toggle .lbl { font: 500 12.5px 'Space Grotesk'; color: rgba(232,233,240,.7); }
+    .pill-toggle .lbl { font: 500 12.5px 'Space Grotesk'; color: var(--dim); }
     .pill-toggle .track { position: relative; width: 32px; height: 18px;
-                          border-radius: 100px; background: rgba(255,255,255,.15);
+                          border-radius: 100px; background: var(--line);
                           transition: background .2s; }
     .pill-toggle .knob { position: absolute; top: 2px; left: 2px; width: 14px;
                          height: 14px; border-radius: 50%; background: #fff;
@@ -56,21 +77,21 @@
     .pill-toggle.on .knob { left: 16px; }
 
     .status-pill { display: flex; align-items: center; gap: 8px; padding: 6px 14px;
-                   border-radius: 100px; background: rgba(124,140,248,.1);
-                   border: 1px solid rgba(124,140,248,.25); }
+                   border-radius: 100px; background: var(--acc-bg);
+                   border: 1px solid var(--acc-border); }
     .status-pill .dot { width: 8px; height: 8px; border-radius: 50%;
                         background: var(--idle); transition: background .25s; }
-    .status-pill span:last-child { font: 500 13px 'Space Grotesk'; color: #c3caff;
+    .status-pill span:last-child { font: 500 13px 'Space Grotesk'; color: var(--acc-chip);
                                    max-width: 260px; white-space: nowrap;
                                    overflow: hidden; text-overflow: ellipsis; }
 
     .stage { flex: 1; display: flex; flex-direction: column; align-items: center;
              justify-content: center; gap: 30px;
              background: radial-gradient(600px 400px at 50% 45%,
-                         rgba(124,140,248,.08), transparent 70%); }
+                         var(--acc-bg), transparent 70%); }
     .orbwrap { position: relative; width: 180px; height: 180px; }
     .ring { position: absolute; inset: -22px; border-radius: 50%;
-            border: 1px dashed rgba(124,140,248,.3); }
+            border: 1px dashed var(--acc-border); }
     .orb { position: absolute; inset: 0; border-radius: 50%;
            background: radial-gradient(circle at 34% 28%, #eef0ff 0%, #aab4ff 22%,
                        #7c8cf8 48%, #3743a8 78%, #232a6e 100%);
@@ -79,7 +100,7 @@
     .live .ring { animation: breathe 3s ease-in-out infinite; }
 
     .eq { display: flex; align-items: flex-end; gap: 5px; height: 34px; opacity: .25; }
-    .eq span { width: 5px; height: 34px; background: #3d4361; border-radius: 3px;
+    .eq span { width: 5px; height: 34px; background: var(--eq-idle); border-radius: 3px;
                transform: scaleY(.25); transform-origin: bottom; }
     .eq.user, .eq.agent { opacity: 1; }
     .eq.user span, .eq.agent span { animation: eq .9s ease-in-out infinite; }
@@ -95,16 +116,16 @@
     .idleblock p.hint { font: 400 12.5px 'Space Grotesk'; color: var(--faint); }
     #btn { display: flex; align-items: center; gap: 10px; padding: 15px 30px;
            border: none; border-radius: 10px; background: var(--accent);
-           color: #0c0d12; font: 600 16px 'Space Grotesk'; }
-    #btn:hover { background: #93a0fa; }
+           color: var(--on-acc); font: 600 16px 'Space Grotesk'; }
+    #btn:hover { filter: brightness(1.1); }
     .incall { flex-direction: row; gap: 12px; }
     #timer { font: 500 15px ui-monospace, Menlo, monospace; color: var(--dim);
              padding: 0 10px; }
     #muteBtn { height: 44px; padding: 0 20px; border-radius: 10px;
-               border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06);
+               border: 1px solid var(--line); background: var(--card2);
                color: var(--ink); font: 500 14px 'Space Grotesk'; }
-    #muteBtn:hover { border-color: rgba(255,255,255,.3); }
-    #muteBtn.muted { background: rgba(229,72,77,.25); }
+    #muteBtn:hover { border-color: var(--acc-border); }
+    #muteBtn.muted { background: var(--red-bg); }
     #endBtn { height: 44px; padding: 0 22px; border-radius: 10px; border: none;
               background: var(--red); color: #fff; font: 600 14px 'Space Grotesk'; }
     #endBtn:hover { background: #f06266; }
@@ -114,64 +135,64 @@
     .side { width: 360px; display: flex; flex-direction: column;
             background: var(--panel); }
     .side h2 { padding: 20px 24px 12px; font: 600 12px 'Space Grotesk';
-               color: rgba(232,233,240,.5); letter-spacing: .08em;
+               color: var(--dim2); letter-spacing: .08em;
                text-transform: uppercase; }
     #convo { flex: 1; overflow: auto; padding: 6px 24px 12px;
              display: flex; flex-direction: column; gap: 12px; }
     #convo .empty { margin-top: 8px; font: 400 13.5px/1.5 'Space Grotesk';
-                    color: rgba(232,233,240,.3); }
+                    color: var(--faint); }
     .card { padding: 10px 14px; border-radius: 10px;
-            background: rgba(255,255,255,.03);
-            border: 1px solid rgba(255,255,255,.06); animation: fadeup .35s ease; }
+            background: var(--card2);
+            border: 1px solid var(--line-soft); animation: fadeup .35s ease; }
     .card .who { font: 600 10.5px 'Space Grotesk'; letter-spacing: .08em;
-                 text-transform: uppercase; color: rgba(232,233,240,.5);
+                 text-transform: uppercase; color: var(--dim2);
                  margin-bottom: 3px; display: flex; justify-content: space-between;
                  align-items: baseline; gap: 8px; }
     .card .who .meta { font: 500 10px ui-monospace, Menlo, monospace;
-                       color: rgba(232,233,240,.35); text-transform: none;
+                       color: var(--faint); text-transform: none;
                        letter-spacing: 0; }
     .card .text { font: 400 13.5px/1.5 'Space Grotesk';
-                  color: rgba(232,233,240,.85); overflow-wrap: break-word; }
-    .card.agent { background: rgba(124,140,248,.08); }
+                  color: var(--ink); overflow-wrap: break-word; }
+    .card.agent { background: var(--acc-bg); }
     .card.agent .who { color: var(--accent-soft); }
     .card.system { border-style: dashed; }
     .card.system .who { color: var(--amber); }
     .card.ghost { opacity: .55; border-style: dashed; }
-    .card.report { background: rgba(110,231,135,.07);
-                   border-color: rgba(110,231,135,.25); }
+    .card.report { background: var(--report-bg);
+                   border-color: var(--report-border); }
     .card.report .who { color: var(--green); }
     .card.report a { color: var(--green); font: 500 13.5px 'Space Grotesk'; }
 
     .chatrow { display: flex; gap: 8px; padding: 10px 24px 14px; }
     .chatrow input { flex: 1; padding: 9px 12px; border-radius: 10px;
-                     border: 1px solid rgba(255,255,255,.1);
-                     background: rgba(255,255,255,.04); color: var(--ink);
+                     border: 1px solid var(--line);
+                     background: var(--card2); color: var(--ink);
                      font: 400 13px 'Space Grotesk'; outline: none; }
     .chatrow input::placeholder { color: var(--faint); }
-    .chatrow input:focus { border-color: rgba(124,140,248,.5); }
+    .chatrow input:focus { border-color: var(--acc-border); }
     .chatrow button { padding: 0 16px; border-radius: 10px; border: none;
-                      background: rgba(124,140,248,.18); color: var(--accent-soft);
+                      background: var(--acc-bg); color: var(--acc-chip);
                       font: 600 13px 'Space Grotesk'; }
-    .chatrow button:hover { background: rgba(124,140,248,.3); }
+    .chatrow button:hover { filter: brightness(1.1); }
 
-    #latencyPanel { border-top: 1px solid var(--line); padding: 16px 24px 20px;
+    #latencyPanel { border-top: 1px solid var(--line-soft); padding: 16px 24px 20px;
                     display: flex; flex-direction: column; gap: 12px;
                     animation: fadeup .3s ease; }
     #latencyPanel .lathead { display: flex; align-items: baseline;
                              justify-content: space-between; }
     #latencyPanel .lathead .t { font: 600 12px 'Space Grotesk';
-                                color: rgba(232,233,240,.5); letter-spacing: .08em;
+                                color: var(--dim2); letter-spacing: .08em;
                                 text-transform: uppercase; }
-    #e2e { font: 500 12px ui-monospace, Menlo, monospace; color: var(--accent-soft); }
+    #e2e { font: 500 12px ui-monospace, Menlo, monospace; color: var(--acc-chip); }
     #latGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-    .lat { padding: 10px 12px; border-radius: 10px; background: rgba(255,255,255,.03);
-           border: 1px solid rgba(255,255,255,.06); display: flex;
+    .lat { padding: 10px 12px; border-radius: 10px; background: var(--card2);
+           border: 1px solid var(--line-soft); display: flex;
            flex-direction: column; gap: 6px; }
     .lat .row { display: flex; align-items: baseline; justify-content: space-between; }
     .lat .lbl { font: 500 11px 'Space Grotesk'; letter-spacing: .06em;
                 text-transform: uppercase; color: var(--dim); }
     .lat .ms { font: 600 14px ui-monospace, Menlo, monospace; }
-    .lat .track { height: 3px; border-radius: 2px; background: rgba(255,255,255,.07);
+    .lat .track { height: 3px; border-radius: 2px; background: var(--line-soft);
                   overflow: hidden; }
     .lat .fill { height: 100%; width: 0; background: var(--accent);
                  border-radius: 2px; transition: width .4s ease; }
@@ -195,6 +216,10 @@
           </button>
           <button class="pill-toggle" id="fluxToggle" type="button" title="Deepgram Flux end-of-turn vs the custom endpointer (applies on next session)">
             <span class="lbl">Flux</span>
+            <span class="track"><span class="knob"></span></span>
+          </button>
+          <button class="pill-toggle" id="themeToggle" type="button" title="Switch between light and dark theme">
+            <span class="lbl">Dark</span>
             <span class="track"><span class="knob"></span></span>
           </button>
           <input type="checkbox" id="fluxMode" hidden>
