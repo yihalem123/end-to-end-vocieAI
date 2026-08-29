@@ -3,7 +3,7 @@ import asyncio
 
 import pytest
 
-from server.realtime.speaker import Speaker, spoken_through
+from server.realtime.speaker import Speaker, playback_remaining_seconds, spoken_through
 
 
 def test_nothing_played_means_nothing_spoken() -> None:
@@ -67,3 +67,9 @@ def test_truncation_is_scoped_to_generation_sample_count() -> None:
         assert speaker.truncate(99, 320) == ("", -1)
 
     asyncio.run(run())
+
+
+def test_playback_remaining_uses_sent_frames_and_elapsed_time() -> None:
+    assert playback_remaining_seconds(0, None, now=10.0) == 0.0
+    assert playback_remaining_seconds(20, 10.0, now=10.1) == pytest.approx(0.3)
+    assert playback_remaining_seconds(20, 10.0, now=11.0) == 0.0

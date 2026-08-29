@@ -7,12 +7,16 @@ the leading part ends in a trailing word ("um,", "at,") — exactly the shape
 that used to get callers cut off. Audio is synthesized offline with Windows
 SAPI (16 kHz mono PCM16, the wire format — no vendor cost), then streamed as
 real-time-paced 20 ms frames. The script waits for each agent reply before
-answering, hangs up, fetches the post-call report, and ASSERTS:
+answering. It decodes generation-prefixed agent audio and acknowledges clear or
+fully received playback just like the browser, then hangs up, fetches the
+post-call report, and ASSERTS:
   1. no answer was split by a premature commit (turns == answers),
   2. the trailing/slow patience tiers actually fired,
   3. extraction got the facts right despite the rambling.
 Exit code 0 = all assertions pass. Run: python scripts/simulate_caller.py
 (server must be running; needs Deepgram + OpenAI keys, ElevenLabs optional).
+Run `python scripts/simulate_caller.py --protocol-self-test` for the offline
+wire/ack verification used in CI and local review.
 
 Usage note: this is a script, not pytest — it exercises live vendors end to
 end, which does not belong in the unit suite.
@@ -23,13 +27,16 @@ import subprocess
 import sys
 import tempfile
 import wave
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import httpx
 import websockets
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from server.realtime.protocol import decode_audio_frame, encode_audio_frame  # noqa: E402
 
 SERVER = "127.0.0.1:8080"
 MODE = "flux" if "--flux" in sys.argv else "custom"  # same rambler, both stacks
@@ -44,6 +51,33 @@ PAUSE_SEC = 1.0
 @dataclass
 class Answer:
     parts: list  # str segments and PAUSE markers
+
+
+@dataclass
+class PlaybackTracker:
+    """Protocol-only playback model used by the headless live harness."""
+
+    played_samples: dict[int, int] = field(default_factory=dict)
+
+    def on_audio(self, wire: bytes) -> tuple[int, bytes]:
+        generation_id, pcm = decode_audio_frame(wire)
+        self.played_samples[generation_id] = (
+            self.played_samples.get(generation_id, 0) + len(pcm) // 2)
+        return generation_id, pcm
+
+    def acknowledgement(self, event: dict) -> dict | None:
+        generation_id = int(event.get("generation_id", 0))
+        if generation_id <= 0:
+            return None
+        if event.get("type") == "clear":
+            return {
+                "type": "cleared",
+                "generation_id": generation_id,
+                "played_samples": self.played_samples.get(generation_id, 0),
+            }
+        if event.get("type") == "audio_end":
+            return {"type": "playback_drained", "generation_id": generation_id}
+        return None
 
 
 # Part texts deliberately avoid internal commas: SAPI renders commas as
@@ -126,13 +160,18 @@ async def main() -> int:
     turns: list[dict] = []
     vad_stops = 0
     agent_events = asyncio.Queue()
+    playback = PlaybackTracker()
     print(f"mode: {MODE}")
     async with websockets.connect(f"ws://{SERVER}/ws/call?mode={MODE}") as ws:
         async def reader() -> None:
             async for msg in ws:
                 if isinstance(msg, bytes):
-                    continue  # agent audio: not analyzed here
+                    playback.on_audio(msg)  # strips generation header and counts PCM
+                    continue
                 ev = json.loads(msg)
+                ack = playback.acknowledgement(ev)
+                if ack is not None:
+                    await ws.send(json.dumps(ack))
                 if ev["type"] == "vad" and ev["state"] == "silence":
                     nonlocal vad_stops
                     vad_stops += 1
@@ -153,6 +192,8 @@ async def main() -> int:
                 print(f"FAIL: no agent reply after answer {i}")
                 return 1
         reader_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await reader_task
 
     await asyncio.sleep(12)  # post-call extraction
     async with httpx.AsyncClient() as client:
@@ -190,4 +231,20 @@ async def main() -> int:
     return 0
 
 
-sys.exit(asyncio.run(main()))
+def protocol_self_test() -> int:
+    tracker = PlaybackTracker()
+    generation_id, pcm = tracker.on_audio(encode_audio_frame(7, bytes(FRAME_BYTES)))
+    assert generation_id == 7 and len(pcm) == FRAME_BYTES
+    assert tracker.acknowledgement(
+        {"type": "audio_end", "generation_id": 7}
+    ) == {"type": "playback_drained", "generation_id": 7}
+    assert tracker.acknowledgement({"type": "clear", "generation_id": 7}) == {
+        "type": "cleared", "generation_id": 7, "played_samples": 320}
+    print("PASS: generation audio decode and playback acknowledgements")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--protocol-self-test" in sys.argv:
+        sys.exit(protocol_self_test())
+    sys.exit(asyncio.run(main()))

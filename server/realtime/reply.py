@@ -47,10 +47,36 @@ log = logging.getLogger(__name__)
 FILLERS = ("Okay.", "Got it.", "Alright.", "Thanks.")
 FILLER_PATIENCE_SEC = 0.6
 SENTENCE_QUEUE_SIZE = 8  # bounded LLM -> TTS handoff; producer backpressures
+DRAIN_ACK_MARGIN_SEC = 1.0
+DRAIN_ACK_MAX_SEC = 5.0
 
 
 def wants_filler(interview) -> bool:
     return interview is not None and bool(interview.fields)
+
+
+def drain_wait_seconds(playback_remaining_sec: float) -> float:
+    """Bound a remote drain acknowledgement by expected audio plus margin."""
+    expected = max(0.0, playback_remaining_sec) + DRAIN_ACK_MARGIN_SEC
+    return min(DRAIN_ACK_MAX_SEC, max(DRAIN_ACK_MARGIN_SEC, expected))
+
+
+async def wait_for_playback_drain(
+    drained: asyncio.Event,
+    generation_id: int,
+    timeout_sec: float,
+) -> bool:
+    try:
+        await asyncio.wait_for(drained.wait(), timeout=timeout_sec)
+        return True
+    except TimeoutError:
+        log.warning(
+            "playback_drained ack timed out after %.2fs for generation %d; "
+            "continuing fail-open",
+            timeout_sec,
+            generation_id,
+        )
+        return False
 
 
 async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENCE_SEC):
@@ -170,7 +196,12 @@ class ReplyController:
             await self._send({"type": "audio_end", "turn_id": token.turn_id,
                               "generation_id": token.generation_id})
             drained = self._drained.setdefault(token.generation_id, asyncio.Event())
-            await drained.wait()
+            remaining = float(timings.pop("_playback_remaining_sec", 0.0))
+            await wait_for_playback_drain(
+                drained,
+                token.generation_id,
+                drain_wait_seconds(remaining),
+            )
             if not is_current():
                 return
         except asyncio.CancelledError:

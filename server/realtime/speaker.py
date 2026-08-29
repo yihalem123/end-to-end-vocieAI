@@ -19,7 +19,8 @@ The client replies with generation id + total played sample count. truncate()
 
 Timings returned per reply: tts_ttfb (commit -> first ElevenLabs byte),
 first_audio (commit -> first frame sent), turn_latency (vad_stop -> first frame
-sent: what the caller experienced as "the agent thought about it").
+sent: what the caller experienced as "the agent thought about it"), plus the
+estimated playback remaining after the final paced send for bounded drain waits.
 """
 import asyncio
 import time
@@ -82,6 +83,8 @@ class Speaker:
                 if tail is not None and pace_start is not None:
                     frames_sent = await self._send_paced(
                         tail, pace_start, frames_sent, generation_id, is_current)
+            timings["_playback_remaining_sec"] = playback_remaining_seconds(
+                frames_sent, pace_start)
             return timings
         finally:
             # On cancellation (barge-in, hangup) partial timings still matter:
@@ -129,3 +132,15 @@ class Speaker:
 class PlaybackRecord:
     sentences: list[str] = field(default_factory=list)
     marks: list[int] = field(default_factory=list)
+
+
+def playback_remaining_seconds(
+    frames_sent: int,
+    pace_start: float | None,
+    now: float | None = None,
+) -> float:
+    """Estimated agent audio still buffered after the final paced send."""
+    if pace_start is None or frames_sent <= 0:
+        return 0.0
+    clock = time.monotonic() if now is None else now
+    return max(0.0, pace_start + frames_sent * FRAME_SEC - clock)
