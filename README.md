@@ -39,5 +39,17 @@ disclosure; no audio recording is stored. Consent refusal ends without extractio
 Reports and metrics stay keyed to that call ID. Numeric scores and knockouts use
 only verified caller utterances; uncertain material evidence requires human review.
 
+Two turn-taking stacks are selectable per call from the console ("Flux
+end-of-turn" toggle): the custom VAD-anchored endpointer (three patience tiers,
+tuned live) or Deepgram Flux's model-integrated end-of-turn. Metrics are tagged
+per mode so the A/B is visible side by side.
+
 ## Metrics that matter (check /metrics/{call_id} after a call)
 endpoint_delay, llm_ttft, tts_ttfb, turn_latency (p50/p95), barge-ins, turns.
+Measured results and their history: see `REHEARSAL.md`.
+
+## Verification
+`pytest -q` — 180 offline tests (no vendor calls).
+`python scripts/simulate_caller.py [--flux]` — live end-to-end gate: a synthesized
+rambling caller with mid-thought pauses asserts turn integrity and extraction
+against the running server. `--protocol-self-test` runs its offline wire check.
