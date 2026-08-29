@@ -32,6 +32,7 @@ from server.realtime.asr import (
     DeepgramSession,
 )
 from server.realtime.endpoint import Endpointer, TurnComplete
+from server.realtime.flux import FluxEndOfTurn, FluxSession, FluxStartOfTurn, FluxUpdate
 from server.realtime.reply import ReplyController
 from server.realtime.vad import SileroVad, VadEvent, VadStream
 
@@ -77,13 +78,20 @@ class CallState:
 
 
 class CallSession:
-    def __init__(self, ws: WebSocket, settings: Settings) -> None:
+    def __init__(self, ws: WebSocket, settings: Settings, mode: str = "custom") -> None:
         self._ws = ws
         self._settings = settings
+        # "custom": v1 ASR + our VAD-anchored endpointer (the built story).
+        # "flux": v2 model end-of-turn — EndOfTurn IS the commit; the
+        # endpointer is bypassed. Local VAD runs in BOTH modes (barge-in
+        # needs ~100ms local onset detection; network events are too late).
+        self.mode = mode if mode in ("custom", "flux") else "custom"
+        self._metric_prefix = "flux_" if self.mode == "flux" else ""
         self.state = CallState()
         self._audio_to_asr: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_FRAMES)
         self._events: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self._endpointer = Endpointer()
+        self._last_vad_stop_t: float | None = None
 
     async def run(self) -> None:
         await self._ws.accept()
@@ -92,12 +100,19 @@ class CallSession:
             await self._ws.close()
             return
         replies = ReplyController(self._send, self._ws.send_bytes,
-                                  self._settings, self.state)
+                                  self._settings, self.state,
+                                  metric_prefix=self._metric_prefix)
         self._replies = replies
         vad_model = _get_vad()
         vad_model.reset()
         self._vad = VadStream(vad=vad_model)
-        asr = DeepgramSession(self._settings.deepgram_api_key, self._events)
+        if self.mode == "flux":
+            from server.realtime.flux import build_flux_url
+            asr = FluxSession(self._settings.deepgram_api_key, self._events,
+                              url=build_flux_url(self._settings.flux_eot_threshold))
+        else:
+            asr = DeepgramSession(self._settings.deepgram_api_key, self._events)
+        log.info("call starting in %s mode", self.mode)
         try:
             async with asyncio.TaskGroup() as tg:
                 recv = tg.create_task(self._recv_loop())
@@ -191,7 +206,9 @@ class CallSession:
                 case VadEvent(kind="stop", t=t):
                     self._endpointer.on_vad_stop(t)
                     self._replies.guard.on_vad_stop(t)
-                    self._offer_audio(FINALIZE)  # flush Deepgram finals now
+                    self._last_vad_stop_t = t
+                    if self.mode == "custom":
+                        self._offer_audio(FINALIZE)  # flush v1 finals now
                     await self._send({"type": "vad", "state": "silence"})
                 case AsrPartial(text=text):
                     await self._send({"type": "partial", "text": text})
@@ -207,14 +224,28 @@ class CallSession:
                     self.state.conversation.append({"role": "caller", "text": text})
                     await self._send({"type": "you", "text": text})
                     await self._replies.on_chat(text)
+                case FluxUpdate(transcript=text):
+                    if text:  # Flux emits empty updates during silence
+                        await self._send({"type": "partial", "text": text})
+                case FluxEndOfTurn(transcript=text):
+                    if text:  # empty end-of-turn = silence, not a turn
+                        anchor = self._last_vad_stop_t or now
+                        turn = TurnComplete(
+                            transcript=text, endpoint_delay=max(0.0, now - anchor),
+                            vad_stop_t=anchor, commit_t=now, reason="flux")
+                case FluxStartOfTurn():
+                    pass  # local VAD already drives the UI + barge-in guard
                 case None:
                     pass
-            turn = turn or self._endpointer.tick(now)
+            if self.mode == "custom":
+                turn = turn or self._endpointer.tick(now)
             if turn is not None:
                 self.state.turns.append(turn)
                 self.state.conversation.append(
                     {"role": "caller", "text": turn.transcript})
-                registry.record_turn(endpoint_delay_ms=turn.endpoint_delay * 1000)
+                registry.record_turn(
+                    **{f"{self._metric_prefix}endpoint_delay_ms":
+                       turn.endpoint_delay * 1000})
                 await self._send({
                     "type": "turn",
                     "transcript": turn.transcript,

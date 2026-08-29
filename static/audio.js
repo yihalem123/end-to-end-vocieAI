@@ -82,7 +82,10 @@ async function refreshMetrics() {
 
 function connectWs() {
   // Shared by voice mode and text mode: one socket, JSON events either way.
-  ws = new WebSocket(`ws://${location.host}/ws/call`);
+  // The mode is fixed at connect time: flux = Deepgram model end-of-turn,
+  // otherwise the custom VAD+endpointer stack. Metrics are tagged per mode.
+  const mode = els.fluxMode.checked ? "flux" : "custom";
+  ws = new WebSocket(`ws://${location.host}/ws/call?mode=${mode}`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
@@ -141,6 +144,7 @@ async function start() {
   else ws.onopen = attachCapture;
 
   running = true;
+  els.fluxMode.disabled = true;  // mode is per-call; toggle applies on next Start
   els.btn.textContent = "Stop";
 }
 
@@ -151,6 +155,7 @@ function stop(reason) {
   ctx?.close();
   ws = null; ctx = null; stream = null;
   els.btn.textContent = "Start";
+  els.fluxMode.disabled = false;
   setStatus(reason || "stopped");
   pollForReport(6);  // post-call extraction takes a few seconds
 }
@@ -178,7 +183,7 @@ async function pollForReport(attemptsLeft) {
 
 window.addEventListener("DOMContentLoaded", () => {
   for (const id of ["btn", "status", "sent", "vad", "partial", "finals", "turns",
-                    "convo", "metrics", "chatText", "chatSend"]) {
+                    "convo", "metrics", "chatText", "chatSend", "fluxMode"]) {
     els[id] = document.getElementById(id);
   }
   els.btn.addEventListener("click", () => {

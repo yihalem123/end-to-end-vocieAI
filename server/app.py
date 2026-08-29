@@ -77,7 +77,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:
-        session = CallSession(ws, app.state.settings)
+        mode = ws.query_params.get("mode", "custom")
+        session = CallSession(ws, app.state.settings, mode=mode)
         try:
             await session.run()
         except Exception:

@@ -10,6 +10,7 @@
     body { font-family: system-ui, sans-serif; max-width: 44rem; margin: 3rem auto; padding: 0 1rem; }
     button { font-size: 1.1rem; padding: 0.5rem 1.5rem; }
     #status { color: #666; margin-left: 1rem; }
+    #fluxLabel { margin-left: 1rem; font-size: 0.95rem; color: #444; user-select: none; }
     #vad { margin-left: 1rem; } #vad.speech { color: #c00; } #vad.silence { color: #999; }
     #transcript { border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem; margin: 1rem 0;
                   min-height: 3.5rem; }
@@ -30,7 +31,9 @@
   <h1>Screener console</h1>
   <p>Phase 3: a spoken screening with the stub agent — talk, get answered, and
      interrupt it mid-sentence to test barge-in.</p>
-  <button id="btn">Start</button><span id="status">idle</span><span id="vad"></span>
+  <button id="btn">Start</button>
+  <label id="fluxLabel"><input type="checkbox" id="fluxMode"> Flux end-of-turn</label>
+  <span id="status">idle</span><span id="vad"></span>
   <div id="transcript"><span id="finals"></span><span id="partial"></span></div>
   <div id="convo"></div>
   <div id="chatRow">

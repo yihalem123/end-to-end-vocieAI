@@ -80,9 +80,11 @@ async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENC
 
 
 class ReplyController:
-    def __init__(self, send_json, send_bytes, settings: Settings, state) -> None:
+    def __init__(self, send_json, send_bytes, settings: Settings, state,
+                 metric_prefix: str = "") -> None:
         self._send = send_json
-        self._state = state  # realtime CallState: replies list lives there
+        self._metric_prefix = metric_prefix  # "flux_" tags the A/B in /metrics
+        self._state = state  # realtime CallState: conversation log lives there
         self.guard = BargeInGuard()
         self._speak_task: asyncio.Task | None = None
         self._tts: MultiContextTts | None = None
@@ -139,7 +141,8 @@ class ReplyController:
             return
         if isinstance(self._engine, LlmEngine) and self._engine.last_ttft_ms:
             timings["llm_ttft_ms"] = self._engine.last_ttft_ms
-        registry.record_turn(**{k: v for k, v in timings.items() if k.endswith("_ms")})
+        registry.record_turn(**{self._metric_prefix + k: v
+                                for k, v in timings.items() if k.endswith("_ms")})
         self.guard.on_agent_audio_end()
         text = " ".join(self._speaker.sentences)
         self._state.conversation.append({"role": "agent", "text": text, "interrupted": False})
@@ -156,7 +159,8 @@ class ReplyController:
             return
         text = " ".join(sentences)
         if isinstance(self._engine, LlmEngine) and self._engine.last_ttft_ms:
-            registry.record_turn(llm_ttft_ms=self._engine.last_ttft_ms)
+            registry.record_turn(
+                **{self._metric_prefix + "llm_ttft_ms": self._engine.last_ttft_ms})
         self._state.conversation.append({"role": "agent", "text": text, "interrupted": False})
         await self._send({"type": "agent", "text": text, "interrupted": False,
                           "audio": False})

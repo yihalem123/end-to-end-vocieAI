@@ -32,6 +32,7 @@ import websockets
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 SERVER = "127.0.0.1:8080"
+MODE = "flux" if "--flux" in sys.argv else "custom"  # same rambler, both stacks
 FRAME_BYTES = 640
 FRAME_SEC = 0.02
 PAUSE = object()  # mid-answer silence: the endpointer patience test.
@@ -125,7 +126,8 @@ async def main() -> int:
     turns: list[dict] = []
     vad_stops = 0
     agent_events = asyncio.Queue()
-    async with websockets.connect(f"ws://{SERVER}/ws/call") as ws:
+    print(f"mode: {MODE}")
+    async with websockets.connect(f"ws://{SERVER}/ws/call?mode={MODE}") as ws:
         async def reader() -> None:
             async for msg in ws:
                 if isinstance(msg, bytes):
