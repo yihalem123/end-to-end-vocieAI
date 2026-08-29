@@ -2,9 +2,12 @@
 
 ## How this works
 Three layers, separable so each is testable alone:
-- SileroVad wraps the ONNX model. Silero v5 is stateful: alongside each 512-sample
-  16 kHz window (32 ms) it takes and returns a recurrent state tensor, so the model
-  hears continuity, not isolated windows. One inference is ~0.1-0.5 ms on CPU.
+- SileroVad wraps the ONNX model. Silero v5 is stateful twice over: alongside each
+  512-sample 16 kHz window (32 ms) it takes and returns a recurrent state tensor,
+  AND each window must be prepended with the last 64 samples of the PREVIOUS
+  window (the "context"), so the real model input is 576 samples. Omit the context
+  and the model scores real speech near 0.0 — found the hard way in Phase 2, now
+  pinned by a regression test on real audio. One inference is ~0.1-0.5 ms on CPU.
 - VadGate turns raw per-window speech probabilities into debounced start/stop
   events via hysteresis: `start_windows` consecutive windows >= start_prob to
   start, `stop_windows` consecutive windows <= stop_prob to stop. The asymmetric
@@ -22,6 +25,7 @@ import numpy as np
 import onnxruntime
 
 WINDOW_SAMPLES = 512  # Silero v5 requires exactly 512 samples at 16 kHz (32 ms)
+CONTEXT_SAMPLES = 64  # v5 prepends this much of the previous window (16 kHz)
 SAMPLE_RATE = 16000
 DEFAULT_MODEL = Path(__file__).resolve().parents[2] / "models" / "silero_vad.onnx"
 
@@ -41,20 +45,24 @@ class SileroVad:
             str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._context = np.zeros(CONTEXT_SAMPLES, dtype=np.float32)
 
     def reset(self) -> None:
         self._state[:] = 0.0
+        self._context[:] = 0.0
 
     def prob(self, chunk: np.ndarray) -> float:
         """Speech probability for one float32 window in [-1, 1], shape (512,)."""
+        with_context = np.concatenate([self._context, chunk])
         out, self._state = self._session.run(
             ["output", "stateN"],
             {
-                "input": chunk.reshape(1, -1),
+                "input": with_context.reshape(1, -1),
                 "state": self._state,
                 "sr": np.array(SAMPLE_RATE, dtype=np.int64),
             },
         )
+        self._context = chunk[-CONTEXT_SAMPLES:]
         return float(out[0, 0])
 
 

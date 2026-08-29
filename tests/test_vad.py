@@ -78,7 +78,26 @@ def test_stream_emits_gate_events() -> None:
     assert kinds == ["start", "stop"]
 
 
-# --- Real model smoke test ---
+# --- Real model tests ---
+
+def test_real_speech_triggers_gate_events() -> None:
+    # Regression: without the 64-sample context the v5 model expects prepended
+    # to each window, real speech scores ~0.0 and the gate never fires (found
+    # live in Phase 2: transcript flowed but no VAD events, so no turns).
+    # tests/assets/speech.wav: 16 kHz mono PCM16, ~6 s of synthesized speech.
+    import wave
+    from pathlib import Path
+
+    with wave.open(str(Path(__file__).parent / "assets" / "speech.wav"), "rb") as w:
+        pcm = w.readframes(w.getnframes())
+    stream = VadStream()
+    events = []
+    for off in range(0, len(pcm) - 639, 640):
+        events += stream.feed(pcm[off : off + 640], t=off / 32000)
+    kinds = [e.kind for e in events]
+    assert "start" in kinds, f"no speech detected in speech audio: {kinds}"
+    assert "stop" in kinds, f"speech never ended: {kinds}"
+
 
 def test_silero_model_loads_and_scores_silence_low() -> None:
     vad = SileroVad()
