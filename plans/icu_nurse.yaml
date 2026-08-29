@@ -19,15 +19,19 @@ steps:
   - field: icu_years
     type: float
     ask: "How many years of ICU experience do you have?"
+    scoring: { min_full: 2.0 }          # >= 2 years scores 1.0, linear below
   - field: certifications
     type: list
     ask: "Which certifications do you hold — BLS, ACLS, CCRN?"
+    scoring: { expected: [BLS, ACLS, CCRN] }   # fraction of expected certs held
   - field: shift_availability
     type: str
     ask: "This role is night shifts. Which shifts can you work?"
+    scoring: { contains_any: [night, any shift, flexible] }
   - field: earliest_start
     type: str
     ask: "When is the earliest you could start?"
+    scoring: { answered: true }
   - field: pay_expectation
     type: str
     ask: "What hourly rate are you looking for?"

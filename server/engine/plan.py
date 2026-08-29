@@ -15,6 +15,7 @@ the user's "LLM-signaled" design pick with CLAUDE.md's coverage rule. Knockouts
 fire the moment a disqualifying value is recorded (e.g. license inactive), so
 the caller isn't dragged through questions that no longer matter.
 """
+import re
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any
@@ -24,12 +25,16 @@ import yaml
 _TYPES = {"bool", "str", "float", "list"}
 
 
+_SCORING_RULES = {"min_full", "expected", "contains_any", "answered"}
+
+
 @dataclass(frozen=True)
 class Step:
     field: str
     type: str
     ask: str | None = None
     knockout: dict | None = None
+    scoring: dict | None = None  # rubric lives in the plan, not in code
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,9 @@ def load_plan(path: Path) -> InterviewPlan:
     for s in steps:
         if s.type not in _TYPES:
             raise ValueError(f"step {s.field!r}: unknown type {s.type!r}")
+        if s.scoring is not None and not set(s.scoring) <= _SCORING_RULES:
+            raise ValueError(f"step {s.field!r}: unknown scoring rule "
+                             f"{set(s.scoring) - _SCORING_RULES}")
     step_fields = {s.field for s in steps}
     weights = raw.get("weights", {})
     for w in weights:
@@ -76,7 +84,14 @@ def _coerce(value: Any, type_name: str) -> Any:
                 return value
             return str(value).strip().lower() in ("true", "yes", "y", "1")
         case "float":
-            return float(value)
+            if isinstance(value, (int, float)):
+                return float(value)
+            # Tolerate prose around the digits ("6.5 years", "about 3 or so"):
+            # models narrate; the first numeric token is the answer.
+            match = re.search(r"-?\d+(?:\.\d+)?", str(value))
+            if match is None:
+                raise ValueError(f"no number in {value!r}")
+            return float(match.group())
         case "list":
             if isinstance(value, list):
                 return [str(v).strip() for v in value]

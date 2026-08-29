@@ -31,6 +31,17 @@ def test_load_rejects_unknown_field_in_weights(tmp_path: Path) -> None:
         load_plan(bad)
 
 
+def test_float_coercion_tolerates_surrounding_words() -> None:
+    # Golden-run regression: extraction returned "six and a half years" -> the
+    # value died in float(). Digits embedded in prose must still parse; pure
+    # word-numbers still fail (schema now asks for digits).
+    st = make_state()
+    assert st.record("icu_years", "6.5 years", quote="q") is True
+    assert st.fields["icu_years"].value == 6.5
+    assert st.record("icu_years", "about 3 years or so", quote="q") is True
+    assert st.fields["icu_years"].value == 3.0
+
+
 def test_record_coerces_types() -> None:
     st = make_state()
     st.record("consent", True, quote="sure, go ahead")
