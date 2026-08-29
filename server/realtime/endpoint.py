@@ -10,10 +10,13 @@ caller (call.py) drives tick() from a ~50 ms loop with real time.
 Policy: when VAD reports silence (on_vad_stop) we arm a deadline anchored at
 vad_stop, with THREE patience tiers judged from the accumulated transcript:
 - complete (ends in terminal punctuation)            -> +250 ms   ("fast")
-- incomplete                                          -> +1.5 s    ("slow")
-- trailing (last word is a conjunction/preposition/
-  filler: "and", "to", "um" — the thought is clearly
-  still in flight)                                    -> +2.5 s    ("trailing")
+- incomplete                                          -> +2.0 s    ("slow")
+- trailing (ends mid-clause: a comma/semicolon, or a
+  conjunction/preposition/filler like "and", "to",
+  "um" — the thought is clearly still in flight)      -> +2.5 s    ("trailing")
+The slow tier is deliberately generous: Deepgram punctuates finished speech, so
+an UNpunctuated ending usually means its prosody model heard continuation too.
+Snappiness lives in the fast tier; only ambiguity pays for patience.
 Each ASR final re-arms the deadline from the SAME vad_stop anchor, because
 finals lag speech: a punctuated final arriving 150 ms after silence upgrades a
 pending slow wait to fast without restarting the clock. Deepgram's UtteranceEnd
@@ -40,8 +43,11 @@ def looks_complete(text: str) -> bool:
 
 
 def looks_trailing(text: str) -> bool:
-    words = text.rstrip().rstrip(",;:").split()
-    return bool(words) and words[-1].lower().strip(",;:") in _TRAILING_WORDS
+    text = text.rstrip()
+    if text.endswith((",", ";", ":")):
+        return True  # mid-clause punctuation: the strongest "still going" cue
+    words = text.split()
+    return bool(words) and words[-1].lower() in _TRAILING_WORDS
 
 
 @dataclass(frozen=True)
@@ -54,7 +60,7 @@ class TurnComplete:
 
 
 class Endpointer:
-    def __init__(self, fast_sec: float = 0.25, slow_sec: float = 1.50,
+    def __init__(self, fast_sec: float = 0.25, slow_sec: float = 2.00,
                  trailing_sec: float = 2.50) -> None:
         self.fast_sec = fast_sec
         self.slow_sec = slow_sec

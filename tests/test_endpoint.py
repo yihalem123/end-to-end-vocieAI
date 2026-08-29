@@ -2,7 +2,7 @@
 from server.realtime.endpoint import Endpointer
 
 FAST = 0.25
-SLOW = 1.50
+SLOW = 2.00
 TRAILING = 2.50
 
 
@@ -71,6 +71,19 @@ def test_utterance_end_commits_complete_text_immediately() -> None:
     assert turn is not None
     assert turn.reason == "utterance_end"
     assert abs(turn.endpoint_delay - 0.4) < 1e-9
+
+
+def test_trailing_comma_gets_extra_patience() -> None:
+    # Live regression (2026-08-30 #2): "Yeah. I mean," was committed at the
+    # slow tier — but a trailing comma is the strongest "still going" cue.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("Yeah. I mean,", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)
+    assert turn is not None
+    assert turn.reason == "trailing"
 
 
 def test_utterance_end_defers_to_timers_on_incomplete_text() -> None:
