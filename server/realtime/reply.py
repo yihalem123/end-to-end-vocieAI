@@ -23,10 +23,9 @@ turn_latency from the Speaker.
 import asyncio
 import logging
 from contextlib import suppress
-from pathlib import Path
 
 from server.config import Settings
-from server.engine.plan import InterviewState, load_plan_cached
+from server.engine.plan import InterviewPlan, InterviewState, load_plan_cached
 from server.engine.stub import StubEngine
 from server.engine.turn import LlmEngine
 from server.metrics import registry
@@ -41,10 +40,16 @@ log = logging.getLogger(__name__)
 
 
 def _spoken_eq(a: str, b: str) -> bool:
-    """Punctuation/case-insensitive equality: a speculation seeded from an
-    interim transcript must still promote when the final only adds a period."""
+    """Allow only casing/space and final punctuation changes on promotion.
+
+    Internal punctuation can change meaning ("No, nights" vs "No nights"), so
+    it remains part of the identity check.
+    """
     import re
-    norm = lambda s: re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+    def norm(value: str) -> str:
+        return re.sub(r"\s+", " ", value.strip().casefold()).rstrip(".!?")
+
     return norm(a) == norm(b)
 
 # Perceived-latency filler, ON DEMAND: at turn commit we give the engine a
@@ -125,7 +130,8 @@ async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENC
 
 class ReplyController:
     def __init__(self, send_json, send_bytes, settings: Settings, state,
-                 metric_prefix: str = "", call_id: str = "unassigned") -> None:
+                 metric_prefix: str = "", call_id: str = "unassigned",
+                 plan: InterviewPlan | None = None) -> None:
         self._send = send_json
         self._send_bytes = send_bytes
         self._metric_prefix = metric_prefix  # "flux_" tags the A/B in /metrics
@@ -136,6 +142,7 @@ class ReplyController:
         self._drained: dict[int, asyncio.Event] = {}
         self._spec: dict | None = None  # in-flight speculative generation
         self._active_voice_generation: int | None = None
+        self._browser_turn_anchors: dict[int, float] = {}
         self._tts: MultiContextTts | None = None
         self._prewarm: asyncio.Task | None = None
         self._speaker: Speaker | None = None
@@ -145,11 +152,11 @@ class ReplyController:
             self._speaker = Speaker(self._send_audio, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
         self._filler_idx = 0
-        plan = load_plan_cached(str(settings.plan_path))
+        plan = plan if plan is not None else load_plan_cached(str(settings.plan_path))
         self.interview = InterviewState(plan)
         self._engine: LlmEngine | StubEngine
         if settings.openai_api_key:
-            self._engine = LlmEngine(settings, self.interview)
+            self._engine = LlmEngine(settings, self.interview, call_id=call_id)
         else:
             self._engine = StubEngine()
 
@@ -163,17 +170,33 @@ class ReplyController:
             raise asyncio.CancelledError
         await self._send_bytes(encode_audio_frame(generation_id, frame))
 
-    async def _sentences_for(self, token: GenerationToken, transcript: str):
-        is_current = lambda: self._supervisor.is_current(token)
+    async def _sentences_for(self, token: GenerationToken, transcript: str,
+                             commit_gate: asyncio.Event | None = None):
+        def is_current() -> bool:
+            return self._supervisor.is_current(token)
         if not is_current():
             return
         if isinstance(self._engine, LlmEngine):
             async for sentence in self._engine.respond(
                     transcript, is_current=is_current,
-                    turn_id=token.turn_id, generation_id=token.generation_id):
+                    turn_id=token.turn_id, generation_id=token.generation_id,
+                    commit_gate=commit_gate):
                 if not is_current():
                     return
                 yield sentence
+            failures = [
+                {"tool_call_id": result.get("tool_call_id"),
+                 "name": result.get("name"), "reason": result.get("reason")}
+                for result in getattr(self._engine, "last_tool_results", [])
+                if (not result.get("applied")
+                    and not str(result.get("reason", "")).startswith("duplicate"))
+            ]
+            if failures and is_current():
+                await self._send({
+                    "type": "tool_failures", "turn_id": token.turn_id,
+                    "generation_id": token.generation_id,
+                    "failures": failures,
+                })
         else:
             for sentence in self._engine.reply(transcript):
                 if not is_current():
@@ -198,6 +221,7 @@ class ReplyController:
             spec["anchors"]["vad_stop_t"] = turn.vad_stop_t
             self._drained[token.generation_id] = asyncio.Event()
             self._active_voice_generation = token.generation_id
+            self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
             self.guard.on_agent_audio_start()
             spec["release"].set()
             return
@@ -210,6 +234,7 @@ class ReplyController:
             turn_id, lambda owned: self._speak_reply(owned, turn))
         self._drained[token.generation_id] = asyncio.Event()
         self._active_voice_generation = token.generation_id
+        self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
         self.guard.on_agent_audio_start()
 
     async def _speak_reply(self, token: GenerationToken, turn: TurnComplete) -> None:
@@ -219,8 +244,9 @@ class ReplyController:
             {"commit_t": turn.commit_t, "vad_stop_t": turn.vad_stop_t},
             record_metrics=True)
 
-    def _voiced_sentences(self, token: GenerationToken, transcript: str):
-        sentences = self._sentences_for(token, transcript)
+    def _voiced_sentences(self, token: GenerationToken, transcript: str,
+                          commit_gate: asyncio.Event | None = None):
+        sentences = self._sentences_for(token, transcript, commit_gate=commit_gate)
         if wants_filler(self.interview):
             filler = FILLERS[self._filler_idx % len(FILLERS)]
             self._filler_idx += 1
@@ -231,7 +257,8 @@ class ReplyController:
                              anchors: dict, record_metrics: bool,
                              release: asyncio.Event | None = None) -> None:
         assert self._speaker is not None
-        is_current = lambda: self._supervisor.is_current(token)
+        def is_current() -> bool:
+            return self._supervisor.is_current(token)
         try:
             timings = await self._speaker.speak(
                 sentences, anchors, token.generation_id, is_current, release)
@@ -251,6 +278,11 @@ class ReplyController:
         except asyncio.CancelledError:
             raise  # barge-in/hangup: truncation and teardown own the rest
         except Exception:
+            if release is not None and not release.is_set():
+                # A draft is not a caller-visible turn. Promotion will see that
+                # ownership cleared and run one normal generation instead.
+                log.info("speculative reply failed before promotion", exc_info=True)
+                return
             log.exception("voice reply failed; generation stopped")
             if is_current():
                 self.guard.on_agent_audio_end()
@@ -264,6 +296,9 @@ class ReplyController:
         if (record_metrics and isinstance(self._engine, LlmEngine)
                 and self._engine.last_ttft_ms):
             timings["llm_ttft_ms"] = self._engine.last_ttft_ms
+            timings["llm_cached_tokens"] = float(self._engine.last_cached_tokens)
+            timings["llm_cache_write_tokens"] = float(
+                self._engine.last_cache_write_tokens)
         if record_metrics:
             registry.record_turn(
                 self._call_id,
@@ -275,7 +310,8 @@ class ReplyController:
         self._active_voice_generation = None
 
     async def _reply_text_only(self, token: GenerationToken, transcript: str) -> None:
-        is_current = lambda: self._supervisor.is_current(token)
+        def is_current() -> bool:
+            return self._supervisor.is_current(token)
         try:
             sentences = [s async for s in self._sentences_for(token, transcript)]
         except Exception:
@@ -353,11 +389,11 @@ class ReplyController:
         anchors = {"commit_t": 0.0, "vad_stop_t": 0.0}
         spec = {"transcript": transcript, "release": release, "anchors": anchors}
         log.info("speculation START %r", transcript[:60])
-        spec_token_holder = None
         spec["token"] = await self._supervisor.start(
             turn_id,
             lambda owned: self._deliver_voice(
-                owned, self._voiced_sentences(owned, transcript),
+                owned, self._voiced_sentences(
+                    owned, transcript, commit_gate=release),
                 anchors, record_metrics=True, release=release))
         self._spec = spec
 
@@ -423,6 +459,23 @@ class ReplyController:
         if event is not None:
             event.set()
 
+    async def on_playback_started(self, generation_id: int) -> None:
+        current = self._supervisor.current
+        anchor = self._browser_turn_anchors.pop(generation_id, None)
+        if (anchor is None or current is None
+                or current.generation_id != generation_id):
+            return
+        registry.record_turn(
+            self._call_id,
+            **{self._metric_prefix + "browser_turn_latency_ms":
+               (asyncio.get_running_loop().time() - anchor) * 1000},
+        )
+
+    def _remember_browser_anchor(self, generation_id: int, vad_stop_t: float) -> None:
+        self._browser_turn_anchors[generation_id] = vad_stop_t
+        while len(self._browser_turn_anchors) > 4:
+            del self._browser_turn_anchors[next(iter(self._browser_turn_anchors))]
+
     async def on_playback_overflow(self, generation_id: int,
                                    played_samples: int) -> None:
         current = self._supervisor.current
@@ -439,10 +492,15 @@ class ReplyController:
     async def close(self) -> None:
         await self._supervisor.close()
         self.guard.on_agent_audio_end()
-        if self._prewarm is not None and not self._prewarm.done():
-            self._prewarm.cancel()
-            with suppress(asyncio.CancelledError):
+        if self._prewarm is not None:
+            if not self._prewarm.done():
+                self._prewarm.cancel()
+            try:
                 await self._prewarm
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                log.info("tts prewarm did not complete: %s", exc)
         if self._tts is not None:
             await self._tts.close()
         if isinstance(self._engine, LlmEngine):

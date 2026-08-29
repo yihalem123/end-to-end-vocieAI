@@ -36,8 +36,9 @@ from server.postcall.report import (
     store_terminal_report,
 )
 from server.engine.plan import load_plan_cached
-from server.realtime.call import CallSession, _get_vad_runtime
+from server.realtime.call import CallSession
 from server.realtime.session import SessionStatus
+from server.realtime.vad import SileroRuntime
 
 _postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
 
@@ -58,8 +59,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # Fail fast at boot: a broken plan file or missing VAD model must
         # surface at startup, not on call #1. Both loads are cached, so the
         # first call pays nothing.
-        app.state.plan = load_plan_cached(str(resolved.plan_path))
-        _get_vad_runtime()
+        # Both operations perform blocking file/CPU work. Startup is the right
+        # lifecycle boundary, but it is still an async context: keep its event
+        # loop responsive for sibling startup tasks.
+        app.state.plan, app.state.vad_runtime = await asyncio.gather(
+            asyncio.to_thread(load_plan_cached, str(resolved.plan_path)),
+            asyncio.to_thread(SileroRuntime),
+        )
         log.info("startup warm: plan %r validated, vad runtime loaded",
                  resolved.plan_path)
         yield
@@ -95,7 +101,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def ws_call(ws: WebSocket) -> None:
         mode = ws.query_params.get("mode", "custom")
         call_id = uuid.uuid4().hex
-        session = CallSession(ws, app.state.settings, call_id=call_id, mode=mode)
+        session = CallSession(
+            ws, app.state.settings, call_id=call_id, mode=mode,
+            plan=getattr(app.state, "plan", None),
+            vad_runtime=getattr(app.state, "vad_runtime", None),
+        )
         try:
             await session.run()
         except Exception:

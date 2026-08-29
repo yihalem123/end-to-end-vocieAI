@@ -24,6 +24,8 @@ browser mic ──ws──▶ /ws/call ─▶ recv → VAD ─▶ ASR task (Deep
                                                                           ▼
         audio ◀── TTS task (ElevenLabs) ◀── sentence chunker ◀── engine (OpenAI stream + tools)
         generation supervisor invalidates, cancels, and awaits before replacement
+        speculative audio + tools + history share one promotion/ownership gate
+        reliable events outrank one replaceable latest-partial slot
         bounded playback acks clear/drained/overflow with the same generation id
         on hangup → caller-utterance evidence verification → deterministic score/report
 ```
@@ -40,16 +42,18 @@ Reports and metrics stay keyed to that call ID. Numeric scores and knockouts use
 only verified caller utterances; uncertain material evidence requires human review.
 
 Two turn-taking stacks are selectable per call from the console ("Flux
-end-of-turn" toggle): the custom VAD-anchored endpointer (three patience tiers,
-tuned live) or Deepgram Flux's model-integrated end-of-turn. Metrics are tagged
-per mode so the A/B is visible side by side.
+end-of-turn" toggle): the custom VAD-anchored endpointer (three patience tiers)
+or Deepgram Flux's model-integrated end-of-turn. Both can prepare commit-gated
+drafts; Flux uses EagerEndOfTurn and cancels them on TurnResumed. Metrics are
+tagged per mode so the A/B is visible side by side.
 
 ## Metrics that matter (check /metrics/{call_id} after a call)
-endpoint_delay, llm_ttft, tts_ttfb, turn_latency (p50/p95), barge-ins, turns.
+endpoint_delay, llm_ttft (first text delta), tts_ttfb (first provider audio),
+first_audio, turn_latency (p50/p95), prompt-cache tokens, barge-ins, turns.
 Measured results and their history: see `REHEARSAL.md`.
 
 ## Verification
-`pytest -q` — 180 offline tests (no vendor calls).
+`python -m pytest -q` — 205 offline tests (no vendor calls).
 `python scripts/simulate_caller.py [--flux]` — live end-to-end gate: a synthesized
 rambling caller with mid-thought pauses asserts turn integrity and extraction
 against the running server. `--protocol-self-test` runs its offline wire check.

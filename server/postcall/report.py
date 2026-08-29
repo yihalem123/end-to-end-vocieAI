@@ -9,12 +9,9 @@ database is a production talking point, not a demo requirement. build_report()
 is pure so the report shape is unit-testable without the vendor call; the HTML
 view lives in report_view.py (the Call Report design canvas).
 """
-import asyncio
 import logging
 import time
 from collections import OrderedDict
-from html import escape
-from pathlib import Path
 
 from server.config import Settings
 from server.engine.plan import load_plan_cached
@@ -88,24 +85,25 @@ async def run_postcall(call_id: str, conversation: list[dict], turns: list,
     try:
         plan = load_plan_cached(str(settings.plan_path))
 
-        async def safe_analyses() -> list[dict]:
-            # Advisory notes must never fail the evidence pipeline.
-            try:
-                return await analyze_call(settings, plan, conversation)
-            except Exception:
-                log.exception("advisory analyses failed for %s", call_id)
-                return []
-
-        extracted, analyses = await asyncio.gather(
-            extract_call(settings, plan, conversation), safe_analyses())
+        extracted = await extract_call(settings, plan, conversation)
         result = score_call(plan, extracted)
         report = build_report(
             call_id, conversation, turns, extracted, result,
             session_state=SessionStatus.COMPLETED, tool_ledger=tool_ledger,
-            analyses=analyses)
+            analyses=[])
         if lifecycle is not None:
             lifecycle.transition(SessionStatus.COMPLETED)
         _store(call_id, report)
+        # The evidence report is available now. Advisory generation may be slow
+        # or fail independently; it enriches the stored report when ready.
+        if not settings.openai_api_key:
+            return
+        try:
+            analyses = await analyze_call(settings, plan, conversation)
+        except Exception:
+            log.exception("advisory analyses failed for %s", call_id)
+        else:
+            report["analyses"] = analyses
         log.info("postcall %s: score=%s needs_review=%s knocked_out=%s",
                  call_id, result.score, result.needs_review, result.knocked_out)
     except Exception:

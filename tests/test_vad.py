@@ -3,7 +3,6 @@ import numpy as np
 
 from server.realtime.vad import (
     CONTEXT_SAMPLES,
-    SileroRuntime,
     SileroVad,
     VadGate,
     VadStream,

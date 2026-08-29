@@ -4,7 +4,9 @@ from urllib.parse import parse_qs, urlparse
 
 from server.realtime.flux import (
     FluxEndOfTurn,
+    FluxEagerEndOfTurn,
     FluxStartOfTurn,
+    FluxTurnResumed,
     FluxUpdate,
     build_flux_url,
     parse_flux_message,
@@ -20,6 +22,7 @@ def test_build_flux_url_pins_model_and_audio() -> None:
     assert q["encoding"] == ["linear16"]
     assert q["sample_rate"] == ["16000"]
     assert q["eot_threshold"] == ["0.7"]
+    assert q["eager_eot_threshold"] == ["0.6"]
 
 
 def _turn_info(event: str, transcript: str = "") -> str:
@@ -43,5 +46,11 @@ def test_parse_start_of_turn() -> None:
 
 def test_parse_ignores_connected_and_unknown() -> None:
     assert parse_flux_message(json.dumps({"type": "Connected"})) is None
-    assert parse_flux_message(_turn_info("TurnResumed")) is None  # eager-mode only
+    assert parse_flux_message(_turn_info("OtherFutureEvent")) is None
     assert parse_flux_message("not json") is None
+
+
+def test_parse_eager_lifecycle_and_epoch() -> None:
+    assert parse_flux_message(_turn_info("EagerEndOfTurn", "Done."), 4) == (
+        FluxEagerEndOfTurn("Done.", 4))
+    assert parse_flux_message(_turn_info("TurnResumed"), 4) == FluxTurnResumed(4)

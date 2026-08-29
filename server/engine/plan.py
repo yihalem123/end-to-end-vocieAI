@@ -14,7 +14,7 @@ LLM can propose flow; it cannot skip coverage. Live captures remain provisional:
 only caller-utterance-verified post-call evidence may produce a score or knockout.
 """
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any

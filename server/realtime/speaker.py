@@ -1,11 +1,10 @@
 """Speaker: streams one assistant reply to the client. Phase 3.
 
 ## How this works
-speak() runs inside one supervisor-owned generation. For each sentence it records
-a MARK (the frame offset where that sentence's audio starts), opens an
-ElevenLabs stream (one per sentence — the reconnect cost is measured, and is the
-known refinement target), reslices arriving PCM into 640-byte frames, and sends
-them FRAME-PACED: an initial PREBUFFER_FRAMES burst absorbs network jitter, then
+speak() runs inside one supervisor-owned generation. A bounded producer records
+each sentence MARK and synthesizes later sentences ahead of playback on the
+call's persistent ElevenLabs connection. The consumer sends those frames
+FRAME-PACED: an initial PREBUFFER_FRAMES burst absorbs network jitter, then
 one frame per 20 ms of a deadline schedule (sleep-until-target, so pacing never
 drifts). Pacing keeps the client's buffer shallow, which is what makes sent ≈
 played and barge-in truncation honest.
@@ -17,7 +16,7 @@ The client replies with generation id + total played sample count. truncate()
   spoken_through() finds the last sentence that got any airtime. That spoken
   prefix is what actually reached the caller's ears — the truthful transcript.
 
-Timings returned per reply: tts_ttfb (commit -> first ElevenLabs byte),
+Timings returned per reply: tts_ttfb (first TTS request -> first provider byte),
 first_audio (commit -> first frame sent), turn_latency (vad_stop -> first frame
 sent: what the caller experienced as "the agent thought about it"), plus the
 estimated playback remaining after the final paced send for bounded drain waits.
@@ -25,6 +24,7 @@ estimated playback remaining after the final paced send for bounded drain waits.
 import asyncio
 import time
 from collections.abc import AsyncIterable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -33,6 +33,7 @@ from server.realtime.tts import FRAME_BYTES, FrameChunker
 SAMPLES_PER_FRAME = FRAME_BYTES // 2
 FRAME_SEC = 0.02
 PREBUFFER_FRAMES = 10  # 200 ms head start before pacing applies
+SYNTHESIS_BUFFER_FRAMES = 75  # bounded 1.5 s look-ahead across sentences
 
 
 def spoken_through(marks: list[int], played_frames: int) -> int:
@@ -67,33 +68,67 @@ class Speaker:
         timings: dict[str, float] = {}
         pace_start: float | None = None
         frames_sent = 0
-        try:
-            async for sentence in sentences:
-                self._require_current(is_current)
-                record.sentences.append(sentence)
-                record.marks.append(frames_sent)
-                chunker = FrameChunker()
-                async for chunk in self._tts.synthesize(sentence):
+        audio: asyncio.Queue = asyncio.Queue(maxsize=SYNTHESIS_BUFFER_FRAMES)
+        first_tts_request_t: float | None = None
+
+        async def synthesize_ahead() -> None:
+            nonlocal first_tts_request_t
+            produced_frames = 0
+            try:
+                async for sentence in sentences:
                     self._require_current(is_current)
-                    for frame in chunker.push(chunk):
-                        if pace_start is None:
-                            if release is not None:
-                                await release.wait()  # commit-gated: no early audio
-                                self._require_current(is_current)
-                            pace_start = time.monotonic()
-                            timings["tts_ttfb_ms"] = (pace_start - anchors["commit_t"]) * 1000
-                            timings["first_audio_ms"] = (pace_start - anchors["commit_t"]) * 1000
-                            timings["turn_latency_ms"] = (pace_start - anchors["vad_stop_t"]) * 1000
-                        frames_sent = await self._send_paced(
-                            frame, pace_start, frames_sent, generation_id, is_current)
-                tail = chunker.flush()
-                if tail is not None and pace_start is not None:
-                    frames_sent = await self._send_paced(
-                        tail, pace_start, frames_sent, generation_id, is_current)
+                    record.sentences.append(sentence)
+                    record.marks.append(produced_frames)
+                    chunker = FrameChunker()
+                    if first_tts_request_t is None:
+                        first_tts_request_t = time.monotonic()
+                    async for chunk in self._tts.synthesize(sentence):
+                        self._require_current(is_current)
+                        if "tts_ttfb_ms" not in timings:
+                            timings["tts_ttfb_ms"] = (
+                                time.monotonic() - first_tts_request_t
+                            ) * 1000
+                        for frame in chunker.push(chunk):
+                            await audio.put(frame)
+                            produced_frames += 1
+                    tail = chunker.flush()
+                    if tail is not None:
+                        await audio.put(tail)
+                        produced_frames += 1
+                await audio.put(None)
+            except Exception as exc:  # carried across the producer boundary
+                await audio.put(exc)
+
+        producer = asyncio.create_task(synthesize_ahead())
+        try:
+            while True:
+                self._require_current(is_current)
+                item = await audio.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                if pace_start is None:
+                    if release is not None:
+                        await release.wait()  # commit-gated: no early audio
+                        self._require_current(is_current)
+                    pace_start = time.monotonic()
+                first_frame = frames_sent == 0
+                frames_sent = await self._send_paced(
+                    item, pace_start, frames_sent, generation_id, is_current)
+                if first_frame:
+                    first_sent_t = time.monotonic()
+                    timings["first_audio_ms"] = (
+                        first_sent_t - anchors["commit_t"]) * 1000
+                    timings["turn_latency_ms"] = (
+                        first_sent_t - anchors["vad_stop_t"]) * 1000
             timings["_playback_remaining_sec"] = playback_remaining_seconds(
                 frames_sent, pace_start)
             return timings
         finally:
+            producer.cancel()
+            with suppress(asyncio.CancelledError):
+                await producer
             # On cancellation (barge-in, hangup) partial timings still matter:
             # a turn that got its first byte out has a measurable ttfb.
             timings.setdefault("interrupted", float(frames_sent))

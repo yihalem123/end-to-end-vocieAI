@@ -9,7 +9,7 @@ caller (call.py) drives tick() from a ~50 ms loop with real time.
 
 Policy: when VAD reports silence (on_vad_stop) we arm a deadline anchored at
 vad_stop, with THREE patience tiers judged from the accumulated transcript:
-- complete (ends in terminal punctuation)            -> +250 ms   ("fast")
+- complete (ends in terminal punctuation)            -> +200 ms   ("fast")
 - incomplete                                          -> +2.0 s    ("slow")
 - trailing (ends mid-clause: a comma/semicolon, or a
   conjunction/preposition/filler like "and", "to",
@@ -65,7 +65,7 @@ class TurnComplete:
 
 
 class Endpointer:
-    def __init__(self, fast_sec: float = 0.25, slow_sec: float = 2.00,
+    def __init__(self, fast_sec: float = 0.20, slow_sec: float = 2.00,
                  trailing_sec: float = 2.50) -> None:
         self.fast_sec = fast_sec
         self.slow_sec = slow_sec

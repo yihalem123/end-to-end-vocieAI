@@ -104,3 +104,13 @@ def test_event_loop_agent_initiates_with_disclosure() -> None:
             pass
 
     asyncio.run(run())
+
+
+def test_stale_asr_epoch_is_rejected_and_counted() -> None:
+    session = object.__new__(CallSession)
+    session.state = CallState(
+        call_id="call-abc", session=SessionLifecycle("call-abc"))
+    session._asr_epoch = 3
+    assert session._accept_asr_epoch(3)
+    assert not session._accept_asr_epoch(2)
+    assert session.state.stale_asr_events == 1

@@ -1,4 +1,6 @@
 """Sentence chunker, Responses-API event assembly, prompt rendering."""
+import asyncio
+import json
 from pathlib import Path
 
 from server.engine.plan import InterviewState, load_plan
@@ -191,7 +193,7 @@ def test_ledger_records_applied_and_rejected_calls() -> None:
         _tc("c2", "record_answer", {"field": "not_a_field", "value": "x", "quote": "q"}),
         _tc("c3", "record_answer", {"field": "icu_years", "value": "5", "quote": ""}),
         _tc("c4", "advance_step", {}),
-    ], turn_id=3, generation_id=7)
+    ], turn_id=3, generation_id=7, source_text="yes go ahead q")
     ledger = state.tool_ledger
     assert [e["applied"] for e in ledger] == [True, False, False, True]
     assert ledger[1]["reason"] == "rejected by state validation"
@@ -204,8 +206,84 @@ def test_ledger_skips_duplicate_tool_call_ids() -> None:
     engine, state = _engine_with_state()
     call = _tc("dup", "record_answer",
                {"field": "consent", "value": "true", "quote": "yes"})
-    engine._apply_tools([call])
-    engine._apply_tools([call])                    # replayed delivery
+    engine._apply_tools([call], turn_id=2, generation_id=4, source_text="yes")
+    engine._apply_tools([call], turn_id=2, generation_id=5,
+                        source_text="yes")  # replayed in a replacement generation
     applied = [e for e in state.tool_ledger if e["applied"]]
     skipped = [e for e in state.tool_ledger if "duplicate" in e["reason"]]
     assert len(applied) == 1 and len(skipped) == 1
+    assert applied[0]["idempotency_key"] == skipped[0]["idempotency_key"]
+    assert applied[0]["execution_id"] != skipped[0]["execution_id"]
+
+
+def test_ledger_rejects_quote_not_in_committed_utterance() -> None:
+    engine, state = _engine_with_state()
+    results = engine._apply_tools([
+        _tc("invented", "record_answer",
+            {"field": "consent", "value": True, "quote": "absolutely yes"})
+    ], turn_id=1, generation_id=2, source_text="No, I do not consent.")
+    assert not results[0]["applied"]
+    assert "committed utterance" in results[0]["reason"]
+    assert state.fields == {}
+    assert results[0]["call_id"] == "unassigned"
+    assert results[0]["idempotency_key"].endswith(":1:invented")
+    assert results[0]["execution_id"].endswith(":1:2:invented")
+
+
+def test_speculative_engine_waits_for_commit_before_tools_and_history() -> None:
+    engine, state = _engine_with_state()
+    gate = asyncio.Event()
+
+    async def stream(_body):
+        events = _events_for_tool_call()
+        for event in events:
+            yield "data: " + json.dumps(event)
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        task = asyncio.create_task(_collect())
+        await asyncio.sleep(0)
+        assert state.fields == {}
+        assert state.tool_ledger == []
+        assert state.recent_history(8) == []
+        gate.set()
+        lines = await task
+        assert lines
+        assert state.fields["icu_years"].value == 5.0
+        assert len(state.recent_history(8)) == 2
+        await engine.close()
+
+    async def _collect() -> list[str]:
+        return [line async for line in engine.respond(
+            "I have five years", turn_id=4, generation_id=9,
+            commit_gate=gate)]
+
+    asyncio.run(run())
+
+
+def test_response_request_has_cache_key_low_verbosity_and_real_text_ttft() -> None:
+    engine, _state = _engine_with_state()
+    captured = {}
+
+    async def stream(body):
+        captured.update(body)
+        yield 'data: {"type":"response.created"}'
+        yield 'data: {"type":"response.output_text.delta","delta":"Okay. "}'
+        yield ('data: {"type":"response.completed","response":{"usage":'
+               '{"input_tokens_details":{"cached_tokens":42}}}}')
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        lines = [line async for line in engine.respond("yes")]
+        assert lines == ["Okay."]
+        assert engine.last_ttft_ms is not None
+        assert engine.last_cached_tokens == 42
+        assert captured["prompt_cache_key"].startswith("screener-")
+        assert captured["text"] == {"verbosity": "low"}
+        await engine.close()
+
+    asyncio.run(run())

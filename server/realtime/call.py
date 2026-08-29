@@ -35,8 +35,16 @@ from server.realtime.asr import (
     DeepgramSession,
 )
 from server.realtime.endpoint import Endpointer, TurnComplete
-from server.realtime.events import EventBuffer
-from server.realtime.flux import FluxEndOfTurn, FluxSession, FluxStartOfTurn, FluxUpdate
+from server.engine.plan import InterviewPlan
+from server.realtime.events import CriticalEventOverflow, EventBuffer
+from server.realtime.flux import (
+    FluxEagerEndOfTurn,
+    FluxEndOfTurn,
+    FluxSession,
+    FluxStartOfTurn,
+    FluxTurnResumed,
+    FluxUpdate,
+)
 from server.realtime.reply import ReplyController
 from server.realtime.session import SessionLifecycle, SessionStatus, classify_consent
 from server.realtime.vad import SileroRuntime, SileroVad, VadEvent, VadStream
@@ -49,16 +57,8 @@ TICK_SEC = 0.025
 # (~0.5-1.5 s), and a 1 s queue ate the caller's greeting (found by the
 # simulated caller: VAD fired, zero transcripts, 54 drops). 5 s costs 160 KB.
 AUDIO_QUEUE_FRAMES = 250
-EVENT_REPLACEABLE_LIMIT = 64  # stale partials evictable; finals/acks never drop
-
-_shared_vad_runtime: SileroRuntime | None = None  # immutable model resources only
-
-
-def _get_vad_runtime() -> SileroRuntime:
-    global _shared_vad_runtime
-    if _shared_vad_runtime is None:
-        _shared_vad_runtime = SileroRuntime()
-    return _shared_vad_runtime
+EVENT_RELIABLE_LIMIT = 256
+PARTIAL_UI_INTERVAL_SEC = 0.05
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,11 @@ class ClientCleared:
 
 @dataclass(frozen=True)
 class ClientPlaybackDrained:
+    generation_id: int
+
+
+@dataclass(frozen=True)
+class ClientPlaybackStarted:
     generation_id: int
 
 
@@ -94,11 +99,13 @@ class CallState:
     frames_in: int = 0
     frames_dropped: int = 0
     vad_events_dropped: int = 0
+    stale_asr_events: int = 0
 
 
 class CallSession:
     def __init__(self, ws: WebSocket, settings: Settings, call_id: str,
-                 mode: str = "custom") -> None:
+                 mode: str = "custom", plan: InterviewPlan | None = None,
+                 vad_runtime: SileroRuntime | None = None) -> None:
         self._ws = ws
         self._settings = settings
         # "custom": v1 ASR + our VAD-anchored endpointer (the built story).
@@ -109,8 +116,12 @@ class CallSession:
         self._metric_prefix = "flux_" if self.mode == "flux" else ""
         self.state = CallState(call_id=call_id, session=SessionLifecycle(call_id))
         self._audio_to_asr: asyncio.Queue = asyncio.Queue(maxsize=AUDIO_QUEUE_FRAMES)
-        self._events = EventBuffer(replaceable_limit=EVENT_REPLACEABLE_LIMIT)
+        self._events = EventBuffer(reliable_limit=EVENT_RELIABLE_LIMIT)
         self._endpointer = Endpointer()
+        self._plan = plan
+        self._vad_runtime = vad_runtime
+        self._asr_epoch = 1
+        self._last_partial_sent_t = 0.0
         self._last_vad_stop_t: float | None = None
         self._next_turn_id = 0
         self._close_when_idle = False
@@ -128,15 +139,22 @@ class CallSession:
         replies = ReplyController(self._send, self._ws.send_bytes,
                                   self._settings, self.state,
                                   metric_prefix=self._metric_prefix,
-                                  call_id=self.state.call_id)
+                                  call_id=self.state.call_id, plan=self._plan)
         self._replies = replies
         # Only immutable ONNX resources are shared. Recurrent state, context,
         # carry, gate and reset lifetime belong exclusively to this call.
-        self._vad = VadStream(vad=SileroVad(_get_vad_runtime()))
+        runtime = self._vad_runtime
+        if runtime is None:
+            runtime = await asyncio.to_thread(SileroRuntime)
+        self._vad = VadStream(vad=SileroVad(runtime))
         if self.mode == "flux":
             from server.realtime.flux import build_flux_url
-            asr = FluxSession(self._settings.deepgram_api_key, self._events,
-                              url=build_flux_url(self._settings.flux_eot_threshold))
+            asr = FluxSession(
+                self._settings.deepgram_api_key,
+                self._events,
+                url=build_flux_url(self._settings.flux_eot_threshold,
+                                   self._settings.flux_eager_eot_threshold),
+            )
         else:
             asr = DeepgramSession(self._settings.deepgram_api_key, self._events)
         log.info("call starting in %s mode", self.mode)
@@ -158,14 +176,23 @@ class CallSession:
                 await self._send({"type": "error",
                                   "message": "speech recognition unavailable"})
                 await self._ws.close(code=1011)
+        except* CriticalEventOverflow:
+            log.error("reliable event lane overflow; ending call %s",
+                      self.state.call_id)
+            self.state.session.transition(SessionStatus.FAILED)
+            with suppress(Exception):
+                await self._send({"type": "error",
+                                  "message": "realtime pipeline overloaded"})
+                await self._ws.close(code=1011)
         finally:
             await replies.close()
             log.info(
                 "call ended: %d turns, %d conversation entries, %d frames in, "
-                "%d dropped, %d stale partials replaced",
+                "%d dropped, %d stale partials replaced, %d stale ASR events",
                 len(self.state.turns), len(self.state.conversation),
                 self.state.frames_in, self.state.frames_dropped,
                 self._events.replaced,
+                self.state.stale_asr_events,
             )
 
     async def _send(self, payload: dict) -> None:
@@ -214,6 +241,10 @@ class CallSession:
                     generation = int(msg.get("generation_id", 0))
                     if generation > 0:
                         self._offer_event(ClientPlaybackDrained(generation))
+                case "playback_started":
+                    generation = int(msg.get("generation_id", 0))
+                    if generation > 0:
+                        self._offer_event(ClientPlaybackStarted(generation))
                 case "playback_overflow":
                     generation = int(msg.get("generation_id", 0))
                     if generation > 0:
@@ -240,9 +271,17 @@ class CallSession:
             self._audio_to_asr.put_nowait(frame)
 
     def _offer_event(self, event) -> None:
-        # EventBuffer never raises: stale partials are evicted under pressure,
-        # finals/VAD/client acks are always admitted (see events.py).
+        # Partials replace in one slot. Reliable overflow raises loudly: losing
+        # a final/VAD/ack would be worse than ending the affected call.
         self._events.put_nowait(event)
+
+    def _accept_asr_epoch(self, epoch: int) -> bool:
+        if epoch == self._asr_epoch:
+            return True
+        self.state.stale_asr_events += 1
+        log.warning("discarding stale ASR event epoch=%d current=%d call=%s",
+                    epoch, self._asr_epoch, self.state.call_id)
+        return False
 
     @property
     def tool_ledger(self) -> list[dict]:
@@ -280,17 +319,22 @@ class CallSession:
                     if self.mode == "custom":
                         self._offer_audio(FINALIZE)  # flush v1 finals now
                     await self._send({"type": "vad", "state": "silence"})
-                case AsrPartial(text=text):
-                    await self._send({"type": "partial", "text": text})
-                case AsrFinal(text=text):
+                case AsrPartial(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
+                    if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
+                        self._last_partial_sent_t = now
+                        await self._send({"type": "partial", "text": text})
+                case AsrFinal(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
                     self._endpointer.on_asr_final(text, now)
                     if text:
                         await self._send({"type": "final", "text": text})
-                case AsrUtteranceEnd():
+                case AsrUtteranceEnd(epoch=epoch) if self._accept_asr_epoch(epoch):
                     turn = self._endpointer.on_utterance_end(now)
                 case AsrReconnected(epoch=epoch):
                     # Continuity: accumulated finals survive; next partial
                     # supersedes any stale one. The caller sees a brief notice.
+                    if epoch <= self._asr_epoch:
+                        continue
+                    self._asr_epoch = epoch
                     log.warning("asr reconnected (epoch %d) call %s",
                                 epoch, self.state.call_id)
                     await self._send({"type": "notice",
@@ -299,6 +343,8 @@ class CallSession:
                     await self._replies.on_cleared(generation, played)
                 case ClientPlaybackDrained(generation_id=generation):
                     await self._replies.on_playback_drained(generation)
+                case ClientPlaybackStarted(generation_id=generation):
+                    await self._replies.on_playback_started(generation)
                 case ClientPlaybackOverflow(
                     generation_id=generation, played_samples=played
                 ):
@@ -306,16 +352,26 @@ class CallSession:
                 case ClientChat(text=text):
                     turn_id = self._new_turn_id()
                     await self._commit_caller_text(text, turn_id, turn=None)
-                case FluxUpdate(transcript=text):
+                case FluxUpdate(transcript=text, epoch=epoch) if self._accept_asr_epoch(epoch):
                     if text:  # Flux emits empty updates during silence
-                        await self._send({"type": "partial", "text": text})
-                case FluxEndOfTurn(transcript=text):
+                        if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
+                            self._last_partial_sent_t = now
+                            await self._send({"type": "partial", "text": text})
+                case FluxEagerEndOfTurn(transcript=text, epoch=epoch) \
+                        if self._accept_asr_epoch(epoch):
+                    if (text and self.state.session.status
+                            == SessionStatus.INTERVIEWING):
+                        await self._replies.speculate(text, self._next_turn_id + 1)
+                case FluxTurnResumed(epoch=epoch) if self._accept_asr_epoch(epoch):
+                    await self._replies.cancel_speculation()
+                case FluxEndOfTurn(transcript=text, epoch=epoch) \
+                        if self._accept_asr_epoch(epoch):
                     if text:  # empty end-of-turn = silence, not a turn
                         anchor = self._last_vad_stop_t or now
                         turn = TurnComplete(
                             transcript=text, endpoint_delay=max(0.0, now - anchor),
                             vad_stop_t=anchor, commit_t=now, reason="flux")
-                case FluxStartOfTurn():
+                case FluxStartOfTurn(epoch=epoch) if self._accept_asr_epoch(epoch):
                     pass  # local VAD already drives the UI + barge-in guard
                 case None:
                     pass

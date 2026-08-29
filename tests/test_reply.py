@@ -91,6 +91,11 @@ def test_fillers_are_short_spoken_lines() -> None:
     assert all(f.endswith(".") and len(f) <= 12 for f in FILLERS)
 
 
+def test_speculation_identity_preserves_meaningful_punctuation() -> None:
+    assert reply_module._spoken_eq("Five years", "five years.")
+    assert not reply_module._spoken_eq("No, nights.", "No nights.")
+
+
 def test_drain_wait_is_expected_remaining_plus_bounded_margin() -> None:
     assert drain_wait_seconds(0.0) == DRAIN_ACK_MARGIN_SEC
     assert drain_wait_seconds(0.25) == DRAIN_ACK_MARGIN_SEC + 0.25
@@ -216,7 +221,7 @@ def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatc
 
 class FakeLlm(reply_module.LlmEngine):
     """isinstance-compatible engine double; no network, records transcripts."""
-    def __init__(self):  # noqa: super().__init__ deliberately skipped
+    def __init__(self):  # parent initialization deliberately skipped
         self.transcripts = []
         self.last_ttft_ms = None
 
@@ -250,6 +255,7 @@ def _controller(events, engine):
     controller._drained = {}
     controller._spec = None
     controller._active_voice_generation = None
+    controller._browser_turn_anchors = {}
     controller._metric_prefix = ""
     controller._call_id = "test-call"
     controller._state = SimpleNamespace(conversation=[])
@@ -338,6 +344,79 @@ def test_caller_resume_cancels_speculation_silently() -> None:
         assert controller._supervisor.current is None
         assert not any(isinstance(e, tuple) for e in log)  # no audio ever released
         assert controller._state.conversation == []
+
+    asyncio.run(run())
+
+
+def test_speculative_failure_is_not_visible_before_commit() -> None:
+    class ExplodingDraftSpeaker(GatedSpeaker):
+        async def speak(self, *_args, **_kwargs):
+            raise RuntimeError("draft provider failed")
+
+    async def run() -> None:
+        sent, log = [], []
+
+        async def send(ev):
+            sent.append(ev)
+
+        controller = _controller({"send": send, "log": log}, FakeLlm())
+        controller._speaker = ExplodingDraftSpeaker(log)
+        await controller.speculate("Finished.", turn_id=3)
+        await asyncio.sleep(0.05)
+        assert sent == []
+        assert controller._state.conversation == []
+
+    asyncio.run(run())
+
+
+def test_tool_failures_are_returned_to_reply_orchestration() -> None:
+    class RejectingLlm(FakeLlm):
+        def __init__(self):
+            super().__init__()
+            self.last_tool_results = []
+
+        async def respond(self, transcript, **_kw):
+            yield "Please clarify."
+            self.last_tool_results = [{
+                "tool_call_id": "tc1", "name": "record_answer",
+                "applied": False, "reason": "quote not supported",
+            }]
+
+    async def run() -> None:
+        sent, log = [], []
+
+        async def send(ev):
+            sent.append(ev)
+
+        controller = _controller({"send": send, "log": log}, RejectingLlm())
+        token = await controller._supervisor.start(7, lambda _owned: asyncio.sleep(10))
+        lines = [line async for line in controller._sentences_for(token, "unclear")]
+        await controller._supervisor.cancel_current()
+        assert lines == ["Please clarify."]
+        assert sent[0]["type"] == "tool_failures"
+        assert "arguments" not in sent[0]["failures"][0]
+
+    asyncio.run(run())
+
+
+def test_browser_playback_start_records_audible_latency(monkeypatch) -> None:
+    recorded = []
+    monkeypatch.setattr(
+        reply_module.registry, "record_turn",
+        lambda call_id, **values: recorded.append((call_id, values)))
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        controller = _controller({"send": send, "log": []}, FakeLlm())
+        token = await controller._supervisor.start(2, lambda _owned: asyncio.sleep(10))
+        controller._remember_browser_anchor(
+            token.generation_id, asyncio.get_running_loop().time() - 0.05)
+        await controller.on_playback_started(token.generation_id)
+        await controller._supervisor.cancel_current()
+        assert recorded[0][0] == "test-call"
+        assert recorded[0][1]["browser_turn_latency_ms"] >= 50
 
     asyncio.run(run())
 

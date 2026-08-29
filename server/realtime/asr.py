@@ -16,7 +16,7 @@ correct by construction):
   Deepgram flushes its final transcripts before we hang up.
 - _recv_loop parses each message into a typed event and pushes it to events_out
   (the EventBuffer: stale partials are replaceable under pressure; finals and
-  control events are never dropped — see events.py). Never blocks the reader.
+  control events use a bounded priority lane — see events.py). Never blocks the reader.
 run() retries ONCE on an abnormal close (each attempt is a connection epoch; a
 reconnect emits AsrReconnected so the consumer can surface it), then fails with
 the typed AsrUnavailable. Shutdown is bounded: after CloseStream the receiver
@@ -58,24 +58,26 @@ FINALIZE = "finalize"  # audio-queue control marker -> {"type":"Finalize"}.
 @dataclass(frozen=True)
 class AsrPartial:
     text: str
+    epoch: int = 1
 
 
 @dataclass(frozen=True)
 class AsrFinal:
     text: str
     speech_final: bool
+    epoch: int = 1
 
 
 @dataclass(frozen=True)
 class AsrUtteranceEnd:
-    pass
+    epoch: int = 1
 
 
 @dataclass(frozen=True)
 class AsrReconnected:
     """The stream restarted on a new connection epoch. Continuity policy:
-    accumulated endpointer finals survive; the next partial supersedes any
-    stale one (partials are replaceable by design — see events.py)."""
+    accumulated endpointer finals survive. Every subsequent provider event is
+    epoch-tagged and the consumer rejects older epochs."""
     epoch: int
 
 
@@ -100,7 +102,7 @@ def build_url() -> str:
     return f"wss://api.deepgram.com/v1/listen?{urlencode(params)}"
 
 
-def parse_message(raw: str) -> AsrEvent | None:
+def parse_message(raw: str, epoch: int = 1) -> AsrEvent | None:
     try:
         msg = json.loads(raw)
     except json.JSONDecodeError:
@@ -110,10 +112,11 @@ def parse_message(raw: str) -> AsrEvent | None:
             alts = msg.get("channel", {}).get("alternatives", [])
             text = alts[0].get("transcript", "") if alts else ""
             if msg.get("is_final"):
-                return AsrFinal(text=text, speech_final=bool(msg.get("speech_final")))
-            return AsrPartial(text=text) if text else None
+                return AsrFinal(text=text, speech_final=bool(msg.get("speech_final")),
+                                epoch=epoch)
+            return AsrPartial(text=text, epoch=epoch) if text else None
         case "UtteranceEnd":
-            return AsrUtteranceEnd()
+            return AsrUtteranceEnd(epoch=epoch)
         case _:
             return None
 
@@ -128,7 +131,7 @@ class DeepgramSession:
     async def run(self, audio: asyncio.Queue) -> None:
         for attempt in (1, 2):  # reconnect-once policy, each attempt = an epoch
             try:
-                await self._run_once(audio)
+                await self._run_once(audio, epoch=attempt)
                 return
             except (websockets.ConnectionClosedError, OSError, TimeoutError) as exc:
                 log.warning("deepgram connection lost (attempt %d): %s", attempt, exc)
@@ -136,17 +139,17 @@ class DeepgramSession:
                     raise AsrUnavailable("speech recognition unavailable") from exc
                 self._events_out.put_nowait(AsrReconnected(epoch=attempt + 1))
 
-    async def _run_once(self, audio: asyncio.Queue) -> None:
+    async def _run_once(self, audio: asyncio.Queue, epoch: int = 1) -> None:
         async with websockets.connect(
             self._url, additional_headers={"Authorization": f"Token {self._api_key}"},
             open_timeout=CONNECT_TIMEOUT_SEC,
         ) as ws:
-            await self._pump(ws, audio)
+            await self._pump(ws, audio, epoch=epoch)
 
-    async def _pump(self, ws, audio: asyncio.Queue) -> None:
+    async def _pump(self, ws, audio: asyncio.Queue, epoch: int = 1) -> None:
         """Sender drives; after the CloseStream sentinel the receiver gets a
         bounded window to drain finals — a hung provider cannot hold teardown."""
-        recv = asyncio.create_task(self._recv_loop(ws))
+        recv = asyncio.create_task(self._recv_loop(ws, epoch))
         try:
             await self._send_loop(ws, audio)
             try:
@@ -174,14 +177,9 @@ class DeepgramSession:
                 continue
             await ws.send(frame)
 
-    async def _recv_loop(self, ws) -> None:
+    async def _recv_loop(self, ws, epoch: int = 1) -> None:
         async for raw in ws:
-            event = parse_message(raw)
+            event = parse_message(raw, epoch=epoch)
             if event is None:
                 continue
-            try:
-                self._events_out.put_nowait(event)
-            except asyncio.QueueFull:
-                # Drop-newest: transcripts refresh continuously, so a fresher one
-                # follows; blocking here would back-pressure the socket reader.
-                self.dropped_events += 1
+            self._events_out.put_nowait(event)

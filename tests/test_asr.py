@@ -132,7 +132,7 @@ def test_reconnect_emits_epoch_event() -> None:
         session = DeepgramSession("key", events)
         attempts = []
 
-        async def flaky(audio):
+        async def flaky(audio, epoch=1):
             attempts.append(1)
             if len(attempts) == 1:
                 from websockets.exceptions import ConnectionClosedError
@@ -147,3 +147,9 @@ def test_reconnect_emits_epoch_event() -> None:
 
     out = asyncio.run(run())
     assert out == [AsrReconnected(epoch=2)]
+
+
+def test_parser_tags_every_event_with_connection_epoch() -> None:
+    assert parse_message(_results("new", False), epoch=3) == AsrPartial("new", 3)
+    assert parse_message(_results("new.", True), epoch=3) == AsrFinal(
+        "new.", False, 3)

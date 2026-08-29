@@ -1,8 +1,9 @@
-"""EventBuffer: replaceable partials are evictable; finals/control never drop."""
+"""EventBuffer: reliable priority plus one latest replaceable partial."""
 import asyncio
+import pytest
 
 from server.realtime.asr import AsrFinal, AsrPartial, AsrUtteranceEnd
-from server.realtime.events import EventBuffer
+from server.realtime.events import CriticalEventOverflow, EventBuffer
 from server.realtime.flux import FluxEndOfTurn, FluxUpdate
 
 
@@ -15,43 +16,40 @@ def drain(buf: EventBuffer) -> list:
     return asyncio.run(run())
 
 
-def test_fifo_order_preserved() -> None:
+def test_reliable_events_jump_ahead_of_partial() -> None:
     buf = EventBuffer()
     events = [AsrPartial("a"), AsrFinal("a.", True), AsrUtteranceEnd()]
     for e in events:
         buf.put_nowait(e)
-    assert drain(buf) == events
+    assert drain(buf) == [events[1], events[2], events[0]]
 
 
-def test_overflow_evicts_oldest_partial_never_finals() -> None:
-    buf = EventBuffer(replaceable_limit=2)
+def test_every_new_partial_replaces_the_previous_one() -> None:
+    buf = EventBuffer()
     buf.put_nowait(AsrPartial("one"))
     buf.put_nowait(AsrFinal("kept.", True))
     buf.put_nowait(AsrPartial("two"))
     buf.put_nowait(AsrPartial("three"))     # over limit: "one" is evicted
     out = drain(buf)
-    assert AsrFinal("kept.", True) in out
-    assert AsrPartial("one") not in out
-    assert out[-1] == AsrPartial("three")   # newest partial survives
-    assert buf.replaced == 1
+    assert out == [AsrFinal("kept.", True), AsrPartial("three")]
+    assert buf.replaced == 2
 
 
 def test_flux_updates_are_replaceable_too() -> None:
-    buf = EventBuffer(replaceable_limit=1)
+    buf = EventBuffer()
     buf.put_nowait(FluxUpdate("hel"))
     buf.put_nowait(FluxUpdate("hello"))     # replaces the stale partial
     buf.put_nowait(FluxEndOfTurn("hello."))
     out = drain(buf)
-    assert out == [FluxUpdate("hello"), FluxEndOfTurn("hello.")]
+    assert out == [FluxEndOfTurn("hello."), FluxUpdate("hello")]
 
 
-def test_criticals_always_admitted_beyond_replaceable_limit() -> None:
-    buf = EventBuffer(replaceable_limit=1)
-    finals = [AsrFinal(f"s{i}.", False) for i in range(10)]
-    for f in finals:
-        buf.put_nowait(f)
-    assert drain(buf) == finals             # nothing critical was lost
-    assert buf.replaced == 0
+def test_reliable_lane_is_bounded_and_fails_loudly() -> None:
+    buf = EventBuffer(reliable_limit=2)
+    buf.put_nowait(AsrFinal("s1.", False))
+    buf.put_nowait(AsrFinal("s2.", False))
+    with pytest.raises(CriticalEventOverflow):
+        buf.put_nowait(AsrFinal("s3.", False))
 
 
 def test_get_waits_for_next_event() -> None:
@@ -69,7 +67,7 @@ def test_get_waits_for_next_event() -> None:
 
 
 def test_non_asr_events_are_critical() -> None:
-    buf = EventBuffer(replaceable_limit=1)
+    buf = EventBuffer(reliable_limit=2)
     buf.put_nowait({"kind": "client"})      # arbitrary pipeline event
     buf.put_nowait({"kind": "client2"})
     assert drain(buf) == [{"kind": "client"}, {"kind": "client2"}]

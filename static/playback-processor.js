@@ -21,6 +21,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.blockedThrough = 0;
     this.endedGeneration = 0;
     this.drainedGeneration = 0;
+    this.startedGeneration = 0;
     this.port.onmessage = (event) => this.onMessage(event.data);
   }
 
@@ -41,6 +42,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       this.cursor = 0.0;
       this.endedGeneration = 0;
       this.drainedGeneration = 0;
+      this.startedGeneration = 0;
     }
     if (!(audio instanceof ArrayBuffer) || audio.byteLength !== 640) return;
     if (this.queue.length >= MAX_QUEUE_FRAMES) {
@@ -96,6 +98,13 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       if (!frame) {
         out[i] = 0;
         continue;
+      }
+      if (this.startedGeneration !== this.generationId) {
+        this.startedGeneration = this.generationId;
+        this.port.postMessage({
+          type: "playback_started", generation_id: this.generationId,
+          played_samples: this.played + Math.floor(this.cursor),
+        });
       }
       out[i] = frame[Math.floor(this.cursor)] / 0x8000;
       this.cursor += this.stride;

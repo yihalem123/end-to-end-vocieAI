@@ -137,3 +137,35 @@ def test_browser_report_polling_never_uses_global_newest_call() -> None:
     source = client.get("/audio.js").text
     assert 'fetch("/calls")' not in source
     assert "/report/${encodeURIComponent(sessionCallId)}" in source
+
+
+def test_core_report_is_available_before_advisory_analysis_finishes(monkeypatch) -> None:
+    analysis_started = asyncio.Event()
+    release_analysis = asyncio.Event()
+
+    async def fake_extract(_settings, _plan, _conversation):
+        return {}
+
+    async def slow_analysis(_settings, _plan, _conversation):
+        analysis_started.set()
+        await release_analysis.wait()
+        return [{"id": "summary", "title": "Summary", "text": "Done"}]
+
+    monkeypatch.setattr(report_module, "extract_call", fake_extract)
+    monkeypatch.setattr(report_module, "analyze_call", slow_analysis)
+
+    async def run() -> None:
+        settings = Settings(_env_file=None, openai_api_key="test",
+                            plan_path=str(PLAN_PATH))
+        task = asyncio.create_task(report_module.run_postcall(
+            "early-report", [], [], settings))
+        await analysis_started.wait()
+        assert reports["early-report"]["analyses"] == []
+        release_analysis.set()
+        await task
+        assert reports["early-report"]["analyses"][0]["text"] == "Done"
+
+    try:
+        asyncio.run(run())
+    finally:
+        reports.pop("early-report", None)

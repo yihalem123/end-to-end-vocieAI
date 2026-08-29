@@ -254,7 +254,8 @@ async function start() {
   playback.connect(ctx.destination);
   playback.port.onmessage = (e) => {
     if (!e.data?.type || ws?.readyState !== WebSocket.OPEN) return;
-    if (["cleared", "playback_drained", "playback_overflow"].includes(e.data.type)) {
+    if (["cleared", "playback_started", "playback_drained",
+         "playback_overflow"].includes(e.data.type)) {
       ws.send(JSON.stringify({
         type: e.data.type,
         generation_id: e.data.generation_id,

@@ -41,6 +41,12 @@ def test_ws_echo_echoes_text() -> None:
         assert ws.receive_text() == "hello"
 
 
+def test_browser_forwards_playback_started_ack() -> None:
+    client = TestClient(app)
+    assert '"playback_started"' in client.get("/audio.js").text
+    assert 'type: "playback_started"' in client.get("/playback-processor.js").text
+
+
 def test_ws_call_without_key_reports_error() -> None:
     # The call pipeline needs Deepgram; with no key it must fail loudly and
     # immediately, not half-start.

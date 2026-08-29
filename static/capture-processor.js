@@ -24,7 +24,10 @@ class CaptureProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
     this.stride = sampleRate / OUT_RATE; // input samples per output sample
-    this.pending = new Float32Array(0);  // input not yet consumed by the resampler
+    // Fixed scratch ring: avoid allocating/copying a Float32Array every audio
+    // render quantum (~375 allocations/sec at 48 kHz).
+    this.pending = new Float32Array(2048);
+    this.pendingLength = 0;
     this.cursor = 0.0;                   // fractional read position into `pending`
     this.frame = new Int16Array(FRAME_SAMPLES);
     this.fill = 0;                       // samples written into `frame` so far
@@ -34,19 +37,18 @@ class CaptureProcessor extends AudioWorkletProcessor {
     const input = inputs[0][0]; // mono: first channel of first input
     if (!input) return true;    // mic not delivering yet; keep processor alive
 
-    // Append this 128-sample block to whatever the resampler hasn't consumed.
-    const buf = new Float32Array(this.pending.length + input.length);
-    buf.set(this.pending);
-    buf.set(input, this.pending.length);
+    this.pending.set(input, this.pendingLength);
+    this.pendingLength += input.length;
 
     // Consume while we still have the sample *after* the cursor (needed to
     // interpolate). Anything unconsumed carries over to the next process() call,
     // so no samples are ever dropped at block boundaries.
     let pos = this.cursor;
-    while (pos + 1 < buf.length) {
+    while (pos + 1 < this.pendingLength) {
       const i = Math.floor(pos);
       const frac = pos - i;
-      const sample = buf[i] * (1 - frac) + buf[i + 1] * frac; // linear interp
+      const sample = this.pending[i] * (1 - frac) +
+                     this.pending[i + 1] * frac; // linear interp
       const clamped = Math.max(-1, Math.min(1, sample));
       this.frame[this.fill++] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
       if (this.fill === FRAME_SAMPLES) {
@@ -60,7 +62,8 @@ class CaptureProcessor extends AudioWorkletProcessor {
 
     // Keep the unconsumed tail; cursor becomes fractional offset into it.
     const consumed = Math.floor(pos);
-    this.pending = buf.slice(consumed);
+    this.pending.copyWithin(0, consumed, this.pendingLength);
+    this.pendingLength -= consumed;
     this.cursor = pos - consumed;
     return true; // false would permanently kill this processor
   }

@@ -47,6 +47,7 @@ INACTIVITY_TIMEOUT_SEC = 180  # max allowed; the connection must outlive silence
 TTS_CONTEXT_QUEUE_SIZE = 32   # provider chunks; overflow fails this context closed
 TTS_CHUNK_TIMEOUT_SEC = 15    # max wait for the provider's next chunk
 TTS_CONNECT_TIMEOUT_SEC = 10
+TTS_CLOSE_TIMEOUT_SEC = 3
 
 
 class TtsBufferOverflow(RuntimeError):
@@ -214,10 +215,11 @@ class MultiContextTts:
             self._reader = None
         if self._ws is not None:
             try:
-                await self._ws.send(json.dumps({"close_socket": True}))
-            except websockets.ConnectionClosed:
-                pass
-            await self._ws.close()
+                async with asyncio.timeout(TTS_CLOSE_TIMEOUT_SEC):
+                    await self._ws.send(json.dumps({"close_socket": True}))
+                    await self._ws.close()
+            except (websockets.ConnectionClosed, TimeoutError):
+                log.warning("tts close did not complete cleanly")
             self._ws = None
 
 

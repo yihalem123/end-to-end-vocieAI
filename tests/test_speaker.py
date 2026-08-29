@@ -1,5 +1,6 @@
 """Sentence marks and generation ownership in speaker.py."""
 import asyncio
+import time
 
 import pytest
 
@@ -73,3 +74,59 @@ def test_playback_remaining_uses_sent_frames_and_elapsed_time() -> None:
     assert playback_remaining_seconds(0, None, now=10.0) == 0.0
     assert playback_remaining_seconds(20, 10.0, now=10.1) == pytest.approx(0.3)
     assert playback_remaining_seconds(20, 10.0, now=11.0) == 0.0
+
+
+def test_synthesis_prefetches_next_sentence_while_first_plays() -> None:
+    class RecordingTts:
+        def __init__(self):
+            self.calls = []
+
+        async def synthesize(self, sentence):
+            self.calls.append(sentence)
+            yield bytes(640 * 20)
+
+    async def two_sentences():
+        yield "First."
+        yield "Second."
+
+    async def run() -> None:
+        tts = RecordingTts()
+
+        async def send(_generation, _frame):
+            await asyncio.sleep(0.002)
+
+        speaker = Speaker(send, tts)
+        now = time.monotonic()
+        await speaker.speak(
+            two_sentences(),
+            {"commit_t": now, "vad_stop_t": now,
+             "generation_start_t": now},
+            4, lambda: True)
+        assert tts.calls == ["First.", "Second."]
+        assert speaker._records[4].marks == [0, 20]
+
+    asyncio.run(run())
+
+
+def test_tts_first_byte_is_measured_before_commit_gated_audio() -> None:
+    async def run() -> None:
+        sent = []
+        release = asyncio.Event()
+
+        async def send(_generation, frame):
+            sent.append(frame)
+
+        speaker = Speaker(send, FakeTts())
+        started = time.monotonic()
+        task = asyncio.create_task(speaker.speak(
+            sentences(),
+            {"commit_t": started, "vad_stop_t": started,
+             "generation_start_t": started},
+            5, lambda: True, release=release))
+        await asyncio.sleep(0.01)
+        assert sent == []
+        release.set()
+        timings = await task
+        assert timings["tts_ttfb_ms"] < timings["first_audio_ms"]
+
+    asyncio.run(run())

@@ -17,12 +17,13 @@ is the sole authority for scores and knockouts.
 LlmEngine.respond() is an async generator of SENTENCES: text deltas stream into
 the chunker (abbreviation + decimal guards) and each complete sentence is
 yielded immediately — the Speaker starts TTS on sentence one while the model is
-still writing sentence three. llm_ttft (request start -> first streamed event)
+still writing sentence three. llm_ttft (request start -> first text delta)
 is recorded per turn. The system prompt is rendered fresh every turn from
 InterviewState, so the model always sees current coverage; the engine, not the
 model, remains the authority on step order (see plan.py).
 """
 import asyncio
+import hashlib
 import json
 import logging
 import time
@@ -131,6 +132,7 @@ class StreamAssembler:
     def __init__(self) -> None:
         self.tool_calls: list[ToolCall] = []
         self._open: dict[str, dict] = {}  # item_id -> {name, call_id, buf}
+        self.usage: dict = {}
 
     def feed(self, event: dict) -> list[str]:
         """Consume one typed event; return any text deltas it carried."""
@@ -141,6 +143,8 @@ class StreamAssembler:
             case "response.failed" | "response.incomplete":
                 err = event.get("response", {}).get("error") or {}
                 raise EngineStreamError(err.get("message", "response failed"))
+            case "response.completed":
+                self.usage = event.get("response", {}).get("usage") or {}
             case "response.output_text.delta":
                 return [event.get("delta", "")]
             case "response.output_item.added":
@@ -242,10 +246,15 @@ def build_system_prompt(state: InterviewState) -> str:
 
 
 class LlmEngine:
-    def __init__(self, settings: Settings, state: InterviewState) -> None:
+    def __init__(self, settings: Settings, state: InterviewState,
+                 call_id: str = "unassigned") -> None:
         self._settings = settings
         self.state = state
+        self._call_id = call_id
         self.last_ttft_ms: float | None = None
+        self.last_cached_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_tool_results: list[dict] = []
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(
             30.0, connect=ENGINE_CONNECT_TIMEOUT_SEC,
             read=ENGINE_READ_TIMEOUT_SEC))
@@ -275,6 +284,7 @@ class LlmEngine:
         is_current: Callable[[], bool] | None = None,
         turn_id: int | None = None,
         generation_id: int | None = None,
+        commit_gate: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
         """Yield reply sentences as they stream; apply tool calls as they land."""
         current = is_current or (lambda: True)
@@ -292,9 +302,14 @@ class LlmEngine:
             "tools": TOOLS,
             "stream": True,
             "store": False,
+            "prompt_cache_key": "screener-" + hashlib.sha256(
+                build_instructions(state.plan).encode("utf-8")
+            ).hexdigest()[:24],
         }
         if self._settings.turn_model.startswith("gpt-5"):
             body["reasoning"] = {"effort": "none"}  # TTFT is dominated by effort
+        if self._settings.turn_model.startswith("gpt-5.6"):
+            body["text"] = {"verbosity": "low"}
         chunker = SentenceChunker()
         assembler = StreamAssembler()
         reply_parts: list[str] = []
@@ -307,9 +322,12 @@ class LlmEngine:
             if payload == "[DONE]":
                 break
             event = json.loads(payload)
-            if self.last_ttft_ms is None:
+            deltas = assembler.feed(event)
+            if deltas and self.last_ttft_ms is None:
+                # TTFT means first TEXT token, not response.created or another
+                # administrative SSE event.
                 self.last_ttft_ms = (time.monotonic() - t0) * 1000
-            for delta in assembler.feed(event):
+            for delta in deltas:
                 if not current():
                     return
                 reply_parts.append(delta)
@@ -320,9 +338,16 @@ class LlmEngine:
         tail = chunker.flush()
         if tail:
             yield tail
+        if commit_gate is not None:
+            # Speculation is pure computation until the caller turn commits.
+            # Cancellation while waiting discards every pending side effect.
+            await commit_gate.wait()
+        if not current():
+            return
         # Tools first so the fallback sees the state they just updated.
-        self._apply_tools(assembler.tool_calls, current,
-                          turn_id=turn_id, generation_id=generation_id)
+        self.last_tool_results = self._apply_tools(
+            assembler.tool_calls, current, turn_id=turn_id,
+            generation_id=generation_id, source_text=user_text)
         if not current():
             return
         if not "".join(reply_parts).strip():
@@ -335,6 +360,10 @@ class LlmEngine:
         # discarded speculative generation leaves no phantom history entries.
         state.add_history("user", user_text)
         state.add_history("assistant", "".join(reply_parts))
+        details = (assembler.usage.get("input_tokens_details")
+                   or assembler.usage.get("prompt_tokens_details") or {})
+        self.last_cached_tokens = int(details.get("cached_tokens") or 0)
+        self.last_cache_write_tokens = int(details.get("cache_write_tokens") or 0)
 
     def _apply_tools(
         self,
@@ -342,24 +371,38 @@ class LlmEngine:
         is_current: Callable[[], bool] | None = None,
         turn_id: int | None = None,
         generation_id: int | None = None,
-    ) -> None:
+        source_text: str = "",
+    ) -> list[dict]:
         """Validate, apply, and LEDGER every tool call. Failures are returned
         to orchestration as ledger entries (and warnings), never swallowed;
         duplicate tool_call_ids are idempotently skipped."""
         current = is_current or (lambda: True)
         ledger = self.state.tool_ledger
-        seen = {e["tool_call_id"] for e in ledger if e.get("tool_call_id")}
+        seen = {e["idempotency_key"] for e in ledger
+                if e.get("idempotency_key")}
+        results: list[dict] = []
         for call in calls:
             if not current():
-                return
-            entry = {"tool_call_id": call.call_id, "name": call.name,
-                     "turn_id": turn_id, "generation_id": generation_id,
-                     "arguments": call.arguments, "applied": False, "reason": ""}
+                return results
+            tool_identity = call.call_id or hashlib.sha256(
+                (call.name + json.dumps(call.arguments, sort_keys=True,
+                                        default=str)).encode("utf-8")
+            ).hexdigest()[:16]
+            idempotency_key = f"{self._call_id}:{turn_id or 0}:{tool_identity}"
+            execution_id = (f"{self._call_id}:{turn_id or 0}:"
+                            f"{generation_id or 0}:{tool_identity}")
+            entry = {"call_id": self._call_id,
+                     "tool_call_id": call.call_id, "name": call.name,
+                      "turn_id": turn_id, "generation_id": generation_id,
+                     "execution_id": execution_id,
+                     "idempotency_key": idempotency_key,
+                      "arguments": call.arguments, "applied": False, "reason": ""}
             ledger.append(entry)
-            if call.call_id and call.call_id in seen:
-                entry["reason"] = "duplicate tool_call_id (idempotent skip)"
+            results.append(entry)
+            if idempotency_key in seen:
+                entry["reason"] = "duplicate idempotency identity (skip)"
                 continue
-            seen.add(call.call_id)
+            seen.add(idempotency_key)
             if call.arguments is None:
                 entry["reason"] = "malformed arguments"
                 log.warning("malformed tool args for %s; skipped", call.name)
@@ -368,18 +411,34 @@ class LlmEngine:
                 quote = str(call.arguments.get("quote") or "").strip()
                 if not quote:
                     entry["reason"] = "empty quote: evidence required before mutation"
-                    log.warning("record_answer without quote rejected: %s",
-                                call.arguments)
+                    log.warning("record_answer without evidence rejected")
+                    continue
+                if not _quote_supported(quote, source_text):
+                    entry["reason"] = "quote not supported by committed utterance"
+                    log.warning("record_answer with unsupported evidence rejected")
                     continue
                 entry["applied"] = self.state.record(
                     call.arguments.get("field", ""),
                     call.arguments.get("value"), quote)
                 if not entry["applied"]:
                     entry["reason"] = "rejected by state validation"
-                    log.warning("record_answer rejected: %s", call.arguments)
+                    log.warning("record_answer rejected by state validation")
             elif call.name == "advance_step":
                 entry["applied"] = self.state.request_advance()
                 if not entry["applied"]:
                     entry["reason"] = "current step not yet covered"
             else:
                 entry["reason"] = "unknown tool"
+        return results
+
+
+def _quote_supported(quote: str, source_text: str) -> bool:
+    """Loose lexical anchoring: punctuation/case may differ, words may not."""
+    import re
+
+    def normalize(value: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
+
+    evidence = normalize(quote)
+    source = normalize(source_text)
+    return bool(evidence) and evidence in source
