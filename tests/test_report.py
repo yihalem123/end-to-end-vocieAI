@@ -52,10 +52,24 @@ def test_build_report_shape() -> None:
 
 def test_render_html_includes_verdict_fields_and_transcript() -> None:
     html = render_html(sample_report())
-    assert "score 0.90" in html
+    assert ">0.90<" in html                    # the verdict tile's big score
+    assert "Score breakdown" in html
     assert "icu_years" in html and "6.5" in html
-    assert "Six and a half." in html
-    assert "<script" not in html  # escaped output only
+    assert "Six and a half." in html           # transcript replay
+    assert "✓ verified 0.99" in html           # chip anchored to the utterance
+    assert "<script" not in html               # escaped, JS-free output
+
+
+def test_render_html_knockout_and_review_variants() -> None:
+    report = sample_report()
+    report["knocked_out"] = "rn_license_active"
+    report["score"] = None
+    html = render_html(report)
+    assert "Knocked out" in html and "rn_license_active" in html
+    report["knocked_out"] = None
+    report["needs_review"] = True
+    html = render_html(report)
+    assert "Needs review" in html and "score withheld" in html
 
 
 def test_report_endpoints() -> None:

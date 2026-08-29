@@ -8,3 +8,4 @@ __pycache__/
 # local design sources (imported UI reference, not app code)
 Asandia Demo.html
 design_import/
+Call Report.html
