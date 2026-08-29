@@ -8,8 +8,7 @@ message, split on type:
     Partials OVERWRITE one gray line (each supersedes the last); finals APPEND
     permanently; a turn event closes out the utterance with its endpoint_delay —
     the number this phase exists to measure.
-  - binary ArrayBuffer: audio for the playback worklet (nothing sends it in
-    Phase 2; the path stays live because Phase 3 TTS uses it).
+  - binary ArrayBuffer: an 8-byte generation id followed by one PCM frame.
 Still true from Phase 1: AudioContext needs a user gesture; getUserMedia needs
 localhost/https; binaryType "arraybuffer" avoids per-frame Blob reads.
 */
@@ -54,7 +53,10 @@ function handleEvent(ev) {
     case "clear":
       // Barge-in: flush the playback queue NOW; the worklet reports how many
       // samples were actually heard and we relay that to the server.
-      playbackNode?.port.postMessage("clear");
+      playbackNode?.port.postMessage({ type: "clear", generation_id: ev.generation_id });
+      break;
+    case "audio_end":
+      playbackNode?.port.postMessage({ type: "audio_end", generation_id: ev.generation_id });
       break;
     case "error":
       setStatus(`server error: ${ev.message}`);
@@ -89,7 +91,13 @@ function connectWs() {
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
-    else if (playbackNode) playbackNode.port.postMessage(e.data, [e.data]);
+    else if (playbackNode && e.data.byteLength === 648) {
+      const view = new DataView(e.data);
+      const generationId = Number(view.getBigUint64(0, false));
+      const audio = e.data.slice(8);
+      playbackNode.port.postMessage(
+        { type: "audio", generation_id: generationId, audio }, [audio]);
+    }
   };
   ws.onclose = () => { if (running) stop("server closed"); ws = null; };
   ws.onerror = () => setStatus("websocket error (is the server running?)");
@@ -125,8 +133,13 @@ async function start() {
   source.connect(capture);
   playback.connect(ctx.destination);
   playback.port.onmessage = (e) => {
-    if (e.data?.type === "cleared" && ws?.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "cleared", played_samples: e.data.played }));
+    if (!e.data?.type || ws?.readyState !== WebSocket.OPEN) return;
+    if (["cleared", "playback_drained", "playback_overflow"].includes(e.data.type)) {
+      ws.send(JSON.stringify({
+        type: e.data.type,
+        generation_id: e.data.generation_id,
+        played_samples: e.data.played_samples,
+      }));
     }
   };
 

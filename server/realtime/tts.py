@@ -26,12 +26,15 @@ Two clients live here:
   lazily if the socket dropped (inactivity), so worst case pays one handshake
   after a long silence instead of one per sentence. Cancelling a synthesize
   mid-stream best-effort closes its context so ElevenLabs stops generating.
+  Each context queue is bounded; overflow discards that context's buffered audio
+  and fails it closed instead of accumulating stale speech in memory.
 """
 import asyncio
 import base64
 import json
 import logging
 from collections.abc import AsyncIterator
+from contextlib import suppress
 from urllib.parse import urlencode
 
 import websockets
@@ -41,6 +44,11 @@ log = logging.getLogger(__name__)
 FRAME_BYTES = 640  # 20 ms of 16 kHz PCM16
 DEFAULT_MODEL = "eleven_flash_v2_5"
 INACTIVITY_TIMEOUT_SEC = 180  # max allowed; the connection must outlive silences
+TTS_CONTEXT_QUEUE_SIZE = 32   # provider chunks; overflow fails this context closed
+
+
+class TtsBufferOverflow(RuntimeError):
+    """The consumer could not keep up with provider audio for one context."""
 
 
 def build_url(voice_id: str, model_id: str = DEFAULT_MODEL) -> str:
@@ -125,12 +133,28 @@ class MultiContextTts:
                 ctx, audio, is_final = parse_multi_message(raw)
                 queue = self._queues.get(ctx)
                 if queue is not None:
-                    queue.put_nowait((audio, is_final))
+                    self._offer_context(queue, (audio, is_final))
         except websockets.ConnectionClosed as exc:
             log.info("tts connection closed: %s", exc)
         finally:
-            for queue in self._queues.values():
-                queue.put_nowait(None)  # wake consumers: connection is gone
+            for queue in list(self._queues.values()):
+                self._fail_context(queue, ConnectionError("tts connection lost"))
+
+    @staticmethod
+    def _fail_context(queue: asyncio.Queue, error: Exception) -> None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        queue.put_nowait(error)
+
+    def _offer_context(self, queue: asyncio.Queue, item) -> None:
+        try:
+            queue.put_nowait(item)
+        except asyncio.QueueFull:
+            self._fail_context(
+                queue, TtsBufferOverflow("tts context queue exceeded bounded capacity"))
 
     async def synthesize(self, text: str) -> AsyncIterator[bytes]:
         """Stream PCM for one utterance. Cancel the generator to abort it."""
@@ -138,7 +162,7 @@ class MultiContextTts:
         assert self._ws is not None
         ctx = f"c{self._counter}"
         self._counter += 1
-        queue: asyncio.Queue = asyncio.Queue()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=TTS_CONTEXT_QUEUE_SIZE)
         self._queues[ctx] = queue
         finished = False
         try:
@@ -152,8 +176,8 @@ class MultiContextTts:
             await self._ws.send(json.dumps({"context_id": ctx, "close_context": True}))
             while True:
                 item = await queue.get()
-                if item is None:
-                    raise ConnectionError("tts connection lost mid-utterance")
+                if isinstance(item, Exception):
+                    raise item
                 audio, is_final = item
                 if audio:
                     yield audio
@@ -172,6 +196,9 @@ class MultiContextTts:
     async def close(self) -> None:
         if self._reader is not None:
             self._reader.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reader
+            self._reader = None
         if self._ws is not None:
             try:
                 await self._ws.send(json.dumps({"close_socket": True}))

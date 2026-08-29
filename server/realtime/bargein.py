@@ -23,6 +23,10 @@ class BargeInGuard:
         self._agent_speaking = False
         self._onset_t: float | None = None  # armed at this time, None = disarmed
 
+    @property
+    def agent_speaking(self) -> bool:
+        return self._agent_speaking
+
     def on_agent_audio_start(self) -> None:
         self._agent_speaking = True
         self._onset_t = None

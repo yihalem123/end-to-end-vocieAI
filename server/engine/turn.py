@@ -27,7 +27,7 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -227,8 +227,15 @@ class LlmEngine:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def respond(self, user_text: str) -> AsyncIterator[str]:
+    async def respond(
+        self,
+        user_text: str,
+        is_current: Callable[[], bool] | None = None,
+    ) -> AsyncIterator[str]:
         """Yield reply sentences as they stream; apply tool calls as they land."""
+        current = is_current or (lambda: True)
+        if not current():
+            return
         state = self.state
         state.add_history("user", user_text)
         body: dict[str, Any] = {
@@ -263,30 +270,49 @@ class LlmEngine:
                 if self.last_ttft_ms is None:
                     self.last_ttft_ms = (time.monotonic() - t0) * 1000
                 for delta in assembler.feed(event):
+                    if not current():
+                        return
                     reply_parts.append(delta)
                     for sentence in chunker.push(delta):
                         yield sentence
+        if not current():
+            return
         tail = chunker.flush()
         if tail:
             yield tail
         # Tools first so the fallback sees the state they just updated.
-        self._apply_tools(assembler.tool_calls)
+        self._apply_tools(assembler.tool_calls, current)
+        if not current():
+            return
         if not "".join(reply_parts).strip():
             line = fallback_line(state)  # tools-only turn: never go silent
             reply_parts.append(line)
             yield line
+        if not current():
+            return
         state.add_history("assistant", "".join(reply_parts))
 
-    def _apply_tools(self, calls: list[ToolCall]) -> None:
+    def _apply_tools(
+        self,
+        calls: list[ToolCall],
+        is_current: Callable[[], bool] | None = None,
+    ) -> None:
+        current = is_current or (lambda: True)
         for call in calls:
+            if not current():
+                return
             if call.arguments is None:
                 log.warning("malformed tool args for %s; skipped", call.name)
                 continue
             if call.name == "record_answer":
+                if not current():
+                    return
                 ok = self.state.record(call.arguments.get("field", ""),
                                        call.arguments.get("value"),
                                        call.arguments.get("quote", ""))
                 if not ok:
                     log.warning("record_answer rejected: %s", call.arguments)
             elif call.name == "advance_step":
+                if not current():
+                    return
                 self.state.request_advance()

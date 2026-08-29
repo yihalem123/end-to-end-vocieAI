@@ -34,7 +34,7 @@ from server.realtime.asr import (
 from server.realtime.endpoint import Endpointer, TurnComplete
 from server.realtime.flux import FluxEndOfTurn, FluxSession, FluxStartOfTurn, FluxUpdate
 from server.realtime.reply import ReplyController
-from server.realtime.vad import SileroVad, VadEvent, VadStream
+from server.realtime.vad import SileroRuntime, SileroVad, VadEvent, VadStream
 
 log = logging.getLogger(__name__)
 
@@ -46,18 +46,30 @@ TICK_SEC = 0.05
 AUDIO_QUEUE_FRAMES = 250
 EVENT_QUEUE_SIZE = 200
 
-_shared_vad: SileroVad | None = None  # model loaded once per process, not per call
+_shared_vad_runtime: SileroRuntime | None = None  # immutable model resources only
 
 
-def _get_vad() -> SileroVad:
-    global _shared_vad
-    if _shared_vad is None:
-        _shared_vad = SileroVad()
-    return _shared_vad
+def _get_vad_runtime() -> SileroRuntime:
+    global _shared_vad_runtime
+    if _shared_vad_runtime is None:
+        _shared_vad_runtime = SileroRuntime()
+    return _shared_vad_runtime
 
 
 @dataclass(frozen=True)
 class ClientCleared:
+    generation_id: int
+    played_samples: int
+
+
+@dataclass(frozen=True)
+class ClientPlaybackDrained:
+    generation_id: int
+
+
+@dataclass(frozen=True)
+class ClientPlaybackOverflow:
+    generation_id: int
     played_samples: int
 
 
@@ -92,6 +104,7 @@ class CallSession:
         self._events: asyncio.Queue = asyncio.Queue(maxsize=EVENT_QUEUE_SIZE)
         self._endpointer = Endpointer()
         self._last_vad_stop_t: float | None = None
+        self._next_turn_id = 0
 
     async def run(self) -> None:
         await self._ws.accept()
@@ -103,9 +116,9 @@ class CallSession:
                                   self._settings, self.state,
                                   metric_prefix=self._metric_prefix)
         self._replies = replies
-        vad_model = _get_vad()
-        vad_model.reset()
-        self._vad = VadStream(vad=vad_model)
+        # Only immutable ONNX resources are shared. Recurrent state, context,
+        # carry, gate and reset lifetime belong exclusively to this call.
+        self._vad = VadStream(vad=SileroVad(_get_vad_runtime()))
         if self.mode == "flux":
             from server.realtime.flux import build_flux_url
             asr = FluxSession(self._settings.deepgram_api_key, self._events,
@@ -160,13 +173,28 @@ class CallSession:
             msg = json.loads(text)
         except json.JSONDecodeError:
             return
-        match msg.get("type"):
-            case "cleared":
-                self._offer_event(ClientCleared(int(msg.get("played_samples", 0))))
-            case "chat":
-                chat_text = str(msg.get("text", "")).strip()
-                if chat_text:
-                    self._offer_event(ClientChat(chat_text))
+        try:
+            match msg.get("type"):
+                case "cleared":
+                    generation = int(msg.get("generation_id", 0))
+                    if generation > 0:
+                        self._offer_event(ClientCleared(
+                            generation, max(0, int(msg.get("played_samples", 0)))))
+                case "playback_drained":
+                    generation = int(msg.get("generation_id", 0))
+                    if generation > 0:
+                        self._offer_event(ClientPlaybackDrained(generation))
+                case "playback_overflow":
+                    generation = int(msg.get("generation_id", 0))
+                    if generation > 0:
+                        self._offer_event(ClientPlaybackOverflow(
+                            generation, max(0, int(msg.get("played_samples", 0)))))
+                case "chat":
+                    chat_text = str(msg.get("text", "")).strip()
+                    if chat_text:
+                        self._offer_event(ClientChat(chat_text))
+        except (TypeError, ValueError):
+            return  # malformed client control messages never kill the call
 
     def _offer_audio(self, frame: bytes | None, force: bool = False) -> None:
         try:
@@ -187,6 +215,10 @@ class CallSession:
         except asyncio.QueueFull:
             self.state.vad_events_dropped += 1
             log.error("pipeline event dropped — event queue full")
+
+    def _new_turn_id(self) -> int:
+        self._next_turn_id += 1
+        return self._next_turn_id
 
     # --- pipeline events -> endpointer + guard -> replies ---
 
@@ -218,12 +250,20 @@ class CallSession:
                         await self._send({"type": "final", "text": text})
                 case AsrUtteranceEnd():
                     turn = self._endpointer.on_utterance_end(now)
-                case ClientCleared(played_samples=played):
-                    await self._replies.on_cleared(played)
+                case ClientCleared(generation_id=generation, played_samples=played):
+                    await self._replies.on_cleared(generation, played)
+                case ClientPlaybackDrained(generation_id=generation):
+                    await self._replies.on_playback_drained(generation)
+                case ClientPlaybackOverflow(
+                    generation_id=generation, played_samples=played
+                ):
+                    await self._replies.on_playback_overflow(generation, played)
                 case ClientChat(text=text):
-                    self.state.conversation.append({"role": "caller", "text": text})
-                    await self._send({"type": "you", "text": text})
-                    await self._replies.on_chat(text)
+                    turn_id = self._new_turn_id()
+                    self.state.conversation.append(
+                        {"role": "caller", "text": text, "turn_id": turn_id})
+                    await self._send({"type": "you", "text": text, "turn_id": turn_id})
+                    await self._replies.on_chat(text, turn_id)
                 case FluxUpdate(transcript=text):
                     if text:  # Flux emits empty updates during silence
                         await self._send({"type": "partial", "text": text})
@@ -240,19 +280,21 @@ class CallSession:
             if self.mode == "custom":
                 turn = turn or self._endpointer.tick(now)
             if turn is not None:
+                turn_id = self._new_turn_id()
                 self.state.turns.append(turn)
                 self.state.conversation.append(
-                    {"role": "caller", "text": turn.transcript})
+                    {"role": "caller", "text": turn.transcript,
+                     "turn_id": turn_id})
                 registry.record_turn(
                     **{f"{self._metric_prefix}endpoint_delay_ms":
                        turn.endpoint_delay * 1000})
                 await self._send({
                     "type": "turn",
+                    "turn_id": turn_id,
                     "transcript": turn.transcript,
                     "endpoint_delay_ms": round(turn.endpoint_delay * 1000),
                     "reason": turn.reason,
                 })
-                await self._replies.on_turn(turn)
+                await self._replies.on_turn(turn, turn_id)
             if self._replies.guard.tick(now):
-                self._replies.cancel_current()
-                await self._send({"type": "clear"})
+                await self._replies.interrupt_current()

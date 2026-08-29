@@ -6,8 +6,10 @@ import pytest
 
 from server.engine.turn import (
     EngineStreamError,
+    LlmEngine,
     SentenceChunker,
     StreamAssembler,
+    ToolCall,
     build_system_prompt,
     fallback_line,
 )
@@ -147,3 +149,19 @@ def test_fallback_line_speaks_the_plan_verbatim() -> None:
     for s in state.plan.steps:
         state.record(s.field, fill[s.type], quote="q")
     assert "thank" in fallback_line(state).lower()            # done: wrap-up line
+
+
+def test_stale_generation_cannot_apply_tool_side_effects() -> None:
+    state = InterviewState(load_plan(PLAN_PATH))
+    engine = object.__new__(LlmEngine)
+    engine.state = state
+    calls = [
+        ToolCall("record_answer", "c1", {
+            "field": "consent", "value": True, "quote": "yes"}),
+        ToolCall("advance_step", "c2", {}),
+    ]
+
+    engine._apply_tools(calls, is_current=lambda: False)
+
+    assert state.fields == {}
+    assert state.step_idx == 0

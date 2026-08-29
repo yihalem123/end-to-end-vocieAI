@@ -1,8 +1,9 @@
 """Silero VAD (ONNX) + hysteresis gate + frame-to-window buffering. Phase 2.
 
 ## How this works
-Three layers, separable so each is testable alone:
-- SileroVad wraps the ONNX model. Silero v5 is stateful twice over: alongside each
+Four layers, separable so each is testable alone:
+- SileroRuntime owns only the immutable, process-shareable ONNX session.
+- SileroVad owns one call's state. Silero v5 is stateful twice over: alongside each
   512-sample 16 kHz window (32 ms) it takes and returns a recurrent state tensor,
   AND each window must be prepended with the last 64 samples of the PREVIOUS
   window (the "context"), so the real model input is 576 samples. Omit the context
@@ -36,7 +37,9 @@ class VadEvent:
     t: float   # timestamp of the window that triggered the transition
 
 
-class SileroVad:
+class SileroRuntime:
+    """Immutable model resources that may be shared by concurrent calls."""
+
     def __init__(self, model_path: Path = DEFAULT_MODEL) -> None:
         opts = onnxruntime.SessionOptions()
         opts.inter_op_num_threads = 1
@@ -44,6 +47,24 @@ class SileroVad:
         self._session = onnxruntime.InferenceSession(
             str(model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
+
+    def infer(self, samples: np.ndarray, state: np.ndarray) -> tuple[float, np.ndarray]:
+        out, next_state = self._session.run(
+            ["output", "stateN"],
+            {
+                "input": samples.reshape(1, -1),
+                "state": state,
+                "sr": np.array(SAMPLE_RATE, dtype=np.int64),
+            },
+        )
+        return float(out[0, 0]), next_state
+
+
+class SileroVad:
+    """Per-call recurrent/context state over a shareable SileroRuntime."""
+
+    def __init__(self, runtime: SileroRuntime | None = None) -> None:
+        self._runtime = runtime if runtime is not None else SileroRuntime()
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
         self._context = np.zeros(CONTEXT_SAMPLES, dtype=np.float32)
 
@@ -54,16 +75,9 @@ class SileroVad:
     def prob(self, chunk: np.ndarray) -> float:
         """Speech probability for one float32 window in [-1, 1], shape (512,)."""
         with_context = np.concatenate([self._context, chunk])
-        out, self._state = self._session.run(
-            ["output", "stateN"],
-            {
-                "input": with_context.reshape(1, -1),
-                "state": self._state,
-                "sr": np.array(SAMPLE_RATE, dtype=np.int64),
-            },
-        )
+        probability, self._state = self._runtime.infer(with_context, self._state)
         self._context = chunk[-CONTEXT_SAMPLES:]
-        return float(out[0, 0])
+        return probability
 
 
 class VadGate:

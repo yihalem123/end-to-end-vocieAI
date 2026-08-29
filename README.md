@@ -23,9 +23,15 @@ browser mic ──ws──▶ /ws/call ─▶ recv → VAD ─▶ ASR task (Deep
 phone (Twilio) ──ws──▶ /ws/twilio ─┘                                      │ turn_complete
                                                                           ▼
         audio ◀── TTS task (ElevenLabs) ◀── sentence chunker ◀── engine (OpenAI stream + tools)
-        barge-in controller cancels engine+TTS on speech onset · CallState persisted per turn
+        generation supervisor invalidates, cancels, and awaits before replacement
+        bounded playback acks clear/drained/overflow with the same generation id
         on hangup → postcall: extraction (quotes+confidence) → deterministic score → report
 ```
+
+The ONNX VAD session is process-shared, while recurrent state, context, frame
+carry, gate state, and reset lifetime are owned by each call. Reply generations
+are per-call and monotonic: stale audio, tool effects, transcript updates, and
+delayed playback acknowledgements are rejected by ownership checks.
 
 ## Metrics that matter (check /metrics after a call)
 endpoint_delay, llm_ttft, tts_ttfb, turn_latency (p50/p95), barge-ins, turns.

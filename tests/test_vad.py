@@ -1,7 +1,14 @@
 """VAD gate hysteresis, frame windowing, and a real-model smoke test."""
 import numpy as np
 
-from server.realtime.vad import SileroVad, VadGate, VadStream, WINDOW_SAMPLES
+from server.realtime.vad import (
+    CONTEXT_SAMPLES,
+    SileroRuntime,
+    SileroVad,
+    VadGate,
+    VadStream,
+    WINDOW_SAMPLES,
+)
 
 
 class FakeVad:
@@ -14,6 +21,18 @@ class FakeVad:
     def prob(self, chunk: np.ndarray) -> float:
         self.chunks.append(chunk)
         return self.probs.pop(0)
+
+
+class FakeRuntime:
+    """Shared immutable runtime; records each stream's recurrent/context input."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[np.ndarray, np.ndarray]] = []
+
+    def infer(self, samples: np.ndarray,
+              state: np.ndarray) -> tuple[float, np.ndarray]:
+        self.calls.append((samples.copy(), state.copy()))
+        return float(samples[-1]), state + 1
 
 
 # --- VadGate hysteresis (pure logic, no model) ---
@@ -76,6 +95,38 @@ def test_stream_emits_gate_events() -> None:
         events += stream.feed(frame, t=i * 0.032)
     kinds = [e.kind for e in events]
     assert kinds == ["start", "stop"]
+
+
+def test_interleaved_calls_keep_recurrent_and_context_state_private() -> None:
+    runtime = FakeRuntime()
+    call_a = SileroVad(runtime)  # type: ignore[arg-type] - deliberate test double
+    call_b = SileroVad(runtime)  # same immutable runtime, separate stream state
+    a1 = np.full(WINDOW_SAMPLES, 0.25, dtype=np.float32)
+    a2 = np.full(WINDOW_SAMPLES, 0.50, dtype=np.float32)
+    b1 = np.full(WINDOW_SAMPLES, 0.75, dtype=np.float32)
+
+    call_a.prob(a1)
+    call_b.prob(b1)
+    call_a.prob(a2)
+
+    assert [float(state[0, 0, 0]) for _, state in runtime.calls] == [0.0, 0.0, 1.0]
+    assert np.all(runtime.calls[0][0][:CONTEXT_SAMPLES] == 0.0)
+    assert np.all(runtime.calls[1][0][:CONTEXT_SAMPLES] == 0.0)
+    assert np.all(runtime.calls[2][0][:CONTEXT_SAMPLES] == 0.25)
+
+
+def test_reset_affects_only_its_call() -> None:
+    runtime = FakeRuntime()
+    call_a = SileroVad(runtime)  # type: ignore[arg-type]
+    call_b = SileroVad(runtime)  # type: ignore[arg-type]
+    chunk = np.ones(WINDOW_SAMPLES, dtype=np.float32)
+    call_a.prob(chunk)
+    call_b.prob(chunk)
+    call_b.reset()
+    call_a.prob(chunk)
+    call_b.prob(chunk)
+
+    assert [float(state[0, 0, 0]) for _, state in runtime.calls] == [0.0, 0.0, 1.0, 0.0]
 
 
 # --- Real model tests ---

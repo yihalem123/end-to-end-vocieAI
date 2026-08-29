@@ -1,10 +1,13 @@
 """ElevenLabs stream-input protocol: URL, message parsing, frame chunking."""
+import asyncio
 import base64
 import json
 from urllib.parse import parse_qs, urlparse
 
 from server.realtime.tts import (
     FrameChunker,
+    MultiContextTts,
+    TtsBufferOverflow,
     build_multi_url,
     build_url,
     parse_multi_message,
@@ -88,3 +91,14 @@ def test_frame_chunker_flush_empty_returns_none() -> None:
     chunker = FrameChunker()
     list(chunker.push(b"x" * 640))
     assert chunker.flush() is None                # nothing pending, no phantom frame
+
+
+def test_multi_context_queue_overflow_fails_closed() -> None:
+    tts = MultiContextTts("key", "voice")
+    queue = asyncio.Queue(maxsize=2)
+    tts._offer_context(queue, (b"first", False))
+    tts._offer_context(queue, (b"second", False))
+    tts._offer_context(queue, (b"overflow", False))
+    item = queue.get_nowait()
+    assert isinstance(item, TtsBufferOverflow)
+    assert queue.empty()  # buffered stale audio was discarded, not replayed later

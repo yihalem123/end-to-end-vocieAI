@@ -1,47 +1,92 @@
-/* Playback worklet: queued 16 kHz PCM16 frames -> speaker output.
+/* Generation-aware, bounded playback queue for 16 kHz PCM16 agent audio.
 
-## How this works
-The mirror of capture-processor: also on the realtime audio thread, but process()
-FILLS `outputs` instead of reading `inputs`. The main thread posts each received
-640-byte frame to our port; we keep them in a FIFO queue and pull samples out at a
-fractional stride of 16000/contextRate (⅓ at 48 kHz — i.e. we upsample by reading
-the same source sample for ~3 output ticks, nearest-neighbor; audible quality is
-fine for speech, and linear interp is a noted refinement).
-
-Two behaviors matter for later phases:
-- UNDERRUN → SILENCE: if the queue is empty we emit zeros rather than stalling.
-  Network jitter produces brief gaps, never crashes.
-- "clear" MESSAGE → instant flush: drop the whole queue mid-frame. This is the
-  barge-in mechanism (Phase 3): the user starts talking, the server says clear,
-  and audio stops within one 128-sample block (~2.7 ms) because the very next
-  process() call finds nothing to play. This is why playback is a worklet queue
-  and not scheduled AudioBufferSources — one flush point, owned by us.
-The queue is unbounded here because the server paces TTS frames (Phase 3); the
-echo test sends at mic rate, which playback drains at the same rate.
+Every audio and control message carries a generation id. Older generations are
+ignored, clear is acknowledged with the exact played-sample count, and an end
+marker is acknowledged only after its final buffered sample is audible. Queue
+overflow fails closed: buffered audio is discarded and that generation is
+blocked so a slow browser cannot replay a stale, arbitrarily large backlog.
 */
 
 const IN_RATE = 16000;
+const MAX_QUEUE_FRAMES = 75; // 1.5 seconds at 20 ms/frame
 
 class PlaybackProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.queue = [];   // Int16Array frames, FIFO
-    this.cursor = 0.0; // fractional read position within queue[0]
-    this.stride = IN_RATE / sampleRate; // source samples per output tick (<1 = upsample)
-    this.played = 0;   // total SOURCE samples fully played (underrun zeros excluded)
-    this.port.onmessage = (e) => {
-      if (e.data === "clear") {
-        // Report how far playback actually got BEFORE dropping the queue: the
-        // server maps this onto sentence marks to truncate the transcript.
-        const played = this.played + Math.floor(this.cursor);
-        this.queue.length = 0;
-        this.cursor = 0.0;
-        this.played = played; // partial frame is gone; fold it into the total
-        this.port.postMessage({ type: "cleared", played });
-      } else {
-        this.queue.push(new Int16Array(e.data));
-      }
-    };
+    this.queue = [];
+    this.cursor = 0.0;
+    this.stride = IN_RATE / sampleRate;
+    this.played = 0;
+    this.generationId = 0;
+    this.blockedThrough = 0;
+    this.endedGeneration = 0;
+    this.drainedGeneration = 0;
+    this.port.onmessage = (event) => this.onMessage(event.data);
+  }
+
+  onMessage(message) {
+    const generationId = Number(message?.generation_id || 0);
+    if (generationId <= 0) return;
+    if (message.type === "audio") this.enqueue(generationId, message.audio);
+    else if (message.type === "clear") this.clear(generationId);
+    else if (message.type === "audio_end") this.end(generationId);
+  }
+
+  enqueue(generationId, audio) {
+    if (generationId <= this.blockedThrough || generationId < this.generationId) return;
+    if (generationId > this.generationId) {
+      if (this.queue.length) this.failClosed(this.generationId);
+      this.generationId = generationId;
+      this.played = 0;
+      this.cursor = 0.0;
+      this.endedGeneration = 0;
+      this.drainedGeneration = 0;
+    }
+    if (!(audio instanceof ArrayBuffer) || audio.byteLength !== 640) return;
+    if (this.queue.length >= MAX_QUEUE_FRAMES) {
+      this.failClosed(generationId);
+      return;
+    }
+    this.queue.push(new Int16Array(audio));
+  }
+
+  clear(generationId) {
+    if (generationId < this.generationId || generationId <= this.blockedThrough) return;
+    if (generationId > this.generationId) this.generationId = generationId;
+    const playedSamples = this.foldAndClear();
+    this.blockedThrough = Math.max(this.blockedThrough, generationId);
+    this.endedGeneration = 0;
+    this.port.postMessage({ type: "cleared", generation_id: generationId, played_samples: playedSamples });
+  }
+
+  end(generationId) {
+    if (generationId !== this.generationId || generationId <= this.blockedThrough) return;
+    this.endedGeneration = generationId;
+    this.reportDrainedIfReady();
+  }
+
+  failClosed(generationId) {
+    const playedSamples = this.foldAndClear();
+    this.blockedThrough = Math.max(this.blockedThrough, generationId);
+    this.endedGeneration = 0;
+    this.port.postMessage({
+      type: "playback_overflow", generation_id: generationId, played_samples: playedSamples,
+    });
+  }
+
+  foldAndClear() {
+    const playedSamples = this.played + Math.floor(this.cursor);
+    this.queue.length = 0;
+    this.cursor = 0.0;
+    this.played = playedSamples;
+    return playedSamples;
+  }
+
+  reportDrainedIfReady() {
+    if (this.queue.length || this.endedGeneration !== this.generationId ||
+        this.drainedGeneration === this.generationId) return;
+    this.drainedGeneration = this.generationId;
+    this.port.postMessage({ type: "playback_drained", generation_id: this.generationId });
   }
 
   process(_inputs, outputs) {
@@ -49,10 +94,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     for (let i = 0; i < out.length; i++) {
       const frame = this.queue[0];
       if (!frame) {
-        out[i] = 0; // underrun: silence, not a stall
+        out[i] = 0;
         continue;
       }
-      out[i] = frame[Math.floor(this.cursor)] / 0x8000; // int16 -> float
+      out[i] = frame[Math.floor(this.cursor)] / 0x8000;
       this.cursor += this.stride;
       if (this.cursor >= frame.length) {
         this.queue.shift();
@@ -60,6 +105,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.played += frame.length;
       }
     }
+    this.reportDrainedIfReady();
     return true;
   }
 }
