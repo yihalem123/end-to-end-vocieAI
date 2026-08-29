@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # "Rachel" id is a library voice now — the API rejects it on free tiers.)
     elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
     turn_model: str = "gpt-5.6-luna"
+    plan_path: str = "plans/icu_nurse.yaml"
 
 
 def get_settings() -> Settings:

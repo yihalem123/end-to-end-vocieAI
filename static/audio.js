@@ -48,6 +48,9 @@ function handleEvent(ev) {
     case "agent":
       addLine("agent", ev.text + (ev.interrupted ? " ⏹ (interrupted)" : ""));
       break;
+    case "you":  // echo of a chat (text-mode) message
+      addLine("you", ev.text);
+      break;
     case "clear":
       // Barge-in: flush the playback queue NOW; the worklet reports how many
       // samples were actually heard and we relay that to the server.
@@ -77,6 +80,31 @@ async function refreshMetrics() {
   } catch { /* server restarting; try again next tick */ }
 }
 
+function connectWs() {
+  // Shared by voice mode and text mode: one socket, JSON events either way.
+  ws = new WebSocket(`ws://${location.host}/ws/call`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (e) => {
+    if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
+    else if (playbackNode) playbackNode.port.postMessage(e.data, [e.data]);
+  };
+  ws.onclose = () => { if (running) stop("server closed"); ws = null; };
+  ws.onerror = () => setStatus("websocket error (is the server running?)");
+  return ws;
+}
+
+function sendChat() {
+  const text = els.chatText.value.trim();
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    connectWs();
+    ws.onopen = () => { setStatus("text mode"); ws.send(JSON.stringify({ type: "chat", text })); };
+  } else {
+    ws.send(JSON.stringify({ type: "chat", text }));
+  }
+  els.chatText.value = "";
+}
+
 async function start() {
   setStatus("requesting mic…");
   stream = await navigator.mediaDevices.getUserMedia({
@@ -99,25 +127,18 @@ async function start() {
     }
   };
 
-  ws = new WebSocket(`ws://${location.host}/ws/call`);
-  ws.binaryType = "arraybuffer";
-
-  ws.onopen = () => {
+  // Reuse a socket opened by text mode, or open a fresh one.
+  if (!ws || ws.readyState !== WebSocket.OPEN) connectWs();
+  const attachCapture = () => {
     setStatus(`live — context ${ctx.sampleRate} Hz`);
     capture.port.onmessage = (e) => {
-      if (ws.readyState !== WebSocket.OPEN) return;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
       ws.send(e.data);
       els.sent.textContent = ++sentCount;
     };
   };
-
-  ws.onmessage = (e) => {
-    if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
-    else playback.port.postMessage(e.data, [e.data]);
-  };
-
-  ws.onclose = () => { if (running) stop("server closed"); };
-  ws.onerror = () => setStatus("websocket error (is the server running?)");
+  if (ws.readyState === WebSocket.OPEN) attachCapture();
+  else ws.onopen = attachCapture;
 
   running = true;
   els.btn.textContent = "Stop";
@@ -135,12 +156,14 @@ function stop(reason) {
 
 window.addEventListener("DOMContentLoaded", () => {
   for (const id of ["btn", "status", "sent", "vad", "partial", "finals", "turns",
-                    "convo", "metrics"]) {
+                    "convo", "metrics", "chatText", "chatSend"]) {
     els[id] = document.getElementById(id);
   }
   els.btn.addEventListener("click", () => {
     if (running) stop();
     else start().catch((err) => setStatus(`failed: ${err.message}`));
   });
+  els.chatSend.addEventListener("click", sendChat);
+  els.chatText.addEventListener("keydown", (e) => { if (e.key === "Enter") sendChat(); });
   setInterval(refreshMetrics, 2000);
 });

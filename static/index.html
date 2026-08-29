@@ -18,6 +18,8 @@
     #turns { font-variant-numeric: tabular-nums; }
     #convo { max-height: 14rem; overflow-y: auto; margin: 0.5rem 0; }
     .line { padding: 0.15rem 0; } .line.agent { color: #06c; }
+    #chatRow { display: flex; gap: 0.5rem; margin: 0.5rem 0; }
+    #chatRow input { flex: 1; padding: 0.4rem; }
     #metrics { border-collapse: collapse; font-variant-numeric: tabular-nums; }
     #metrics td, #metrics th { border: 1px solid #ddd; padding: 0.2rem 0.6rem; text-align: right; }
     #metrics th:first-child, #metrics td:first-child { text-align: left; }
@@ -31,6 +33,10 @@
   <button id="btn">Start</button><span id="status">idle</span><span id="vad"></span>
   <div id="transcript"><span id="finals"></span><span id="partial"></span></div>
   <div id="convo"></div>
+  <div id="chatRow">
+    <input id="chatText" type="text" placeholder="Text mode: type instead of talking…">
+    <button id="chatSend">Send</button>
+  </div>
   <details open>
     <summary>Turns (endpoint_delay)</summary>
     <ul id="turns"></ul>

@@ -23,8 +23,9 @@ sent: what the caller experienced as "the agent thought about it").
 """
 import asyncio
 import time
+from collections.abc import AsyncIterable
 
-from server.realtime.tts import FRAME_BYTES, FrameChunker, TtsSession
+from server.realtime.tts import FRAME_BYTES, FrameChunker
 
 SAMPLES_PER_FRAME = FRAME_BYTES // 2
 FRAME_SEC = 0.02
@@ -41,7 +42,7 @@ def spoken_through(marks: list[int], played_frames: int) -> int:
 
 
 class Speaker:
-    def __init__(self, send_bytes, tts: TtsSession) -> None:
+    def __init__(self, send_bytes, tts) -> None:  # tts: anything with .synthesize()
         self._send_bytes = send_bytes
         self._tts = tts
         self.samples_sent_total = 0  # lifetime, matches the client's played counter
@@ -49,15 +50,19 @@ class Speaker:
         self.sentences: list[str] = []
         self.marks: list[int] = []   # frame offset (within reply) per sentence
 
-    async def speak(self, sentences: list[str], commit_t: float, vad_stop_t: float) -> dict:
-        self.sentences = sentences
+    async def speak(self, sentences: AsyncIterable[str], commit_t: float,
+                    vad_stop_t: float) -> dict:
+        # Streaming input: sentences arrive as the LLM writes them, so sentence
+        # one is playing while sentence three is still being generated.
+        self.sentences = []
         self.marks = []
         self.reply_base = self.samples_sent_total
         timings: dict[str, float] = {}
         pace_start: float | None = None
         frames_sent = 0
         try:
-            for sentence in sentences:
+            async for sentence in sentences:
+                self.sentences.append(sentence)
                 self.marks.append(frames_sent)
                 chunker = FrameChunker()
                 async for chunk in self._tts.synthesize(sentence):
