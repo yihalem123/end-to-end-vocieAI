@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     # "Rachel" id is a library voice now — the API rejects it on free tiers.)
     elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
     turn_model: str = "gpt-5.6-luna"
+    extract_model: str = "gpt-5.6-terra"  # post-call: quality over latency
     plan_path: str = "plans/icu_nurse.yaml"
 
 
