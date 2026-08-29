@@ -32,23 +32,25 @@ from server.realtime.tts import MultiContextTts
 
 log = logging.getLogger(__name__)
 
-# Perceived-latency filler: spoken IMMEDIATELY at turn commit while the LLM is
-# still thinking, so the caller hears a human-paced acknowledgment instead of
-# dead air (the llm_ttft + first-sentence gap, ~1-2 s). Rotated for variety;
-# skipped on the first exchange (an "Okay." before the greeting reads wrong).
+# Perceived-latency filler, ON DEMAND: at turn commit we give the engine a
+# patience window; if its first sentence arrives in time the caller hears only
+# the real reply, and only a slow turn gets covered by an acknowledgment.
+# Rotated for variety; skipped on the first exchange (an "Okay." before the
+# greeting reads wrong).
 FILLERS = ("Okay.", "Got it.", "Alright.", "Thanks.")
+FILLER_PATIENCE_SEC = 0.6
 
 
 def wants_filler(interview) -> bool:
     return interview is not None and bool(interview.fields)
 
 
-async def overlap_stream(first: str, rest):
-    """Yield `first` immediately while `rest` (the engine stream) runs
-    CONCURRENTLY underneath. A naive 'yield first, then iterate rest' would
-    serialize filler-TTS before the LLM request even starts — the opposite of
-    the point. Errors from the pump re-raise in the consumer; cancelling the
-    consumer (barge-in) cancels the pump and with it the engine request."""
+async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENCE_SEC):
+    """Run `rest` (the engine stream) in a pump task immediately; if its first
+    item beats `patience_sec`, yield only real sentences — otherwise yield the
+    filler to cover the gap, then the real reply as it lands. Errors from the
+    pump re-raise in the consumer; cancelling the consumer (barge-in) cancels
+    the pump and with it the engine request."""
     queue: asyncio.Queue = asyncio.Queue()
 
     async def pump() -> None:
@@ -61,14 +63,18 @@ async def overlap_stream(first: str, rest):
 
     task = asyncio.create_task(pump())
     try:
-        yield first
-        while True:
+        try:
+            item = await asyncio.wait_for(queue.get(), timeout=patience_sec)
+        except TimeoutError:
+            yield filler  # engine is slow this turn: cover the silence
             item = await queue.get()
+        while True:
             if item is None:
                 return
             if isinstance(item, Exception):
                 raise item
             yield item
+            item = await queue.get()
     finally:
         task.cancel()
 

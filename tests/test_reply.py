@@ -1,9 +1,11 @@
-"""overlap_stream: filler yields immediately, engine runs underneath."""
+"""overlap_stream: on-demand filler — spoken only when the engine is slow."""
 import asyncio
 
 import pytest
 
 from server.realtime.reply import FILLERS, overlap_stream, wants_filler
+
+PATIENCE = 0.05  # fast test clock
 
 
 class FakeInterview:
@@ -17,25 +19,44 @@ def test_wants_filler_gating() -> None:
     assert wants_filler(FakeInterview({"consent": 1})) is True
 
 
-def test_overlap_stream_starts_inner_before_first_is_consumed() -> None:
+def test_fast_engine_skips_the_filler() -> None:
+    async def quick():
+        yield "Here already."
+
+    async def run() -> list[str]:
+        return [s async for s in overlap_stream("Okay.", quick(),
+                                                patience_sec=PATIENCE)]
+
+    assert asyncio.run(run()) == ["Here already."]          # no filler needed
+
+
+def test_slow_engine_gets_covered_by_the_filler() -> None:
+    async def slow():
+        await asyncio.sleep(PATIENCE * 4)
+        yield "Sorry, had to think."
+
+    async def run() -> list[str]:
+        return [s async for s in overlap_stream("Okay.", slow(),
+                                                patience_sec=PATIENCE)]
+
+    assert asyncio.run(run()) == ["Okay.", "Sorry, had to think."]
+
+
+def test_engine_runs_concurrently_during_patience_window() -> None:
     started = asyncio.Event()
 
     async def inner():
-        started.set()  # proves the engine request began without being pulled
-        yield "reply sentence"
+        started.set()  # the request must begin during the wait, not after
+        await asyncio.sleep(PATIENCE * 4)
+        yield "reply"
 
-    async def run() -> list[str]:
-        out = []
-        gen = overlap_stream("Okay.", inner())
-        first = await anext(gen)
-        await asyncio.sleep(0)  # let the pump task run
-        assert started.is_set(), "engine must start concurrently with the filler"
-        out.append(first)
-        async for s in gen:
-            out.append(s)
-        return out
+    async def run() -> None:
+        gen = overlap_stream("Okay.", inner(), patience_sec=PATIENCE)
+        assert await anext(gen) == "Okay."
+        assert started.is_set(), "engine must start before the filler decision"
+        assert await anext(gen) == "reply"
 
-    assert asyncio.run(run()) == ["Okay.", "reply sentence"]
+    asyncio.run(run())
 
 
 def test_overlap_stream_propagates_engine_errors() -> None:
@@ -44,8 +65,7 @@ def test_overlap_stream_propagates_engine_errors() -> None:
         yield  # pragma: no cover
 
     async def run() -> None:
-        gen = overlap_stream("Okay.", broken())
-        assert await anext(gen) == "Okay."
+        gen = overlap_stream("Okay.", broken(), patience_sec=PATIENCE)
         with pytest.raises(RuntimeError, match="engine down"):
             await anext(gen)
 

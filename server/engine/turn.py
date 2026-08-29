@@ -177,7 +177,9 @@ def fallback_line(state: InterviewState) -> str:
 
 def build_system_prompt(state: InterviewState) -> str:
     plan = state.plan
-    filled = "\n".join(f"- {name}: {rec.value!r} (they said: \"{rec.quote}\")"
+    # Quotes are truncated in the PROMPT only (full text stays in state for
+    # post-call verification) — the prompt must not grow with caller verbosity.
+    filled = "\n".join(f"- {name}: {rec.value!r} (they said: \"{rec.quote[:60]}\")"
                        for name, rec in state.fields.items()) or "- none yet"
     remaining = ", ".join(s.field for s in plan.steps
                           if s.field not in state.fields) or "none"
