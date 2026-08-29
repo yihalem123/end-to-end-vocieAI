@@ -1,0 +1,102 @@
+{
+  "entries": [
+    {
+      "role": "agent",
+      "text": "Hi, this is Sarah calling about the ICU nurse role. This call is recorded. Is now a good time?"
+    },
+    {
+      "role": "caller",
+      "text": "Yes, sure, go ahead."
+    },
+    {
+      "role": "agent",
+      "text": "Which state is your RN license in, and is it currently active?"
+    },
+    {
+      "role": "caller",
+      "text": "It's a Texas license and yes, it's active."
+    },
+    {
+      "role": "agent",
+      "text": "How many years of ICU experience do you have?"
+    },
+    {
+      "role": "caller",
+      "text": "About six and a half years."
+    },
+    {
+      "role": "agent",
+      "text": "Which certifications do you hold?"
+    },
+    {
+      "role": "caller",
+      "text": "I've got BLS and ACLS, and I'm sitting for the CCRN in October."
+    },
+    {
+      "role": "agent",
+      "text": "This role is night shifts. Which shifts can you work?"
+    },
+    {
+      "role": "caller",
+      "text": "Nights are actually my preference."
+    },
+    {
+      "role": "agent",
+      "text": "When is the earliest you could start?"
+    },
+    {
+      "role": "caller",
+      "text": "I'd need to give two weeks notice."
+    },
+    {
+      "role": "agent",
+      "text": "What hourly rate are you looking for?"
+    },
+    {
+      "role": "caller",
+      "text": "Somewhere around fifty-five an hour."
+    }
+  ],
+  "raw_extraction": {
+    "consent": {
+      "value": "true",
+      "quote": "Yes, sure, go ahead.",
+      "confidence": 0.99
+    },
+    "rn_license_state": {
+      "value": "Texas",
+      "quote": "It's a Texas license and yes, it's active.",
+      "confidence": 0.99
+    },
+    "rn_license_active": {
+      "value": "true",
+      "quote": "It's a Texas license and yes, it's active.",
+      "confidence": 0.99
+    },
+    "icu_years": {
+      "value": "6.5",
+      "quote": "About six and a half years.",
+      "confidence": 0.99
+    },
+    "certifications": {
+      "value": "BLS, ACLS",
+      "quote": "I've got BLS and ACLS, and I'm sitting for the CCRN in October.",
+      "confidence": 0.98
+    },
+    "shift_availability": {
+      "value": "Nights",
+      "quote": "Nights are actually my preference.",
+      "confidence": 0.99
+    },
+    "earliest_start": {
+      "value": "Two weeks notice",
+      "quote": "I'd need to give two weeks notice.",
+      "confidence": 0.99
+    },
+    "pay_expectation": {
+      "value": "Around $55 per hour",
+      "quote": "Somewhere around fifty-five an hour.",
+      "confidence": 0.99
+    }
+  }
+}
