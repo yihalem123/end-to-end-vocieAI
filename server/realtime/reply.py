@@ -32,6 +32,46 @@ from server.realtime.tts import MultiContextTts
 
 log = logging.getLogger(__name__)
 
+# Perceived-latency filler: spoken IMMEDIATELY at turn commit while the LLM is
+# still thinking, so the caller hears a human-paced acknowledgment instead of
+# dead air (the llm_ttft + first-sentence gap, ~1-2 s). Rotated for variety;
+# skipped on the first exchange (an "Okay." before the greeting reads wrong).
+FILLERS = ("Okay.", "Got it.", "Alright.", "Thanks.")
+
+
+def wants_filler(interview) -> bool:
+    return interview is not None and bool(interview.fields)
+
+
+async def overlap_stream(first: str, rest):
+    """Yield `first` immediately while `rest` (the engine stream) runs
+    CONCURRENTLY underneath. A naive 'yield first, then iterate rest' would
+    serialize filler-TTS before the LLM request even starts — the opposite of
+    the point. Errors from the pump re-raise in the consumer; cancelling the
+    consumer (barge-in) cancels the pump and with it the engine request."""
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for item in rest:
+                await queue.put(item)
+            await queue.put(None)
+        except Exception as exc:  # noqa: BLE001 — carried to the consumer
+            await queue.put(exc)
+
+    task = asyncio.create_task(pump())
+    try:
+        yield first
+        while True:
+            item = await queue.get()
+            if item is None:
+                return
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+
 
 class ReplyController:
     def __init__(self, send_json, send_bytes, settings: Settings, state) -> None:
@@ -47,6 +87,7 @@ class ReplyController:
                                         settings.elevenlabs_voice_id)
             self._speaker = Speaker(send_bytes, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
+        self._filler_idx = 0
         self._engine: LlmEngine | StubEngine
         if settings.openai_api_key:
             plan = load_plan(Path(settings.plan_path))
@@ -75,9 +116,14 @@ class ReplyController:
 
     async def _speak_reply(self, turn: TurnComplete) -> None:
         assert self._speaker is not None
+        sentences = self._sentences_for(turn.transcript)
+        if wants_filler(self.interview):
+            filler = FILLERS[self._filler_idx % len(FILLERS)]
+            self._filler_idx += 1
+            sentences = overlap_stream(filler, sentences)
         try:
             timings = await self._speaker.speak(
-                self._sentences_for(turn.transcript), turn.commit_t, turn.vad_stop_t)
+                sentences, turn.commit_t, turn.vad_stop_t)
         except asyncio.CancelledError:
             raise  # barge-in/hangup: truncation and teardown own the rest
         except Exception:
