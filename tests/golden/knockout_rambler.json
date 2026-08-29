@@ -6,7 +6,8 @@
     },
     {
       "role": "caller",
-      "text": "Yeah, I mean, sure, I was just, yeah go ahead."
+      "text": "Yeah, I mean, sure, I was just, yeah go ahead.",
+      "utterance_id": "golden:u1"
     },
     {
       "role": "agent",
@@ -14,7 +15,8 @@
     },
     {
       "role": "caller",
-      "text": "So I was licensed in Ohio, well, actually it started in Kentucky but I transferred it to Ohio, um, but honestly it lapsed back in March, I've been meaning to renew it."
+      "text": "So I was licensed in Ohio, well, actually it started in Kentucky but I transferred it to Ohio, um, but honestly it lapsed back in March, I've been meaning to renew it.",
+      "utterance_id": "golden:u2"
     },
     {
       "role": "agent",
@@ -23,49 +25,66 @@
     },
     {
       "role": "caller",
-      "text": "Twelve years, well, eleven if you don't count the float pool."
+      "text": "Twelve years, well, eleven if you don't count the float pool.",
+      "utterance_id": "golden:u3"
     }
   ],
   "raw_extraction": {
     "consent": {
       "value": "true",
       "quote": "Yeah, I mean, sure, I was just, yeah go ahead.",
-      "confidence": 0.88
+      "utterance_id": "golden:u1",
+      "confidence": 0.93,
+      "contradictory": false
     },
     "rn_license_state": {
       "value": "Ohio",
       "quote": "So I was licensed in Ohio, well, actually it started in Kentucky but I transferred it to Ohio, um, but honestly it lapsed back in March, I've been meaning to renew it.",
-      "confidence": 0.9
+      "utterance_id": "golden:u2",
+      "confidence": 0.91,
+      "contradictory": false
     },
     "rn_license_active": {
       "value": "false",
-      "quote": "but honestly it lapsed back in March, I've been meaning to renew it.",
-      "confidence": 0.98
+      "quote": "So I was licensed in Ohio, well, actually it started in Kentucky but I transferred it to Ohio, um, but honestly it lapsed back in March, I've been meaning to renew it.",
+      "utterance_id": "golden:u2",
+      "confidence": 0.99,
+      "contradictory": false
     },
     "icu_years": {
       "value": "11",
       "quote": "Twelve years, well, eleven if you don't count the float pool.",
-      "confidence": 0.78
+      "utterance_id": "golden:u3",
+      "confidence": 0.7,
+      "contradictory": true
     },
     "certifications": {
       "value": null,
       "quote": null,
-      "confidence": 0.0
+      "utterance_id": null,
+      "confidence": 0,
+      "contradictory": false
     },
     "shift_availability": {
       "value": null,
       "quote": null,
-      "confidence": 0.0
+      "utterance_id": null,
+      "confidence": 0,
+      "contradictory": false
     },
     "earliest_start": {
       "value": null,
       "quote": null,
-      "confidence": 0.0
+      "utterance_id": null,
+      "confidence": 0,
+      "contradictory": false
     },
     "pay_expectation": {
       "value": null,
       "quote": null,
-      "confidence": 0.0
+      "utterance_id": null,
+      "confidence": 0,
+      "contradictory": false
     }
   }
 }
