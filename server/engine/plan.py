@@ -1,1 +1,131 @@
-"""Stub — see PLAN.md for the phase that builds this module, and CLAUDE.md for the rules it must follow."""
+"""Plan loading + InterviewState. Phase 4.
+
+## How this works
+"Plan is data" (CLAUDE.md): everything about WHAT the interview covers — steps,
+field types, knockouts, weights — lives in plans/*.yaml and is validated at
+load. The engine walks it; the LLM only phrases.
+
+InterviewState is the source of truth for one conversation: recorded fields
+(value + verbatim quote, coerced to the step's declared type), the step cursor,
+and bounded history. Advancement is LLM-signaled but ENGINE-VALIDATED:
+request_advance() refuses unless the current step's field is recorded, then
+moves the cursor forward past any step already filled by volunteered info. The
+LLM can propose flow; it cannot skip coverage — that's the reconciliation of
+the user's "LLM-signaled" design pick with CLAUDE.md's coverage rule. Knockouts
+fire the moment a disqualifying value is recorded (e.g. license inactive), so
+the caller isn't dragged through questions that no longer matter.
+"""
+from dataclasses import dataclass, field as dc_field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+_TYPES = {"bool", "str", "float", "list"}
+
+
+@dataclass(frozen=True)
+class Step:
+    field: str
+    type: str
+    ask: str | None = None
+    knockout: dict | None = None
+
+
+@dataclass(frozen=True)
+class InterviewPlan:
+    persona: str
+    consent: str
+    steps: list[Step]
+    weights: dict[str, float]
+    scoring_version: str
+    language: str = "en"
+
+
+@dataclass(frozen=True)
+class Recorded:
+    value: Any
+    quote: str
+
+
+def load_plan(path: Path) -> InterviewPlan:
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    steps = [Step(**s) for s in raw["steps"]]
+    for s in steps:
+        if s.type not in _TYPES:
+            raise ValueError(f"step {s.field!r}: unknown type {s.type!r}")
+    step_fields = {s.field for s in steps}
+    weights = raw.get("weights", {})
+    for w in weights:
+        if w not in step_fields:
+            raise ValueError(f"weights reference unknown field {w!r}")
+    return InterviewPlan(
+        persona=raw["persona"],
+        consent=raw["consent"],
+        steps=steps,
+        weights=weights,
+        scoring_version=raw["scoring_version"],
+        language=raw.get("language", "en"),
+    )
+
+
+def _coerce(value: Any, type_name: str) -> Any:
+    match type_name:
+        case "bool":
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("true", "yes", "y", "1")
+        case "float":
+            return float(value)
+        case "list":
+            if isinstance(value, list):
+                return [str(v).strip() for v in value]
+            return [part.strip() for part in str(value).split(",") if part.strip()]
+        case _:
+            return str(value)
+
+
+class InterviewState:
+    def __init__(self, plan: InterviewPlan) -> None:
+        self.plan = plan
+        self.fields: dict[str, Recorded] = {}
+        self.history: list[dict[str, str]] = []
+        self.step_idx = 0
+        self.knocked_out: str | None = None
+
+    @property
+    def current_step(self) -> Step:
+        return self.plan.steps[min(self.step_idx, len(self.plan.steps) - 1)]
+
+    @property
+    def done(self) -> bool:
+        return self.step_idx >= len(self.plan.steps)
+
+    def record(self, field: str, value: Any, quote: str) -> bool:
+        step = next((s for s in self.plan.steps if s.field == field), None)
+        if step is None:
+            return False
+        try:
+            coerced = _coerce(value, step.type)
+        except (TypeError, ValueError):
+            return False
+        self.fields[field] = Recorded(value=coerced, quote=quote)
+        if step.knockout is not None and coerced == step.knockout.get("equals"):
+            self.knocked_out = field
+        return True
+
+    def request_advance(self) -> bool:
+        """LLM proposes advancement; the engine grants it only when the current
+        step is actually covered, then skips past anything already filled."""
+        if self.done or self.current_step.field not in self.fields:
+            return False
+        self.step_idx += 1
+        while not self.done and self.current_step.field in self.fields:
+            self.step_idx += 1
+        return True
+
+    def add_history(self, role: str, content: str) -> None:
+        self.history.append({"role": role, "content": content})
+
+    def recent_history(self, n: int) -> list[dict[str, str]]:
+        return self.history[-n:]
