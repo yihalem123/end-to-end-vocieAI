@@ -61,7 +61,11 @@ class CaptureProcessor extends AudioWorkletProcessor {
     }
 
     // Keep the unconsumed tail; cursor becomes fractional offset into it.
-    const consumed = Math.floor(pos);
+    // The loop stops when the cursor has no sample AFTER it to interpolate
+    // with, so `pos` can legitimately sit one sample PAST what we hold: clamp,
+    // or the tail length goes negative and the next set() throws (a throwing
+    // process() is killed by the browser — the mic dies for the whole call).
+    const consumed = Math.min(Math.floor(pos), this.pendingLength);
     this.pending.copyWithin(0, consumed, this.pendingLength);
     this.pendingLength -= consumed;
     this.cursor = pos - consumed;
