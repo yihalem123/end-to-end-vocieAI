@@ -17,6 +17,7 @@ raises TtsNoAudio (an exhausted quota must fail loud, not ship a silent call).
 import asyncio
 import json
 import logging
+from contextlib import suppress
 from typing import AsyncIterator
 from urllib.parse import urlencode
 
@@ -47,6 +48,9 @@ class AuraTts:
         self._ws = None
         self._lock = asyncio.Lock()          # one utterance owns the stream
         self._connect_lock = asyncio.Lock()
+        # Kept so a detached scrub cannot be garbage-collected mid-flight and
+        # so its failures surface instead of vanishing into the GC.
+        self._reclaim_task: asyncio.Task | None = None
 
     async def ensure_connected(self) -> None:
         async with self._connect_lock:
@@ -90,8 +94,13 @@ class AuraTts:
             except (asyncio.CancelledError, GeneratorExit):
                 # Aborted mid-utterance (barge-in): hand the lock to a reclaim
                 # task that scrubs the stream, then let the abort propagate.
+                # An abort during connect has no stream to scrub — and no
+                # connection to hand over (found live: a barge-in landed while
+                # the first Speak was still opening the socket).
+                if self._ws is None:
+                    raise
                 release_here = False
-                asyncio.create_task(self._reclaim(self._ws))
+                self._reclaim_task = asyncio.create_task(self._reclaim(self._ws))
                 raise
         finally:
             if release_here:
@@ -133,6 +142,11 @@ class AuraTts:
                 pass
 
     async def close(self) -> None:
+        if self._reclaim_task is not None:
+            self._reclaim_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._reclaim_task
+            self._reclaim_task = None
         ws, self._ws = self._ws, None
         if ws is not None:
             try:

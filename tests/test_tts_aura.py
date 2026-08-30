@@ -47,6 +47,7 @@ def _client(ws) -> AuraTts:
     client._ws = ws
     client._lock = asyncio.Lock()
     client._connect_lock = asyncio.Lock()
+    client._reclaim_task = None
     return client
 
 
@@ -164,5 +165,39 @@ def test_second_utterance_waits_for_the_single_stream() -> None:
         assert (first, second) == ([b"one"], [b"two"])
         speaks = [m["text"] for m in ws.sent if m["type"] == "Speak"]
         assert speaks == ["First.", "Second."]
+
+    asyncio.run(run())
+
+
+def test_cancellation_during_connect_does_not_crash_the_reclaim() -> None:
+    # Found live: a barge-in landed while the very first Speak was still
+    # opening the socket, so there was no connection to scrub. The reclaim task
+    # died on None.send() and left a stack trace in the logs each call.
+    from server.realtime import tts_aura
+
+    async def run() -> None:
+        client = _client(None)
+
+        connecting = asyncio.Event()
+
+        async def slow_connect() -> None:
+            connecting.set()
+            await asyncio.sleep(3600)  # never completes; cancelled mid-connect
+
+        client.ensure_connected = slow_connect
+
+        async def consume() -> None:
+            async for _ in client.synthesize("Hello."):
+                pass
+
+        task = asyncio.create_task(consume())
+        await connecting.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.05)
+        assert not client._lock.locked()  # freed for the next utterance
+        # Nothing was ever streamed, so there is nothing to scrub: scheduling a
+        # reclaim here is what crashed on None.send().
+        assert client._reclaim_task is None
 
     asyncio.run(run())

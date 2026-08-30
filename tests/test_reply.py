@@ -145,6 +145,7 @@ def test_voice_pipeline_finalizes_when_client_never_acks(monkeypatch) -> None:
         controller._supervisor = GenerationSupervisor()
         controller._drained = {}
         controller._active_voice_generation = None
+        controller._audible_generation = None
         controller._metric_prefix = ""
         controller._call_id = "test-call"
         controller._state = SimpleNamespace(conversation=[])
@@ -194,6 +195,7 @@ def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatc
         controller._supervisor = GenerationSupervisor()
         controller._drained = {}
         controller._active_voice_generation = None
+        controller._audible_generation = None
         controller._metric_prefix = ""
         controller._state = SimpleNamespace(conversation=[])
         controller.guard = BargeInGuard()
@@ -256,6 +258,7 @@ def _controller(events, engine):
     controller._drained = {}
     controller._spec = None
     controller._active_voice_generation = None
+    controller._audible_generation = None
     controller._browser_turn_anchors = {}
     controller._metric_prefix = ""
     controller._call_id = "test-call"
@@ -520,5 +523,78 @@ def test_agent_sentences_reach_the_client_while_she_is_still_speaking(monkeypatc
         # ordering: every partial precedes the committed agent card
         assert sent.index(partials[-1]) < sent.index(
             next(e for e in sent if e["type"] == "agent"))
+
+    asyncio.run(run())
+
+
+def test_caller_noise_before_any_audio_does_not_kill_the_reply(monkeypatch) -> None:
+    # Found live the moment the mic started working again: the guard was armed
+    # when the GENERATION started, but first audio is ~2 s later (LLM + TTS
+    # connect). Any 250 ms of room noise in that window cancelled a reply the
+    # caller had never heard — the call just sat there silent.
+    _spec_env(monkeypatch)
+
+    class SlowSpeaker:
+        def __init__(self):
+            self.cancelled = False
+
+        async def speak(self, sentences, anchors, generation_id, is_current,
+                        release=None, on_sentence=None):
+            try:
+                await asyncio.sleep(5)  # still connecting: nothing sent yet
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
+            return {"_playback_remaining_sec": 0.0}
+
+        def text(self, _generation_id):
+            return "never got here"
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        controller = _controller({"send": send, "log": []}, FakeLlm())
+        speaker = SlowSpeaker()
+        controller._speaker = speaker
+
+        await controller.on_script("Hi, this is Sarah.", turn_id=0)
+        await asyncio.sleep(0.05)
+
+        # The caller makes a sound and keeps making it past the onset window.
+        controller.guard.on_vad_start(0.0)
+        fired = controller.guard.tick(0.0 + controller.guard.onset_sec)
+        assert not fired, "nothing audible has been sent; this is not a barge-in"
+        assert not speaker.cancelled
+
+        await controller._supervisor.cancel_current()
+
+    asyncio.run(run())
+
+
+def test_barge_in_still_fires_once_audio_is_actually_going_out(monkeypatch) -> None:
+    _spec_env(monkeypatch)
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        sent_frames = []
+
+        async def send_bytes(payload):
+            sent_frames.append(payload)
+
+        controller = _controller({"send": send, "log": []}, FakeLlm())
+        controller._send_bytes = send_bytes
+
+        token = await controller._supervisor.start(1, lambda _t: asyncio.sleep(5))
+        controller._active_voice_generation = token.generation_id
+        await controller._send_audio(token.generation_id, bytes(640))
+
+        assert controller.guard.agent_speaking, "armed by real audio going out"
+        controller.guard.on_vad_start(0.0)
+        assert controller.guard.tick(controller.guard.onset_sec) is True
+
+        await controller._supervisor.cancel_current()
 
     asyncio.run(run())

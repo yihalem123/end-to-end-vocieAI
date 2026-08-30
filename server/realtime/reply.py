@@ -143,6 +143,7 @@ class ReplyController:
         self._drained: dict[int, asyncio.Event] = {}
         self._spec: dict | None = None  # in-flight speculative generation
         self._active_voice_generation: int | None = None
+        self._audible_generation: int | None = None
         self._browser_turn_anchors: dict[int, float] = {}
         self._tts: MultiContextTts | AuraTts | None = None
         self._prewarm: asyncio.Task | None = None
@@ -174,6 +175,15 @@ class ReplyController:
         token = self._supervisor.current
         if token is None or token.generation_id != generation_id:
             raise asyncio.CancelledError
+        if self._audible_generation != generation_id:
+            # Arm barge-in HERE, not when the generation starts: the caller can
+            # only interrupt speech they can hear, and first audio trails the
+            # generation by ~2 s (LLM + TTS connect). Arming early made room
+            # noise cancel replies that were never heard — the call went silent
+            # and looked dead. Caller speech before this point is not an
+            # interruption; it commits a turn and replaces the reply normally.
+            self._audible_generation = generation_id
+            self.guard.on_agent_audio_start()
         await self._send_bytes(encode_audio_frame(generation_id, frame))
 
     async def _sentences_for(self, token: GenerationToken, transcript: str,
@@ -228,7 +238,6 @@ class ReplyController:
             self._drained[token.generation_id] = asyncio.Event()
             self._active_voice_generation = token.generation_id
             self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
-            self.guard.on_agent_audio_start()
             spec["release"].set()
             return
         await self._replace_current()
@@ -241,7 +250,6 @@ class ReplyController:
         self._drained[token.generation_id] = asyncio.Event()
         self._active_voice_generation = token.generation_id
         self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
-        self.guard.on_agent_audio_start()
 
     async def _speak_reply(self, token: GenerationToken, turn: TurnComplete) -> None:
         sentences = self._voiced_sentences(token, turn.transcript)
@@ -381,7 +389,6 @@ class ReplyController:
         )
         self._drained[token.generation_id] = asyncio.Event()
         self._active_voice_generation = token.generation_id
-        self.guard.on_agent_audio_start()
 
     # --- text mode (chat box drives the engine without audio) ---
 
