@@ -18,6 +18,9 @@ def test_explicit_end_call_intent(text: str) -> None:
 @pytest.mark.parametrize("text", [
     "Can you in the cold in the cold?",
     "Enough enough honey in the cold, please.",
+    "Please in the call.",
+    "in this call",
+    "into this call",
 ])
 def test_observed_asr_confusion_requires_confirmation(text: str) -> None:
     assert classify_end_call_intent(text) == EndCallIntent.CONFIRM

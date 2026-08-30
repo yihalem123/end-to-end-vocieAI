@@ -138,7 +138,8 @@ def test_system_prompt_exposes_all_unfilled_objectives_without_ordering() -> Non
     prompt = build_system_prompt(state)
     assert "rn_license_active" in prompt
     assert "icu_years" in prompt
-    assert "Choose the best next objective" in prompt
+    assert "coverage goals, not a questionnaire" in prompt
+    assert "Respond to the caller's latest intent first" in prompt
     assert "Next question to get answered" not in prompt
 
 
@@ -168,7 +169,8 @@ def test_limit_end_call_is_rejected_early_and_accepted_at_boundary() -> None:
 def test_fallback_line_is_non_scripted_and_never_silent() -> None:
     state = InterviewState(load_plan(PLAN_PATH))
     state.record("consent", True, quote="yes")
-    assert fallback_line(state) == "Could you tell me a little more so I can continue?"
+    assert "clarify" in fallback_line(state).lower()
+    assert "tell me a little more" not in fallback_line(state).lower()
     fill = {"bool": True, "float": 1.0, "list": ["x"], "str": "x"}
     for s in state.plan.steps:
         state.record(s.field, fill[s.type], quote="q")
@@ -327,6 +329,48 @@ def test_speculative_engine_waits_for_commit_before_tools_and_history() -> None:
         return [line async for line in engine.respond(
             "I have five years", turn_id=4, generation_id=9,
             commit_gate=gate)]
+
+    asyncio.run(run())
+
+
+def test_tool_only_response_continues_with_function_output_not_canned_fallback() -> None:
+    engine, state = _engine_with_state()
+    requests = []
+
+    async def stream(body):
+        requests.append(body)
+        if len(requests) == 1:
+            for event in _events_for_tool_call():
+                yield "data: " + json.dumps(event)
+        else:
+            yield ('data: {"type":"response.output_text.delta","delta":'
+                   '"Five years gives me useful context. What kinds of ICU patients "}')
+            yield ('data: {"type":"response.output_text.delta","delta":'
+                   '"have you worked with most recently?"}')
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        lines = [line async for line in engine.respond(
+            "I have five years", turn_id=4, generation_id=9)]
+        assert lines == [
+            "Five years gives me useful context.",
+            "What kinds of ICU patients have you worked with most recently?",
+        ]
+        assert state.fields["icu_years"].value == 5.0
+        assert len(requests) == 2
+        continuation_items = requests[1]["input"]
+        assert any(item.get("type") == "function_call"
+                   for item in continuation_items)
+        outputs = [item for item in continuation_items
+                   if item.get("type") == "function_call_output"]
+        assert len(outputs) == 1
+        assert json.loads(outputs[0]["output"])["applied"] is True
+        assert requests[1]["tools"] == TOOLS
+        assert requests[1]["tool_choice"] == "none"
+        assert "tell me a little more" not in " ".join(lines).lower()
+        await engine.close()
 
     asyncio.run(run())
 

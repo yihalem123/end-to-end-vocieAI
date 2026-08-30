@@ -1,9 +1,7 @@
-"""overlap_stream: on-demand filler — spoken only when the engine is slow."""
+"""Reply orchestration, playback drain, speculation, and delivery tests."""
 import asyncio
 import time
 from types import SimpleNamespace
-
-import pytest
 
 import server.realtime.reply as reply_module
 from server.engine.stub import StubEngine
@@ -12,84 +10,10 @@ from server.realtime.endpoint import TurnComplete
 from server.realtime.reply import (
     DRAIN_ACK_MARGIN_SEC,
     DRAIN_ACK_MAX_SEC,
-    FILLERS,
     drain_wait_seconds,
-    overlap_stream,
     wait_for_playback_drain,
-    wants_filler,
 )
 from server.realtime.supervisor import GenerationSupervisor
-
-PATIENCE = 0.05  # fast test clock
-
-
-class FakeInterview:
-    def __init__(self, fields: dict) -> None:
-        self.fields = fields
-
-
-def test_wants_filler_gating() -> None:
-    assert wants_filler(None) is False                     # stub engine: instant
-    assert wants_filler(FakeInterview({})) is False        # first exchange: no
-    assert wants_filler(FakeInterview({"consent": 1})) is True
-
-
-def test_fast_engine_skips_the_filler() -> None:
-    async def quick():
-        yield "Here already."
-
-    async def run() -> list[str]:
-        return [s async for s in overlap_stream("Okay.", quick(),
-                                                patience_sec=PATIENCE)]
-
-    assert asyncio.run(run()) == ["Here already."]          # no filler needed
-
-
-def test_slow_engine_gets_covered_by_the_filler() -> None:
-    async def slow():
-        await asyncio.sleep(PATIENCE * 4)
-        yield "Sorry, had to think."
-
-    async def run() -> list[str]:
-        return [s async for s in overlap_stream("Okay.", slow(),
-                                                patience_sec=PATIENCE)]
-
-    assert asyncio.run(run()) == ["Okay.", "Sorry, had to think."]
-
-
-def test_engine_runs_concurrently_during_patience_window() -> None:
-    started = asyncio.Event()
-
-    async def inner():
-        started.set()  # the request must begin during the wait, not after
-        await asyncio.sleep(PATIENCE * 4)
-        yield "reply"
-
-    async def run() -> None:
-        gen = overlap_stream("Okay.", inner(), patience_sec=PATIENCE)
-        assert await anext(gen) == "Okay."
-        assert started.is_set(), "engine must start before the filler decision"
-        assert await anext(gen) == "reply"
-
-    asyncio.run(run())
-
-
-def test_overlap_stream_propagates_engine_errors() -> None:
-    async def broken():
-        raise RuntimeError("engine down")
-        yield  # pragma: no cover
-
-    async def run() -> None:
-        gen = overlap_stream("Okay.", broken(), patience_sec=PATIENCE)
-        with pytest.raises(RuntimeError, match="engine down"):
-            await anext(gen)
-
-    asyncio.run(run())
-
-
-def test_fillers_are_short_spoken_lines() -> None:
-    assert all(f.endswith(".") and len(f) <= 12 for f in FILLERS)
-
 
 def test_speculation_identity_preserves_meaningful_punctuation() -> None:
     assert reply_module._spoken_eq("Five years", "five years.")
@@ -151,7 +75,6 @@ def test_voice_pipeline_finalizes_when_client_never_acks(monkeypatch) -> None:
         controller._state = SimpleNamespace(conversation=[])
         controller.guard = BargeInGuard()
         controller.interview = None
-        controller._filler_idx = 0
         controller._engine = StubEngine()
         now = time.monotonic()
         turn = TurnComplete("Hello.", 0.1, now, now, "test")
@@ -200,7 +123,6 @@ def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatc
         controller._state = SimpleNamespace(conversation=[])
         controller.guard = BargeInGuard()
         controller.interview = None
-        controller._filler_idx = 0
         controller._engine = StubEngine()
         now = time.monotonic()
         turn = TurnComplete("Hello.", 0.1, now, now, "test")
@@ -265,9 +187,24 @@ def _controller(events, engine):
     controller._state = SimpleNamespace(conversation=[])
     controller.guard = BargeInGuard()
     controller.interview = None
-    controller._filler_idx = 0
     controller._engine = engine
     return controller
+
+
+def test_voice_path_never_injects_server_authored_acknowledgements() -> None:
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        controller = _controller({"send": send, "log": []}, FakeLlm())
+        token = await controller._supervisor.start(
+            1, lambda _owned: asyncio.sleep(10))
+        lines = [line async for line in controller._voiced_sentences(
+            token, "Delaware.")]
+        await controller._supervisor.cancel_current()
+        assert lines == ["Reply to: Delaware."]
+
+    asyncio.run(run())
 
 
 def _spec_env(monkeypatch):

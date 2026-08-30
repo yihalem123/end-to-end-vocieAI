@@ -99,7 +99,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws/call")
     async def ws_call(ws: WebSocket) -> None:
-        mode = ws.query_params.get("mode", "flux")
+        mode = ws.query_params.get("mode", "custom")
         call_id = uuid.uuid4().hex
         session = CallSession(
             ws, app.state.settings, call_id=call_id, mode=mode,

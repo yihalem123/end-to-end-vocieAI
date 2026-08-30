@@ -111,6 +111,21 @@ def test_fuzzy_end_request_asks_for_confirmation_not_an_interview_answer() -> No
     asyncio.run(run())
 
 
+def test_repeated_fuzzy_end_request_confirms_without_waiting_for_exact_yes() -> None:
+    async def run() -> None:
+        session, replies, _ = make_session()
+        session.state.session.transition(SessionStatus.INTERVIEWING)
+        await session._commit_caller_text("Please in the call.", 2, turn=None)
+        assert session._pending_end_confirmation is True
+
+        await session._commit_caller_text("in this call", 3, turn=None)
+        assert session.state.session.status == SessionStatus.CLOSING
+        assert replies.interview.end_call_request.reason == "candidate_requested"
+        assert replies.chats == []
+
+    asyncio.run(run())
+
+
 def test_event_loop_agent_initiates_with_disclosure() -> None:
     async def run() -> None:
         session, replies, _ = make_session()

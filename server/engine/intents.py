@@ -28,11 +28,13 @@ def classify_end_call_intent(text: str) -> EndCallIntent | None:
     if normalized == "stop" or any(re.search(pattern, normalized) for pattern in direct):
         return EndCallIntent.END
 
-    # Only the exact, repeatedly observed phonetic neighborhood plus request
-    # language qualifies. The caller must confirm before any state transition.
-    fuzzy_phrase = re.search(r"\b(?:in|end) the cold\b", normalized)
+    # Narrow phonetic neighborhoods observed in live calls. These only request
+    # confirmation; they never terminate by themselves.
+    fuzzy_phrase = re.search(
+        r"\b(?:in|into|end) (?:this |the )?(?:call|cold)\b", normalized)
     request_cue = ({"please", "can", "could", "want", "end", "stop"}
                    & set(normalized.split()))
-    if fuzzy_phrase and request_cue:
+    if fuzzy_phrase and (request_cue or normalized in {
+            "in this call", "in the call", "into this call"}):
         return EndCallIntent.CONFIRM
     return None

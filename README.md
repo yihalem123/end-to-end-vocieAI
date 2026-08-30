@@ -46,13 +46,15 @@ Two turn-taking stacks are selectable per call from the console ("Flux
 end-of-turn" toggle): the custom VAD-anchored endpointer (three patience tiers)
 or Deepgram Flux's model-integrated end-of-turn. Both can prepare commit-gated
 drafts; Flux uses EagerEndOfTurn and cancels them on TurnResumed. Metrics are
-tagged per mode so the A/B is visible side by side. Flux is the default; custom
-mode remains an explicit fallback/comparison.
+tagged per mode so the A/B is visible side by side. The measured low-latency
+custom endpointer is the default; Flux remains an explicit A/B option.
 
 The YAML plan contains evidence objectives, time/turn limits, and prohibited
-topics—not interview question text. The LLM chooses the next objective, wording,
-order, and contextual follow-up while validated `record_answer` and `end_call`
-tools keep evidence and lifecycle state backend-owned. Explicit stop requests
+topics—not interview question text. The LLM responds to the caller's intent and
+uses those objectives as coverage goals rather than a questionnaire; it owns
+wording, order, clarifications, and contextual follow-ups. Validated
+`record_answer` and `end_call` tools keep evidence and lifecycle state
+backend-owned. Explicit stop requests
 bypass ordinary dialogue generation; a narrow ASR-confusion path asks for
 confirmation rather than continuing the interview or hanging up speculatively.
 

@@ -8,11 +8,11 @@ raw-protocol ethos, and the typed events are the whole lesson:
   response.function_call_arguments.delta/.done -> its JSON args accumulate/finish
 StreamAssembler turns that event soup into text deltas + completed ToolCalls.
 
-Tools are ONE-WAY state mutations (record_answer, end_call): we never send
-tool outputs back, so one request per turn — no second round trip, which is the
-latency trick that makes tool use viable in a voice loop. These live captures
-are provisional interview memory only; post-call caller-utterance verification
-is the sole authority for scores and knockouts.
+Tool calls are validated by the backend and their outputs are returned to the
+model when it emitted no speech. That continuation is essential: a tool-only
+Responses turn is an intermediate function-calling step, not a complete spoken
+reply. These live captures are provisional interview memory only; post-call
+caller-utterance verification is the sole authority for scores and knockouts.
 
 LlmEngine.respond() is an async generator of SENTENCES: text deltas stream into
 the chunker (abbreviation + decimal guards) and each complete sentence is
@@ -194,11 +194,11 @@ class StreamAssembler:
 
 
 def fallback_line(state: InterviewState) -> str:
-    """Safe speech when a tool-only model response would otherwise be silent."""
+    """Last-resort speech if both model passes produce no caller-facing text."""
     if state.end_call_request is not None:
         return state.end_call_request.closing_message
     if state.remaining:
-        return "Could you tell me a little more so I can continue?"
+        return "I'm sorry, I lost my place for a moment. What would you like me to clarify?"
     return "Thanks, that covers everything I needed for this screening."
 
 
@@ -225,10 +225,19 @@ Boundaries:
 - Prohibited topics: {prohibited}
 
 Rules:
-- Select the most useful natural question from the still-missing objectives.
+- Respond to the caller's latest meaning first. Evidence objectives are coverage
+  goals, not a script, required order, or whitelist of allowed conversation.
+- Handle questions, corrections, uncertainty, requests for clarification, and
+  brief role-relevant conversation before naturally returning to screening.
+- If the caller asks what you need from them, explain the relevant screening
+  goal plainly instead of using a generic prompt or immediately re-asking it.
+- When it is natural to continue collecting evidence, choose the most useful
+  question yourself. It may clarify context rather than directly fill a field.
 - Do not repeat established information. If part of a compound topic was
   answered, ask only for what remains missing.
 - Ask ONE concise question at a time. Keep speech to one or two short sentences.
+- Avoid empty acknowledgements such as "Okay", "Got it", or "Alright". Only
+  acknowledge something when the acknowledgement adds useful meaning.
 - ALWAYS include a spoken reply for the caller. Never respond with only tool
   calls — a silent turn is a broken phone call.
 - Every time the caller answers, call record_answer with the field name, the
@@ -263,8 +272,10 @@ def build_state_block(state: InterviewState) -> str:
             "closing statement and call end_call with reason limit_reached.")
     elif state.remaining:
         objective = (
-            "Choose the best next objective based on conversational context. "
-            "Generate your own concise question; do not combine unrelated gaps.")
+            "Treat the missing evidence as coverage goals, not a questionnaire. "
+            "Respond to the caller's latest intent first. When natural, continue "
+            "with one useful question that you formulate yourself; it may answer "
+            "or clarify the conversation before pursuing missing evidence.")
     else:
         objective = (
             "All evidence objectives are covered. Give a brief closing statement "
@@ -331,14 +342,15 @@ class LlmEngine:
         if not current():
             return
         state = self.state
+        request_input = ([{"role": "system", "content": build_state_block(state)}]
+                         + state.recent_history(8)
+                         + [{"role": "user", "content": user_text}])
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             # Static prefix in instructions (cache-friendly); per-turn state
             # rides as a system input message ahead of the history window.
             "instructions": build_instructions(state.plan),
-            "input": ([{"role": "system", "content": build_state_block(state)}]
-                      + state.recent_history(8)
-                      + [{"role": "user", "content": user_text}]),
+            "input": request_input,
             "tools": TOOLS,
             "stream": True,
             "store": False,
@@ -386,14 +398,82 @@ class LlmEngine:
             await commit_gate.wait()
         if not current():
             return
-        # Tools first so the fallback sees the state they just updated.
+        # Apply validated side effects only after speculative ownership commits.
         self.last_tool_results = self._apply_tools(
             assembler.tool_calls, current, turn_id=turn_id,
             generation_id=generation_id, source_text=user_text)
         if not current():
             return
+        if not "".join(reply_parts).strip() and assembler.tool_calls:
+            if state.end_call_request is not None:
+                # end_call already carries its short, model-authored closing.
+                line = state.end_call_request.closing_message
+                reply_parts.append(line)
+                yield line
+            else:
+                # Responses function calling is request -> call -> output ->
+                # response. A tool-only first pass expects this continuation;
+                # canned speech here made the agent appear scripted.
+                by_call_id = {
+                    item.get("tool_call_id"): item
+                    for item in self.last_tool_results
+                }
+                tool_exchange: list[dict[str, Any]] = []
+                for call in assembler.tool_calls:
+                    args = call.arguments if call.arguments is not None else {}
+                    tool_exchange.append({
+                        "type": "function_call", "call_id": call.call_id,
+                        "name": call.name,
+                        "arguments": json.dumps(args, separators=(",", ":")),
+                    })
+                for call in assembler.tool_calls:
+                    result = by_call_id.get(call.call_id, {})
+                    tool_exchange.append({
+                        "type": "function_call_output", "call_id": call.call_id,
+                        "output": json.dumps({
+                            "applied": bool(result.get("applied")),
+                            "reason": result.get("reason") or "recorded",
+                        }, separators=(",", ":")),
+                    })
+                continuation = dict(body)
+                # Keep the same tool definitions in context as prescribed by
+                # the Responses flow, but force this bounded continuation to
+                # produce caller-facing speech rather than start another loop.
+                continuation["tool_choice"] = "none"
+                continuation["input"] = request_input + tool_exchange + [{
+                    "role": "system",
+                    "content": (
+                        build_state_block(state)
+                        + "\nNow give the caller a natural spoken response to their "
+                          "latest message. Do not mention tools or internal fields."
+                    ),
+                }]
+                next_chunker = SentenceChunker()
+                next_assembler = StreamAssembler()
+                async for line in self._stream_lines(continuation):
+                    if not line.startswith("data:"):
+                        continue
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    deltas = next_assembler.feed(json.loads(payload))
+                    if deltas and self.last_ttft_ms is None:
+                        self.last_ttft_ms = (time.monotonic() - t0) * 1000
+                    for delta in deltas:
+                        if not current():
+                            return
+                        reply_parts.append(delta)
+                        for sentence in next_chunker.push(delta):
+                            yield sentence
+                if not current():
+                    return
+                next_tail = next_chunker.flush()
+                if next_tail:
+                    yield next_tail
+                if next_assembler.usage:
+                    assembler.usage = next_assembler.usage
         if not "".join(reply_parts).strip():
-            line = fallback_line(state)  # tools-only turn: never go silent
+            line = fallback_line(state)
             reply_parts.append(line)
             yield line
         if not current():

@@ -22,7 +22,6 @@ turn_latency from the Speaker.
 """
 import asyncio
 import logging
-from contextlib import suppress
 
 from server.config import Settings
 from server.engine.plan import InterviewPlan, InterviewState, load_plan_cached
@@ -53,20 +52,8 @@ def _spoken_eq(a: str, b: str) -> bool:
 
     return norm(a) == norm(b)
 
-# Perceived-latency filler, ON DEMAND: at turn commit we give the engine a
-# patience window; if its first sentence arrives in time the caller hears only
-# the real reply, and only a slow turn gets covered by an acknowledgment.
-# Rotated for variety; skipped on the first exchange (an "Okay." before the
-# greeting reads wrong).
-FILLERS = ("Okay.", "Got it.", "Alright.", "Thanks.")
-FILLER_PATIENCE_SEC = 0.45
-SENTENCE_QUEUE_SIZE = 8  # bounded LLM -> TTS handoff; producer backpressures
 DRAIN_ACK_MARGIN_SEC = 1.0
 DRAIN_ACK_MAX_SEC = 5.0
-
-
-def wants_filler(interview) -> bool:
-    return interview is not None and bool(interview.fields)
 
 
 def drain_wait_seconds(playback_remaining_sec: float) -> float:
@@ -91,42 +78,6 @@ async def wait_for_playback_drain(
             generation_id,
         )
         return False
-
-
-async def overlap_stream(filler: str, rest, patience_sec: float = FILLER_PATIENCE_SEC):
-    """Run `rest` (the engine stream) in a pump task immediately; if its first
-    item beats `patience_sec`, yield only real sentences — otherwise yield the
-    filler to cover the gap, then the real reply as it lands. Errors from the
-    pump re-raise in the consumer; cancelling the consumer (barge-in) cancels
-    the pump and with it the engine request."""
-    queue: asyncio.Queue = asyncio.Queue(maxsize=SENTENCE_QUEUE_SIZE)
-
-    async def pump() -> None:
-        try:
-            async for item in rest:
-                await queue.put(item)
-            await queue.put(None)
-        except Exception as exc:  # noqa: BLE001 — carried to the consumer
-            await queue.put(exc)
-
-    task = asyncio.create_task(pump())
-    try:
-        try:
-            item = await asyncio.wait_for(queue.get(), timeout=patience_sec)
-        except TimeoutError:
-            yield filler  # engine is slow this turn: cover the silence
-            item = await queue.get()
-        while True:
-            if item is None:
-                return
-            if isinstance(item, Exception):
-                raise item
-            yield item
-            item = await queue.get()
-    finally:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
 
 
 class ReplyController:
@@ -158,7 +109,6 @@ class ReplyController:
         if self._tts is not None:
             self._speaker = Speaker(self._send_audio, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
-        self._filler_idx = 0
         plan = plan if plan is not None else load_plan_cached(str(settings.plan_path))
         self.interview = InterviewState(plan)
         self._engine: LlmEngine | StubEngine
@@ -260,12 +210,9 @@ class ReplyController:
 
     def _voiced_sentences(self, token: GenerationToken, transcript: str,
                           commit_gate: asyncio.Event | None = None):
-        sentences = self._sentences_for(token, transcript, commit_gate=commit_gate)
-        if wants_filler(self.interview):
-            filler = FILLERS[self._filler_idx % len(FILLERS)]
-            self._filler_idx += 1
-            sentences = overlap_stream(filler, sentences)
-        return sentences
+        # The model owns every spoken word. Server-injected acknowledgements
+        # sounded repetitive and could contradict the response that followed.
+        return self._sentences_for(token, transcript, commit_gate=commit_gate)
 
     async def _deliver_voice(self, token: GenerationToken, sentences,
                              anchors: dict, record_metrics: bool,

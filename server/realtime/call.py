@@ -488,7 +488,10 @@ class CallSession:
                 self._replies.interview.update_elapsed(time.monotonic() - started)
             if getattr(self, "_pending_end_confirmation", False):
                 confirmation = classify_consent(text)
-                if confirmation is True:
+                repeated_end_intent = classify_end_call_intent(text)
+                if (confirmation is True
+                        or repeated_end_intent in {
+                            EndCallIntent.END, EndCallIntent.CONFIRM}):
                     self._pending_end_confirmation = False
                     await self._finish_interview(
                         "candidate_requested",
