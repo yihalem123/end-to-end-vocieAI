@@ -188,7 +188,12 @@ async def main() -> int:
 
         reader_task = asyncio.create_task(reader())
         # The agent must initiate with disclosure before the caller consents.
-        await asyncio.wait_for(agent_events.get(), timeout=45)
+        try:
+            await asyncio.wait_for(agent_events.get(), timeout=45)
+        except TimeoutError:
+            print("FAIL: no agent disclosure — check server logs "
+                  "(a silent TTS failure lands here)")
+            return 1
         for i, answer in enumerate(RAMBLER):
             await stream_answer(ws, answer, cache)
             try:
@@ -224,6 +229,13 @@ async def main() -> int:
         failures.append(f"certifications wrong: {fields.get('certifications')}")
     if report.get("knocked_out"):
         failures.append(f"false knockout: {report['knocked_out']}")
+    # A silent server can otherwise pass this gate: agent text still streams
+    # over JSON while TTS delivers nothing (seen live with an exhausted
+    # ElevenLabs quota — every reply finalized with zero audio).
+    heard = sum(playback.played_samples.values())
+    if heard == 0:
+        failures.append("no agent audio received — TTS is silent "
+                        "(quota exhausted or provider failure)")
 
     print(f"\nreport {report['call_id']}: score={report.get('score')} "
           f"needs_review={report.get('needs_review')}")
