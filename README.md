@@ -53,7 +53,8 @@ first_audio, turn_latency (p50/p95), prompt-cache tokens, barge-ins, turns.
 Measured results and their history: see `REHEARSAL.md`.
 
 ## Verification
-`python -m pytest -q` — 205 offline tests (no vendor calls).
+`python -m pytest -q` — 207 offline tests (no vendor calls).
 `python scripts/simulate_caller.py [--flux]` — live end-to-end gate: a synthesized
-rambling caller with mid-thought pauses asserts turn integrity and extraction
-against the running server. `--protocol-self-test` runs its offline wire check.
+rambling caller with mid-thought pauses asserts turn integrity, extraction, and
+that agent audio actually arrived (a silent TTS failure is a FAIL, not a pass).
+`--protocol-self-test` runs its offline wire check.
