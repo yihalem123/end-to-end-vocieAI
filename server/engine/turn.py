@@ -308,8 +308,10 @@ class LlmEngine:
         }
         if self._settings.turn_model.startswith("gpt-5"):
             body["reasoning"] = {"effort": "none"}  # TTFT is dominated by effort
-        if self._settings.turn_model.startswith("gpt-5.6"):
-            body["text"] = {"verbosity": "low"}
+        # NOTE: verbosity "low" was trialed here per the model guide and
+        # reverted after a live A/B: it suppressed record_answer diligence
+        # (shift_availability never recorded across four asks; loop). Short
+        # replies are already enforced by the prompt's one-question rule.
         chunker = SentenceChunker()
         assembler = StreamAssembler()
         reply_parts: list[str] = []
@@ -413,8 +415,9 @@ class LlmEngine:
                     entry["reason"] = "empty quote: evidence required before mutation"
                     log.warning("record_answer without evidence rejected")
                     continue
-                if not _quote_supported(quote, source_text):
-                    entry["reason"] = "quote not supported by committed utterance"
+                if not any(_quote_supported(quote, s) for s in
+                           self._caller_sources(source_text)):
+                    entry["reason"] = "quote not supported by any caller utterance"
                     log.warning("record_answer with unsupported evidence rejected")
                     continue
                 entry["applied"] = self.state.record(
@@ -430,6 +433,18 @@ class LlmEngine:
             else:
                 entry["reason"] = "unknown tool"
         return results
+
+
+    def _caller_sources(self, source_text: str) -> list[str]:
+        """Evidence may come from ANY committed caller utterance, not just the
+        current one — the model legitimately records volunteered or delayed
+        answers a turn late (live finding: single-utterance scoping caused
+        systematic rejects and re-ask loops). History holds only committed,
+        ownership-gated user turns, so this stays anchored to real speech."""
+        sources = [h["content"] for h in self.state.history
+                   if h.get("role") == "user"]
+        sources.append(source_text)
+        return [s for s in sources if s]
 
 
 def _quote_supported(quote: str, source_text: str) -> bool:

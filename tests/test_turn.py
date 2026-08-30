@@ -223,7 +223,7 @@ def test_ledger_rejects_quote_not_in_committed_utterance() -> None:
             {"field": "consent", "value": True, "quote": "absolutely yes"})
     ], turn_id=1, generation_id=2, source_text="No, I do not consent.")
     assert not results[0]["applied"]
-    assert "committed utterance" in results[0]["reason"]
+    assert "caller utterance" in results[0]["reason"]
     assert state.fields == {}
     assert results[0]["call_id"] == "unassigned"
     assert results[0]["idempotency_key"].endswith(":1:invented")
@@ -283,7 +283,25 @@ def test_response_request_has_cache_key_low_verbosity_and_real_text_ttft() -> No
         assert engine.last_ttft_ms is not None
         assert engine.last_cached_tokens == 42
         assert captured["prompt_cache_key"].startswith("screener-")
-        assert captured["text"] == {"verbosity": "low"}
+        # verbosity "low" was reverted after a live A/B: it suppressed
+        # record_answer diligence (fields went unrecorded; re-ask loop).
+        assert "verbosity" not in captured.get("text", {})
         await engine.close()
 
     asyncio.run(run())
+
+
+def test_evidence_from_an_earlier_committed_turn_is_accepted() -> None:
+    # Live regression: the model records volunteered/delayed answers one turn
+    # late, quoting an EARLIER caller utterance verbatim. Single-utterance
+    # evidence scoping rejected those and caused re-ask loops.
+    engine, state = _engine_with_state()
+    state.add_history("user", "Honestly what I prefer is Nights are fine for me.")
+    state.add_history("assistant", "Understood.")
+    engine._apply_tools(
+        [_tc("late1", "record_answer",
+             {"field": "shift_availability", "value": "true",
+              "quote": "Nights are fine for me."})],
+        source_text="Somewhere around fifty five dollars an hour.")
+    entry = state.tool_ledger[-1]
+    assert entry["applied"] is True, entry["reason"]
