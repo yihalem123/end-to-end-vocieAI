@@ -2,7 +2,8 @@
 
 A local browser Voice AI prototype built with **no voice platform and no agent framework**:
 browser mic → WebSocket → FastAPI → VAD → streaming ASR (Deepgram)
-→ interview-plan engine (OpenAI, streaming + tools) → streaming TTS (ElevenLabs) → back to the caller.
+→ interview-plan engine (OpenAI, streaming + tools) → streaming TTS (Deepgram
+Aura or ElevenLabs, selectable via `TTS_PROVIDER`) → back to the caller.
 Includes barge-in, per-turn latency metrics, post-call evidence extraction, and deterministic scoring.
 
 Built to demonstrate ownership of the full real-time loop. Development is co-piloted with Claude Code:
