@@ -130,3 +130,73 @@ def test_tts_first_byte_is_measured_before_commit_gated_audio() -> None:
         assert timings["tts_ttfb_ms"] < timings["first_audio_ms"]
 
     asyncio.run(run())
+
+
+def test_each_sentence_is_announced_as_its_audio_starts() -> None:
+    # The transcript should grow while the agent talks, not land in one block
+    # when she stops. Announce a sentence only once its FIRST frame is on the
+    # wire, so what the console shows is what the caller has actually heard.
+    class SlowTts:
+        async def synthesize(self, _sentence):
+            yield bytes(640 * 5)  # five frames per sentence
+
+    async def three():
+        yield "One."
+        yield "Two."
+        yield "Three."
+
+    async def run() -> None:
+        announced: list[tuple[str, int]] = []
+        frames = 0
+
+        async def send(_generation, _frame):
+            nonlocal frames
+            frames += 1
+
+        async def on_sentence(text: str) -> None:
+            announced.append((text, frames))
+
+        speaker = Speaker(send, SlowTts())
+        now = time.monotonic()
+        await speaker.speak(three(), {"commit_t": now, "vad_stop_t": now},
+                            3, lambda: True, on_sentence=on_sentence)
+
+        assert [text for text, _ in announced] == ["One.", "Two.", "Three."]
+        # Each announcement lands on the first frame of its own sentence.
+        assert [at for _, at in announced] == [1, 6, 11]
+
+    asyncio.run(run())
+
+
+def test_unspoken_sentences_are_never_announced() -> None:
+    # Barge-in mid-reply: sentences synthesized ahead but never sent must not
+    # appear in the transcript — same truthfulness rule as truncate().
+    class FastTts:
+        async def synthesize(self, _sentence):
+            yield bytes(640 * 2)
+
+    async def two():
+        yield "Heard."
+        yield "Never spoken."
+
+    async def run() -> None:
+        announced: list[str] = []
+        current = True
+        sent = 0
+
+        async def send(_generation, _frame):
+            nonlocal current, sent
+            sent += 1
+            if sent == 2:  # sentence one is out; barge in before sentence two
+                current = False
+
+        async def on_sentence(text: str) -> None:
+            announced.append(text)
+
+        speaker = Speaker(send, FastTts())
+        with pytest.raises(asyncio.CancelledError):
+            await speaker.speak(two(), {"commit_t": 0.0, "vad_stop_t": 0.0},
+                                4, lambda: current, on_sentence=on_sentence)
+        assert announced == ["Heard."]
+
+    asyncio.run(run())

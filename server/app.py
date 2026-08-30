@@ -165,7 +165,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except WebSocketDisconnect:
             pass
 
-    app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="static")
+    class NoStoreStatic(StaticFiles):
+        """The console's JS *is* the app. A cached audio.js or worklet runs
+        yesterday's code against today's server and reads as "the fix didn't
+        work" — it cost one live debugging session already. This is a local
+        dev console, so correctness beats the handful of saved requests."""
+
+        def file_response(self, *args, **kwargs):
+            response = super().file_response(*args, **kwargs)
+            response.headers["cache-control"] = "no-store, must-revalidate"
+            return response
+
+    app.mount("/", NoStoreStatic(directory=STATIC_DIR, html=True), name="static")
     return app
 
 

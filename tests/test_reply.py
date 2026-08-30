@@ -124,7 +124,7 @@ def test_voice_pipeline_finalizes_when_client_never_acks(monkeypatch) -> None:
     monkeypatch.setattr(reply_module, "DRAIN_ACK_MAX_SEC", 0.02)
 
     class FakeSpeaker:
-        async def speak(self, *_args):
+        async def speak(self, *_args, **_kwargs):
             return {"_playback_remaining_sec": 0.0}
 
         def text(self, _generation_id: int) -> str:
@@ -173,7 +173,7 @@ def test_voice_engine_failure_produces_exactly_one_error_and_no_reply(monkeypatc
     """P3.4: a failed generation must fail closed — never a second, conflicting
     reply after audio already went out, and never a silent double-append."""
     class ExplodingSpeaker:
-        async def speak(self, *_args):
+        async def speak(self, *_args, **_kwargs):
             raise RuntimeError("provider died mid-reply")
 
         def text(self, _generation_id: int) -> str:  # pragma: no cover
@@ -234,7 +234,8 @@ class GatedSpeaker:
     def __init__(self, events):
         self.events = events
 
-    async def speak(self, sentences, anchors, generation_id, is_current, release=None):
+    async def speak(self, sentences, anchors, generation_id, is_current,
+                    release=None, on_sentence=None):
         async for _ in sentences:
             pass
         self.events.append("engine-done")
@@ -471,5 +472,53 @@ def test_controller_selects_tts_provider_from_settings(monkeypatch) -> None:
             send, send, settings, SimpleNamespace(conversation=[]))
         assert isinstance(controller._tts, reply_module.MultiContextTts)
         controller._prewarm.cancel()
+
+    asyncio.run(run())
+
+
+def test_agent_sentences_reach_the_client_while_she_is_still_speaking(monkeypatch) -> None:
+    # Live report: the agent's transcript card only appeared once she finished
+    # the whole reply. Each sentence must land as its audio starts, with the
+    # final "agent" event closing the turn.
+    _spec_env(monkeypatch)
+
+    class AnnouncingSpeaker:
+        async def speak(self, sentences, anchors, generation_id, is_current,
+                        release=None, on_sentence=None):
+            async for sentence in sentences:
+                await on_sentence(sentence)
+            return {"_playback_remaining_sec": 0.0}
+
+        def text(self, _generation_id):
+            return "One. Two."
+
+    async def run() -> None:
+        sent, log = [], []
+        done = asyncio.Event()
+
+        async def send(ev):
+            sent.append(ev)
+            if ev["type"] == "agent":
+                done.set()
+
+        class TwoSentenceLlm(FakeLlm):
+            async def respond(self, transcript, **_kw):
+                yield "One."
+                yield "Two."
+
+        controller = _controller({"send": send, "log": log}, TwoSentenceLlm())
+        controller._speaker = AnnouncingSpeaker()
+        now = time.monotonic()
+        turn = TurnComplete("Hi.", 0.05, now, now, "fast")
+        await controller.on_turn(turn, 1)
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+
+        partials = [e for e in sent if e["type"] == "agent_partial"]
+        assert [e["text"] for e in partials] == ["One.", "One. Two."]
+        assert all(e["generation_id"] == partials[0]["generation_id"]
+                   for e in partials)
+        # ordering: every partial precedes the committed agent card
+        assert sent.index(partials[-1]) < sent.index(
+            next(e for e in sent if e["type"] == "agent"))
 
     asyncio.run(run())

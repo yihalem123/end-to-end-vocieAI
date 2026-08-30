@@ -77,3 +77,15 @@ def test_lifespan_warms_plan_and_vad_and_fails_fast_on_bad_plan(tmp_path) -> Non
     with pytest.raises(Exception):
         with TestClient(create_app(bad)):
             pass  # startup itself must fail, not call #1
+
+
+def test_console_assets_are_never_cached() -> None:
+    # The console's JS IS the app: a cached audio.js or capture-processor.js
+    # silently runs yesterday's code against today's server. That cost a live
+    # debugging session (a fixed mic worklet appeared still broken), and it is
+    # exactly how a demo take goes wrong.
+    with TestClient(create_app(Settings(_env_file=None))) as client:
+        for path in ("/", "/audio.js", "/capture-processor.js"):
+            resp = client.get(path)
+            assert resp.status_code == 200, path
+            assert "no-store" in resp.headers.get("cache-control", ""), path

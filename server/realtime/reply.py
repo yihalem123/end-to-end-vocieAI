@@ -265,9 +265,23 @@ class ReplyController:
         assert self._speaker is not None
         def is_current() -> bool:
             return self._supervisor.is_current(token)
+
+        spoken: list[str] = []
+
+        async def announce(sentence: str) -> None:
+            """Grow the console transcript as the caller hears each sentence."""
+            spoken.append(sentence)
+            if is_current():
+                await self._send({
+                    "type": "agent_partial", "text": " ".join(spoken),
+                    "turn_id": token.turn_id,
+                    "generation_id": token.generation_id,
+                })
+
         try:
             timings = await self._speaker.speak(
-                sentences, anchors, token.generation_id, is_current, release)
+                sentences, anchors, token.generation_id, is_current, release,
+                on_sentence=announce)
             if not is_current():
                 return
             await self._send({"type": "audio_end", "turn_id": token.turn_id,

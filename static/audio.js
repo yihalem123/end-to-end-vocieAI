@@ -93,7 +93,14 @@ function handleEvent(ev) {
       els.partialCard.hidden = true;
       addLine("you", ev.transcript, `${ev.endpoint_delay_ms} ms · ${ev.reason}`);
       break;
+    case "agent_partial":
+      els.agentPartialText.textContent = ev.text;
+      els.agentPartialCard.hidden = !ev.text;
+      scrollConvo();
+      break;
     case "agent":
+      els.agentPartialText.textContent = "";
+      els.agentPartialCard.hidden = true;
       addLine("agent", ev.text + (ev.interrupted ? " ⏹" : ""),
               ev.interrupted ? "interrupted" : "");
       if (!agentInitiated) {
@@ -382,6 +389,18 @@ window.addEventListener("DOMContentLoaded", () => {
   els.convo.appendChild(ghost);
   els.partialCard = ghost;
   els.partialText = ghost.querySelector("#partialText");
+
+  // Same trick for the agent: her card grows sentence by sentence as the
+  // audio for each one starts, then the committed "agent" event replaces it.
+  const agentGhost = document.createElement("div");
+  agentGhost.className = "card agent ghost";
+  agentGhost.id = "agentPartialCard";
+  agentGhost.hidden = true;
+  agentGhost.innerHTML =
+    `<div class="who">Sarah</div><div class="text" id="agentPartialText"></div>`;
+  els.convo.appendChild(agentGhost);
+  els.agentPartialCard = agentGhost;
+  els.agentPartialText = agentGhost.querySelector("#agentPartialText");
 
   buildLatencyCards();
   els.btn.addEventListener("click", () =>

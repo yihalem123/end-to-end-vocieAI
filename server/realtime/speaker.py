@@ -54,12 +54,16 @@ class Speaker:
 
     async def speak(self, sentences: AsyncIterable[str], anchors: dict,
                     generation_id: int, is_current: Callable[[], bool],
-                    release: asyncio.Event | None = None) -> dict:
+                    release: asyncio.Event | None = None,
+                    on_sentence: Callable[[str], object] | None = None) -> dict:
         """`anchors` carries commit_t/vad_stop_t and is read at measurement
         time — for a SPECULATIVE generation they are filled at promotion.
         `release` (when given) gates the FIRST audio send: LLM and TTS run
         warm behind it, but nothing reaches the caller until the endpointer
-        actually commits and the controller sets the event."""
+        actually commits and the controller sets the event.
+        `on_sentence` is awaited as each sentence's FIRST frame goes out, so a
+        live transcript shows only what the caller has actually started to
+        hear — the same truthfulness rule truncate() applies afterwards."""
         # Streaming input: sentences arrive as the LLM writes them, so sentence
         # one is playing while sentence three is still being generated.
         record = PlaybackRecord()
@@ -68,6 +72,7 @@ class Speaker:
         timings: dict[str, float] = {}
         pace_start: float | None = None
         frames_sent = 0
+        announced = -1  # index of the last sentence handed to on_sentence
         audio: asyncio.Queue = asyncio.Queue(maxsize=SYNTHESIS_BUFFER_FRAMES)
         first_tts_request_t: float | None = None
 
@@ -122,6 +127,14 @@ class Speaker:
                         first_sent_t - anchors["commit_t"]) * 1000
                     timings["turn_latency_ms"] = (
                         first_sent_t - anchors["vad_stop_t"]) * 1000
+                if on_sentence is not None:
+                    # marks[] holds each sentence's first frame offset, so the
+                    # same helper truncate() uses tells us which sentence just
+                    # began — no second bookkeeping path to drift out of sync.
+                    started = spoken_through(record.marks, frames_sent)
+                    while announced < started:
+                        announced += 1
+                        await on_sentence(record.sentences[announced])
             timings["_playback_remaining_sec"] = playback_remaining_seconds(
                 frames_sent, pace_start)
             return timings
