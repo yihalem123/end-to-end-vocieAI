@@ -20,7 +20,7 @@ const reportPolls = new Set();
 let agentInitiated = false;
 const pendingChats = [];
 
-let activeMode = "custom";
+let activeMode = "flux";
 let sessionState = null;
 let muted = false;
 let lastAgentAudioAt = 0;

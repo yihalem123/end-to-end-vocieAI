@@ -1,4 +1,4 @@
-"""Plan loading and InterviewState: recording, advancement, knockouts."""
+"""Objective-plan loading and InterviewState evidence/termination rules."""
 from pathlib import Path
 
 import pytest
@@ -18,6 +18,9 @@ def test_load_real_plan() -> None:
     assert [s.field for s in plan.steps][:3] == ["consent", "rn_license_state",
                                                 "rn_license_active"]
     assert plan.steps[0].knockout == {"equals": False}
+    assert plan.steps[1].objective.startswith("Establish which US state")
+    assert plan.boundaries.max_turns == 15
+    assert "age" in plan.boundaries.prohibited_topics
     assert abs(sum(plan.weights.values()) - 1.0) < 1e-9
 
 
@@ -58,31 +61,19 @@ def test_record_unknown_field_is_rejected() -> None:
     assert "favorite_color" not in st.fields
 
 
-def test_advance_requires_current_field_recorded() -> None:
-    # LLM-signaled advancement, engine-validated: the signal is refused until
-    # the current step's field is actually recorded.
-    st = make_state()
-    assert st.current_step.field == "consent"
-    assert st.request_advance() is False                  # nothing recorded yet
-    st.record("consent", True, quote="yes")
-    assert st.request_advance() is True
-    assert st.current_step.field == "rn_license_state"
-
-
-def test_advance_skips_steps_already_filled() -> None:
-    # Volunteered info: "License is active in Texas" fills two fields at once.
+def test_remaining_objectives_follow_evidence_not_a_cursor() -> None:
+    # Volunteered info may fill objectives in any order; no scripted cursor is
+    # advanced and the LLM sees exactly the evidence still missing.
     st = make_state()
     st.record("consent", True, quote="yes")
     st.record("rn_license_state", "Texas", quote="active in Texas")
     st.record("rn_license_active", True, quote="active in Texas")
-    assert st.request_advance() is True
-    assert st.current_step.field == "icu_years"           # skipped two filled steps
+    assert [s.field for s in st.remaining][:2] == ["icu_years", "certifications"]
 
 
 def test_knockout_detected_on_record() -> None:
     st = make_state()
     st.record("consent", True, quote="yes")
-    st.request_advance()
     st.record("rn_license_state", "Ohio", quote="Ohio")
     st.record("rn_license_active", False, quote="it lapsed")
     assert st.knocked_out is None  # live LLM capture is provisional, never adverse
@@ -106,17 +97,13 @@ def test_done_only_after_all_steps() -> None:
     for field, value in answers.items():
         assert not st.done
         st.record(field, value, quote=str(value))
-        st.request_advance()
     assert st.done
 
 
-def test_next_needed_ignores_cursor_lag() -> None:
-    # The model may record answers without ever signaling advance_step; the
-    # prompt must still point at the first genuinely unanswered step.
+def test_next_needed_tracks_first_unanswered_objective() -> None:
     st = make_state()
     st.record("consent", True, quote="yes")
     st.record("rn_license_state", "Texas", quote="Texas")
-    assert st.current_step.field == "consent"          # cursor never moved
     assert st.next_needed is not None
     assert st.next_needed.field == "rn_license_active"  # but the need is clear
 
@@ -129,14 +116,36 @@ def test_next_needed_none_when_all_filled() -> None:
     assert st.next_needed is None
 
 
-def test_next_askable_skips_askless_steps() -> None:
-    # rn_license_active has no ask text: it rides along with the license
-    # question, so it can never be the spoken objective itself.
+def test_every_missing_field_remains_an_open_objective() -> None:
     st = make_state()
     st.record("consent", True, quote="yes")
     st.record("rn_license_state", "Texas", quote="Texas")
     assert st.next_needed.field == "rn_license_active"
-    assert st.next_askable.field == "icu_years"
+    assert [s.field for s in st.remaining][:2] == ["rn_license_active", "icu_years"]
+
+
+def test_end_call_request_is_bounded_and_first_valid_request_wins() -> None:
+    st = make_state()
+    assert st.request_end_call("candidate_requested", "Understood. Goodbye.")
+    assert st.end_call_request.reason == "candidate_requested"
+    assert not st.request_end_call("interview_complete", "A second ending.")
+
+
+def test_end_call_rejects_questions_and_unknown_reasons() -> None:
+    st = make_state()
+    assert not st.request_end_call("made_up", "Goodbye.")
+    assert not st.request_end_call("candidate_requested", "Anything else?")
+
+
+def test_plan_rejects_scripted_ask_text(tmp_path: Path) -> None:
+    bad = tmp_path / "scripted.yaml"
+    bad.write_text(
+        "persona: p\nconsent: c\nsteps:\n"
+        "  - {field: a, type: str, ask: 'Ask this exactly?'}\n"
+        "scoring_version: v1\n"
+    )
+    with pytest.raises(ValueError, match="scripted 'ask'"):
+        load_plan(bad)
 
 
 def test_history_is_bounded_window() -> None:

@@ -1,16 +1,15 @@
-"""Plan loading + InterviewState. Phase 4.
+"""Bounded interview objectives + per-call evidence state.
 
 ## How this works
-"Plan is data" (CLAUDE.md): everything about WHAT the interview covers — steps,
-field types, knockouts, weights — lives in plans/*.yaml and is validated at
-load. The engine walks it; the LLM only phrases.
+"Plan is data": everything about WHAT the interview must establish — evidence
+fields, objectives, boundaries, knockouts and weights — lives in plans/*.yaml.
+The LLM owns question choice and wording; the engine owns scope and validation.
 
 InterviewState is the source of truth for one conversation: recorded fields
-(value + verbatim quote, coerced to the step's declared type), the step cursor,
-and bounded history. Advancement is LLM-signaled but ENGINE-VALIDATED:
-request_advance() refuses unless the current step's field is recorded, then
-moves the cursor forward past any step already filled by volunteered info. The
-LLM can propose flow; it cannot skip coverage. Live captures remain provisional:
+(value + verbatim quote, coerced to the declared type), a validated end-call
+request, and bounded history. There is deliberately no live question script:
+coverage is the set of unanswered objectives, which the LLM may pursue in any
+natural order. Live captures remain provisional:
 only caller-utterance-verified post-call evidence may produce a score or knockout.
 """
 import re
@@ -31,9 +30,17 @@ _SCORING_RULES = {"min_full", "expected", "equals", "answered"}
 class Step:
     field: str
     type: str
-    ask: str | None = None
+    objective: str = ""
     knockout: dict | None = None
     scoring: dict | None = None  # rubric lives in the plan, not in code
+
+
+@dataclass(frozen=True)
+class InterviewBounds:
+    max_turns: int = 15
+    max_duration_minutes: float = 8.0
+    ask_one_question_at_a_time: bool = True
+    prohibited_topics: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -54,6 +61,7 @@ class InterviewPlan:
     scoring_version: str
     language: str = "en"
     analyses: tuple[Analysis, ...] = ()
+    boundaries: InterviewBounds = InterviewBounds()
 
 
 @dataclass(frozen=True)
@@ -62,9 +70,30 @@ class Recorded:
     quote: str
 
 
+@dataclass(frozen=True)
+class EndCallRequest:
+    reason: str
+    closing_message: str
+
+
+END_CALL_REASONS = frozenset({
+    "candidate_requested", "consent_refused", "interview_complete",
+    "knockout", "max_duration", "max_turns", "limit_reached", "safety",
+    "technical_failure",
+})
+
+
 def load_plan(path: Path) -> InterviewPlan:
     raw = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
-    steps = [Step(**s) for s in raw["steps"]]
+    steps = []
+    for item in raw["steps"]:
+        if "ask" in item:
+            raise ValueError(
+                f"step {item.get('field')!r}: scripted 'ask' is not allowed; "
+                "describe the evidence objective instead")
+        data = dict(item)
+        data.setdefault("objective", str(data["field"]).replace("_", " "))
+        steps.append(Step(**data))
     for s in steps:
         if s.type not in _TYPES:
             raise ValueError(f"step {s.field!r}: unknown type {s.type!r}")
@@ -82,6 +111,17 @@ def load_plan(path: Path) -> InterviewPlan:
     ids = [a.id for a in analyses]
     if len(ids) != len(set(ids)):
         raise ValueError(f"duplicate analysis id in {sorted(ids)}")
+    bounds_raw = raw.get("boundaries", {})
+    boundaries = InterviewBounds(
+        max_turns=int(bounds_raw.get("max_turns", 15)),
+        max_duration_minutes=float(bounds_raw.get("max_duration_minutes", 8.0)),
+        ask_one_question_at_a_time=bool(
+            bounds_raw.get("ask_one_question_at_a_time", True)),
+        prohibited_topics=tuple(str(v) for v in
+                                  bounds_raw.get("prohibited_topics", [])),
+    )
+    if boundaries.max_turns < 1 or boundaries.max_duration_minutes <= 0:
+        raise ValueError("interview boundaries must be positive")
     return InterviewPlan(
         persona=raw["persona"],
         consent=raw["consent"],
@@ -90,6 +130,7 @@ def load_plan(path: Path) -> InterviewPlan:
         scoring_version=raw["scoring_version"],
         language=raw.get("language", "en"),
         analyses=analyses,
+        boundaries=boundaries,
     )
 
 
@@ -137,38 +178,26 @@ class InterviewState:
         self.plan = plan
         self.fields: dict[str, Recorded] = {}
         self.history: list[dict[str, str]] = []
-        self.step_idx = 0
         self.knocked_out: str | None = None
+        self.end_call_request: EndCallRequest | None = None
+        self.caller_turn_count = 0
+        self.elapsed_seconds = 0.0
         # Audit trail of every tool call the model attempted: applied or not,
         # with the reason — orchestration and the post-call report read this.
         self.tool_ledger: list[dict] = []
 
     @property
-    def current_step(self) -> Step:
-        return self.plan.steps[min(self.step_idx, len(self.plan.steps) - 1)]
-
-    @property
     def done(self) -> bool:
-        return self.step_idx >= len(self.plan.steps)
+        return self.next_needed is None
 
     @property
     def next_needed(self) -> Step | None:
-        """First step with no recorded answer — tracks NEED, not the cursor.
-        The prompt targets need so a model that records answers without ever
-        signaling advance_step still gets pointed at the right question."""
+        """First unanswered evidence objective, for compatibility/reporting."""
         return next((s for s in self.plan.steps if s.field not in self.fields), None)
 
     @property
-    def next_askable(self) -> Step | None:
-        """First unfilled step that has words to ask with. Ask-less steps
-        (knockout companions like rn_license_active) are filled as side effects
-        of other questions and can't be the spoken objective themselves."""
-        for i, s in enumerate(self.plan.steps):
-            if s.field in self.fields:
-                continue
-            if s.ask is not None or i == 0:  # step 0 asks via plan.consent
-                return s
-        return None
+    def remaining(self) -> list[Step]:
+        return [s for s in self.plan.steps if s.field not in self.fields]
 
     def record(self, field: str, value: Any, quote: str) -> bool:
         step = next((s for s in self.plan.steps if s.field == field), None)
@@ -185,15 +214,21 @@ class InterviewState:
         # verification may produce a candidate knockout.
         return True
 
-    def request_advance(self) -> bool:
-        """LLM proposes advancement; the engine grants it only when the current
-        step is actually covered, then skips past anything already filled."""
-        if self.done or self.current_step.field not in self.fields:
+    def request_end_call(self, reason: str, closing_message: str) -> bool:
+        """Validate a one-way termination request; first valid request wins."""
+        reason = str(reason).strip()
+        message = " ".join(str(closing_message).split())
+        if (self.end_call_request is not None or reason not in END_CALL_REASONS
+                or not message or len(message) > 240 or "?" in message):
             return False
-        self.step_idx += 1
-        while not self.done and self.current_step.field in self.fields:
-            self.step_idx += 1
+        self.end_call_request = EndCallRequest(reason, message)
         return True
+
+    def note_caller_turn(self) -> None:
+        self.caller_turn_count += 1
+
+    def update_elapsed(self, seconds: float) -> None:
+        self.elapsed_seconds = max(0.0, float(seconds))
 
     def add_history(self, role: str, content: str) -> None:
         self.history.append({"role": role, "content": content})

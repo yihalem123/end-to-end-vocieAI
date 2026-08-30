@@ -1,4 +1,4 @@
-"""One engine turn: OpenAI Responses API streaming -> tools applied -> sentences.
+"""One bounded, goal-driven engine turn: Responses stream -> tools -> speech.
 
 ## How this works
 We speak the Responses API over raw SSE (httpx) — consistent with the project's
@@ -8,7 +8,7 @@ raw-protocol ethos, and the typed events are the whole lesson:
   response.function_call_arguments.delta/.done -> its JSON args accumulate/finish
 StreamAssembler turns that event soup into text deltas + completed ToolCalls.
 
-Tools are ONE-WAY state mutations (record_answer, advance_step): we never send
+Tools are ONE-WAY state mutations (record_answer, end_call): we never send
 tool outputs back, so one request per turn — no second round trip, which is the
 latency trick that makes tool use viable in a voice loop. These live captures
 are provisional interview memory only; post-call caller-utterance verification
@@ -20,7 +20,7 @@ yielded immediately — the Speaker starts TTS on sentence one while the model i
 still writing sentence three. llm_ttft (request start -> first text delta)
 is recorded per turn. The system prompt is rendered fresh every turn from
 InterviewState, so the model always sees current coverage; the engine, not the
-model, remains the authority on step order (see plan.py).
+model, remains the authority on scope, evidence and termination (see plan.py).
 """
 import asyncio
 import hashlib
@@ -34,6 +34,7 @@ from typing import Any
 import httpx
 
 from server.config import Settings
+from server.engine.intents import EndCallIntent, classify_end_call_intent
 from server.engine.plan import InterviewState
 
 log = logging.getLogger(__name__)
@@ -67,11 +68,32 @@ TOOLS = [
     },
     {
         "type": "function",
-        "name": "advance_step",
-        "description": "Signal the current question is fully answered.",
+        "name": "end_call",
+        "description": (
+            "Request a graceful end after the caller asks to stop or all "
+            "interview objectives are covered. The backend validates and owns "
+            "the actual session transition."),
         "strict": True,
-        "parameters": {"type": "object", "additionalProperties": False,
-                       "required": [], "properties": {}},
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["reason", "closing_message"],
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "enum": [
+                        "candidate_requested", "interview_complete",
+                        "limit_reached",
+                    ],
+                },
+                "closing_message": {
+                    "type": "string",
+                    "description": (
+                        "One short final statement, with no question, to speak "
+                        "before the backend closes the call."),
+                },
+            },
+        },
     },
 ]
 
@@ -172,36 +194,53 @@ class StreamAssembler:
 
 
 def fallback_line(state: InterviewState) -> str:
-    """Deterministic reply when the model returns tools but no text (a silent
-    turn is never acceptable in voice). The plan's own words are the script."""
-    if state.knocked_out:
-        return ("Thanks for your time today. Unfortunately this role requires "
-                "that, so we won't move forward — but thank you for talking with me.")
-    step = state.next_askable
-    if step is not None:
-        return step.ask if step.ask else state.plan.consent
-    needed = state.next_needed
-    if needed is not None:  # only ask-less fields remain: confirm explicitly
-        return f"One more thing to confirm: {needed.field.replace('_', ' ')}?"
-    return "That's everything I needed — thank you for your time today!"
+    """Safe speech when a tool-only model response would otherwise be silent."""
+    if state.end_call_request is not None:
+        return state.end_call_request.closing_message
+    if state.remaining:
+        return "Could you tell me a little more so I can continue?"
+    return "Thanks, that covers everything I needed for this screening."
 
 
 def build_instructions(plan) -> str:
     """The STATIC per-call prefix (persona + rules). Kept byte-identical across
     turns so provider prompt caching can hit; everything that changes per turn
     lives in build_state_block and travels as an input message instead."""
+    objectives = "\n".join(
+        f"- {s.field} ({s.type}): {s.objective}" for s in plan.steps)
+    prohibited = ", ".join(plan.boundaries.prohibited_topics) or "none configured"
+    one_at_a_time = "yes" if plan.boundaries.ask_one_question_at_a_time else "no"
     return f"""{plan.persona}
 
-You are conducting a structured screening interview. Rules:
-- Ask ONE question at a time. Keep replies to one or two short sentences.
+You are conducting an open but bounded screening interview. You choose every
+substantive question and its wording; there is no scripted question order.
+
+Evidence objectives:
+{objectives}
+
+Boundaries:
+- Maximum caller turns: {plan.boundaries.max_turns}
+- Maximum duration: {plan.boundaries.max_duration_minutes:g} minutes
+- Ask one question at a time: {one_at_a_time}
+- Prohibited topics: {prohibited}
+
+Rules:
+- Select the most useful natural question from the still-missing objectives.
+- Do not repeat established information. If part of a compound topic was
+  answered, ask only for what remains missing.
+- Ask ONE concise question at a time. Keep speech to one or two short sentences.
 - ALWAYS include a spoken reply for the caller. Never respond with only tool
   calls — a silent turn is a broken phone call.
 - Every time the caller answers, call record_answer with the field name, the
   answer, and their VERBATIM words as the quote. If they volunteer other
   fields' answers, record those too.
-- When the current question is fully answered, call advance_step.
+- If the caller asks to stop, speak only a brief goodbye and call end_call with
+  reason candidate_requested. Do not ask another interview question.
+- When every objective is covered, briefly close and call end_call with reason
+  interview_complete.
 - Never invent answers. Never promise pay, benefits, or hiring decisions.
-- A system message states what has been recorded and the next question."""
+- A system message states what is established and what remains; it never gives
+  you a required question or question order."""
 
 
 def build_state_block(state: InterviewState) -> str:
@@ -210,31 +249,32 @@ def build_state_block(state: InterviewState) -> str:
     # post-call verification) — the prompt must not grow with caller verbosity.
     filled = "\n".join(f"- {name}: {rec.value!r} (they said: \"{rec.quote[:60]}\")"
                        for name, rec in state.fields.items()) or "- none yet"
-    remaining = ", ".join(s.field for s in plan.steps
-                          if s.field not in state.fields) or "none"
-    # Target NEED (first unfilled, askable step), not the cursor: the model may
-    # record answers without signaling advance_step, and must not re-ask
-    # stale steps. Ask-less steps are covered opportunistically or confirmed.
-    step = state.next_askable
-    if state.knocked_out:
-        objective = ("The caller did not pass a required check "
-                     f"({state.knocked_out}). Politely wrap up the call now.")
-    elif step is not None:
-        ask = step.ask if step.ask else plan.consent
-        # Typed value hint: without it the model records "Nights" for a bool
-        # field, validation rejects it, and the agent re-asks (bench finding).
-        hint = {"bool": " (record the answer as true or false)",
-                "float": " (record the answer as a number)",
-                "list": " (record as comma-separated items)"}.get(step.type, "")
-        objective = f'Next question to get answered: "{ask}"{hint}'
-    elif state.next_needed is not None:
-        objective = (f"Only {state.next_needed.field} still needs confirming — "
-                     "ask for it directly, then wrap up.")
+    remaining = "\n".join(
+        f"- {s.field} ({s.type}): {s.objective}"
+        for s in state.remaining) or "- none"
+    turns_left = max(0, plan.boundaries.max_turns - state.caller_turn_count)
+    seconds_left = max(
+        0.0, plan.boundaries.max_duration_minutes * 60 - state.elapsed_seconds)
+    if state.end_call_request is not None:
+        objective = "Termination is already requested. Do not ask another question."
+    elif turns_left == 0 or seconds_left == 0:
+        objective = (
+            "The interview limit is reached. Ask no question. Give a brief "
+            "closing statement and call end_call with reason limit_reached.")
+    elif state.remaining:
+        objective = (
+            "Choose the best next objective based on conversational context. "
+            "Generate your own concise question; do not combine unrelated gaps.")
     else:
-        objective = "All questions are covered. Thank them and wrap up the call."
+        objective = (
+            "All evidence objectives are covered. Give a brief closing statement "
+            "and call end_call with reason interview_complete.")
     return f"""Recorded so far:
 {filled}
-Fields still needed: {remaining}
+Evidence objectives still missing:
+{remaining}
+
+Runtime budget: {turns_left} caller turns and {seconds_left:.0f} seconds remain.
 
 {objective}"""
 
@@ -383,7 +423,13 @@ class LlmEngine:
         seen = {e["idempotency_key"] for e in ledger
                 if e.get("idempotency_key")}
         results: list[dict] = []
-        for call in calls:
+        # Function-call output order is model-controlled. Evidence mutations
+        # must settle before an interview_complete request is validated, or an
+        # end_call item emitted first can be rejected even though the same
+        # response records the final objective. Stable sort preserves relative
+        # order within each class and keeps the audit deterministic.
+        ordered_calls = sorted(calls, key=lambda call: call.name == "end_call")
+        for call in ordered_calls:
             if not current():
                 return results
             tool_identity = call.call_id or hashlib.sha256(
@@ -426,10 +472,28 @@ class LlmEngine:
                 if not entry["applied"]:
                     entry["reason"] = "rejected by state validation"
                     log.warning("record_answer rejected by state validation")
-            elif call.name == "advance_step":
-                entry["applied"] = self.state.request_advance()
+            elif call.name == "end_call":
+                reason = str(call.arguments.get("reason") or "")
+                closing = str(call.arguments.get("closing_message") or "")
+                if (reason == "candidate_requested"
+                        and not any(classify_end_call_intent(source)
+                                    == EndCallIntent.END
+                                    for source in self._caller_sources(source_text))):
+                    entry["reason"] = "candidate end request not supported by transcript"
+                    continue
+                if reason == "interview_complete" and self.state.remaining:
+                    entry["reason"] = "interview objectives still missing"
+                    continue
+                if (reason == "limit_reached"
+                        and self.state.caller_turn_count <
+                        self.state.plan.boundaries.max_turns
+                        and self.state.elapsed_seconds <
+                        self.state.plan.boundaries.max_duration_minutes * 60):
+                    entry["reason"] = "interview limit not reached"
+                    continue
+                entry["applied"] = self.state.request_end_call(reason, closing)
                 if not entry["applied"]:
-                    entry["reason"] = "current step not yet covered"
+                    entry["reason"] = "invalid or duplicate end-call request"
             else:
                 entry["reason"] = "unknown tool"
         return results

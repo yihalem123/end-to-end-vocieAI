@@ -79,6 +79,38 @@ def test_ambiguous_consent_reprompts_without_engine_or_false_value() -> None:
     asyncio.run(run())
 
 
+def test_explicit_end_request_bypasses_llm_and_closes_gracefully() -> None:
+    async def run() -> None:
+        session, replies, _ = make_session()
+        session.state.session.transition(SessionStatus.INTERVIEWING)
+        await session._commit_caller_text("I want you to end this call.", 2, turn=None)
+        assert session.state.session.status == SessionStatus.CLOSING
+        assert replies.chats == []
+        assert replies.interview.end_call_request.reason == "candidate_requested"
+        assert "end the call" in replies.scripts[-1][0]
+        assert session._close_when_idle is True
+
+    asyncio.run(run())
+
+
+def test_fuzzy_end_request_asks_for_confirmation_not_an_interview_answer() -> None:
+    async def run() -> None:
+        session, replies, _ = make_session()
+        session.state.session.transition(SessionStatus.INTERVIEWING)
+        await session._commit_caller_text(
+            "Can you in the cold in the cold?", 2, turn=None)
+        assert session.state.session.status == SessionStatus.INTERVIEWING
+        assert replies.chats == []
+        assert "ask me to end" in replies.scripts[-1][0]
+        assert session._pending_end_confirmation is True
+
+        await session._commit_caller_text("Yes.", 3, turn=None)
+        assert session.state.session.status == SessionStatus.CLOSING
+        assert replies.interview.end_call_request.reason == "candidate_requested"
+
+    asyncio.run(run())
+
+
 def test_event_loop_agent_initiates_with_disclosure() -> None:
     async def run() -> None:
         session, replies, _ = make_session()

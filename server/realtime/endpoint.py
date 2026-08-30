@@ -42,6 +42,12 @@ _TRAILING_WORDS = frozenset(
     "could should may might must do does did that".split()
 )
 
+_TRAILING_CONTRACTIONS = frozenset({
+    "i'm", "im", "it's", "its", "we're", "were", "they're", "theyre",
+    "you're", "youre", "i've", "ive", "we've", "weve", "i'd", "id",
+    "we'd", "wed", "can't", "cant", "don't", "dont",
+})
+
 
 def looks_complete(text: str) -> bool:
     return text.rstrip().endswith(_TERMINAL)
@@ -52,7 +58,10 @@ def looks_trailing(text: str) -> bool:
     if text.endswith((",", ";", ":")):
         return True  # mid-clause punctuation: the strongest "still going" cue
     words = text.split()
-    return bool(words) and words[-1].lower() in _TRAILING_WORDS
+    if not words:
+        return False
+    last = words[-1].lower().strip('"\'()[]{}')
+    return last in _TRAILING_WORDS or last in _TRAILING_CONTRACTIONS
 
 
 @dataclass(frozen=True)

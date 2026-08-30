@@ -86,6 +86,18 @@ def test_trailing_copula_gets_extra_patience() -> None:
     assert turn is not None and turn.reason == "trailing"
 
 
+def test_dangling_contraction_gets_extra_patience() -> None:
+    # Live regression: "I guess it's" hit the 2 s slow timeout, became its own
+    # caller turn, and made the agent repeat the question over the continuation.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("I guess it's", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)
+    assert turn is not None and turn.reason == "trailing"
+
+
 def test_trailing_comma_gets_extra_patience() -> None:
     # Live regression (2026-08-30 #2): "Yeah. I mean," was committed at the
     # slow tier — but a trailing comma is the strongest "still going" cue.

@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from fastapi import WebSocket, WebSocketDisconnect
 
 from server.config import Settings
+from server.engine.intents import EndCallIntent, classify_end_call_intent
 from server.metrics import registry
 from server.realtime.asr import (
     FINALIZE,
@@ -125,6 +126,8 @@ class CallSession:
         self._last_vad_stop_t: float | None = None
         self._next_turn_id = 0
         self._close_when_idle = False
+        self._pending_end_confirmation = False
+        self._interview_started_t: float | None = None
 
     async def run(self) -> None:
         await self._ws.accept()
@@ -305,6 +308,9 @@ class CallSession:
             except TimeoutError:
                 event = None
             now = time.monotonic()
+            started = getattr(self, "_interview_started_t", None)
+            if started is not None:
+                self._replies.interview.update_elapsed(now - started)
             turn: TurnComplete | None = None
             match event:
                 case VadEvent(kind="start", t=t):
@@ -398,10 +404,36 @@ class CallSession:
             if self._replies.guard.tick(now):
                 await self._replies.interrupt_current()
             if (self.state.session.status == SessionStatus.INTERVIEWING
-                    and self._replies.interview.next_needed is None
                     and self._replies.is_idle):
-                self.state.session.transition(SessionStatus.CLOSING)
-                await self._send_state()
+                request = self._replies.interview.end_call_request
+                if request is not None:
+                    self.state.session.transition(SessionStatus.CLOSING)
+                    await self._send_state()
+                    self._close_when_idle = True
+                elif self._replies.interview.done:
+                    # Safety fallback when the model covers every objective but
+                    # omits its end_call tool. The LLM still generated every
+                    # substantive interview question; this is fixed lifecycle
+                    # copy, not a scripted interview step.
+                    await self._finish_interview(
+                        "interview_complete",
+                        "Thanks, that covers everything I needed for this screening.",
+                        self._next_turn_id,
+                    )
+                elif (self._replies.interview.elapsed_seconds >=
+                      self._replies.interview.plan.boundaries.max_duration_minutes * 60):
+                    await self._finish_interview(
+                        "max_duration",
+                        "We've reached the time limit, so I'll end the screening here. Thank you.",
+                        self._next_turn_id,
+                    )
+                elif (self._replies.interview.caller_turn_count >=
+                      self._replies.interview.plan.boundaries.max_turns):
+                    await self._finish_interview(
+                        "max_turns",
+                        "We've reached the interview limit, so I'll end the screening here. Thank you.",
+                        self._next_turn_id,
+                    )
             if self._close_when_idle and self._replies.is_idle:
                 await self._ws.close(code=1000)
                 return
@@ -444,11 +476,64 @@ class CallSession:
                 self._close_when_idle = True
                 return
             self.state.session.transition(SessionStatus.INTERVIEWING)
+            self._interview_started_t = time.monotonic()
             await self._send_state()
         elif status != SessionStatus.INTERVIEWING:
             return
+
+        if self.state.session.status == SessionStatus.INTERVIEWING:
+            self._replies.interview.note_caller_turn()
+            started = getattr(self, "_interview_started_t", None)
+            if started is not None:
+                self._replies.interview.update_elapsed(time.monotonic() - started)
+            if getattr(self, "_pending_end_confirmation", False):
+                confirmation = classify_consent(text)
+                if confirmation is True:
+                    self._pending_end_confirmation = False
+                    await self._finish_interview(
+                        "candidate_requested",
+                        "Understood. I'll end the call here. Thank you for your time.",
+                        turn_id,
+                    )
+                    return
+                if confirmation is False:
+                    self._pending_end_confirmation = False
+                    await self._replies.on_script(
+                        "Okay, we can continue.", turn_id)
+                    return
+                await self._replies.on_script(
+                    "Please say yes if you want me to end the call, or no to continue.",
+                    turn_id,
+                )
+                return
+
+            intent = classify_end_call_intent(text)
+            if intent == EndCallIntent.END:
+                await self._finish_interview(
+                    "candidate_requested",
+                    "Understood. I'll end the call here. Thank you for your time.",
+                    turn_id,
+                )
+                return
+            if intent == EndCallIntent.CONFIRM:
+                self._pending_end_confirmation = True
+                await self._replies.on_script(
+                    "Did you ask me to end the call? Please say yes or no.",
+                    turn_id,
+                )
+                return
 
         if turn is None:
             await self._replies.on_chat(text, turn_id)
         else:
             await self._replies.on_turn(turn, turn_id)
+
+    async def _finish_interview(self, reason: str, closing_message: str,
+                                turn_id: int) -> None:
+        """One validated owner for graceful termination and closing playback."""
+        self._replies.interview.request_end_call(reason, closing_message)
+        if self.state.session.status == SessionStatus.INTERVIEWING:
+            self.state.session.transition(SessionStatus.CLOSING)
+            await self._send_state()
+        await self._replies.on_script(closing_message, turn_id)
+        self._close_when_idle = True

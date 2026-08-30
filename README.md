@@ -2,7 +2,7 @@
 
 A local browser Voice AI prototype built with **no voice platform and no agent framework**:
 browser mic → WebSocket → FastAPI → VAD → streaming ASR (Deepgram)
-→ interview-plan engine (OpenAI, streaming + tools) → streaming TTS (Deepgram
+→ bounded objective engine (OpenAI, streaming + tools) → streaming TTS (Deepgram
 Aura or ElevenLabs, selectable via `TTS_PROVIDER`) → back to the caller.
 Includes barge-in, per-turn latency metrics, post-call evidence extraction, and deterministic scoring.
 
@@ -46,7 +46,15 @@ Two turn-taking stacks are selectable per call from the console ("Flux
 end-of-turn" toggle): the custom VAD-anchored endpointer (three patience tiers)
 or Deepgram Flux's model-integrated end-of-turn. Both can prepare commit-gated
 drafts; Flux uses EagerEndOfTurn and cancels them on TurnResumed. Metrics are
-tagged per mode so the A/B is visible side by side.
+tagged per mode so the A/B is visible side by side. Flux is the default; custom
+mode remains an explicit fallback/comparison.
+
+The YAML plan contains evidence objectives, time/turn limits, and prohibited
+topics—not interview question text. The LLM chooses the next objective, wording,
+order, and contextual follow-up while validated `record_answer` and `end_call`
+tools keep evidence and lifecycle state backend-owned. Explicit stop requests
+bypass ordinary dialogue generation; a narrow ASR-confusion path asks for
+confirmation rather than continuing the interview or hanging up speculatively.
 
 ## Metrics that matter (check /metrics/{call_id} after a call)
 endpoint_delay, llm_ttft (first text delta), tts_ttfb (first provider audio),
@@ -54,7 +62,7 @@ first_audio, turn_latency (p50/p95), prompt-cache tokens, barge-ins, turns.
 Measured results and their history: see `REHEARSAL.md`.
 
 ## Verification
-`python -m pytest -q` — 232 offline tests (no vendor calls; the browser capture
+`python -m pytest -q` — 252 offline tests (no vendor calls; the browser capture
 worklet runs as real JS under Node, since no Python test can reach it).
 `python scripts/simulate_caller.py [--flux]` — live end-to-end gate: a synthesized
 rambling caller with mid-thought pauses asserts turn integrity, extraction, and

@@ -1,4 +1,4 @@
-# Interview plan = data. The engine enforces coverage; the LLM only phrases.
+# Bounded interview objectives. The LLM chooses every substantive question.
 persona: >
   You are Sarah, a friendly recruiter for Horizon Staffing. Short sentences,
   one question at a time, warm but efficient. Never promise pay or benefits.
@@ -7,35 +7,42 @@ consent: >
   Hi, this is Sarah, an AI assistant calling for Horizon Staffing about the ICU nurse
   role. I will transcribe what you say and analyze the transcript for this screening.
   No audio recording is stored. Do you consent to continue now?
+boundaries:
+  max_turns: 15
+  max_duration_minutes: 8
+  ask_one_question_at_a_time: true
+  prohibited_topics: [age, religion, marital status, disability, family status]
 steps:
   - field: consent
     type: bool
+    objective: Establish explicit consent before screening begins.
     knockout: { equals: false }
   - field: rn_license_state
     type: str
-    ask: "Which state is your RN license in, and is it currently active?"
+    objective: Establish which US state issued the candidate's RN license.
   - field: rn_license_active
     type: bool
+    objective: Establish whether the RN license is currently active.
     knockout: { equals: false }
   - field: icu_years
     type: float
-    ask: "How many years of ICU experience do you have?"
+    objective: Establish the candidate's total years of relevant ICU experience.
     scoring: { min_full: 2.0 }          # >= 2 years scores 1.0, linear below
   - field: certifications
     type: list
-    ask: "Which certifications do you hold — BLS, ACLS, CCRN?"
+    objective: Establish which relevant current certifications the candidate holds.
     scoring: { expected: [BLS, ACLS, CCRN] }   # fraction of expected certs held
   - field: shift_availability
     type: bool
-    ask: "This role requires night shifts. Are you available to work nights?"
+    objective: Establish whether the candidate is available for required night shifts.
     scoring: { equals: true }
   - field: earliest_start
     type: str
-    ask: "When is the earliest you could start?"
+    objective: Establish the earliest date or timeframe the candidate could start.
     scoring: { answered: true }
   - field: pay_expectation
     type: str
-    ask: "What hourly rate are you looking for?"
+    objective: Establish the candidate's hourly pay expectation without making promises.
 # Post-call analyses: ADVISORY notes the LLM writes after the call. Rendered
 # in their own clearly-labeled report section; never part of score/knockouts.
 analyses:

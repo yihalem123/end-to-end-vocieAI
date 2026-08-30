@@ -14,6 +14,7 @@ from server.engine.turn import (
     ToolCall,
     build_system_prompt,
     fallback_line,
+    TOOLS,
 )
 
 PLAN_PATH = Path(__file__).resolve().parents[1] / "plans" / "icu_nurse.yaml"
@@ -122,35 +123,61 @@ def test_assembler_malformed_arguments_kept_as_error() -> None:
 def test_system_prompt_contains_step_and_state() -> None:
     state = InterviewState(load_plan(PLAN_PATH))
     state.record("consent", True, quote="yes")
-    state.request_advance()
     prompt = build_system_prompt(state)
     assert "Sarah" in prompt                                  # persona included
-    assert "Which state is your RN license in" in prompt      # current step's ask
+    assert "which US state issued" in prompt                  # objective, not script
+    assert "there is no scripted question order" in prompt
     assert "consent" in prompt                                # filled field listed
     assert "pay_expectation" in prompt                        # remaining coverage listed
 
 
-def test_system_prompt_targets_first_unfilled_even_if_cursor_lags() -> None:
-    # Live regression: the model recorded answers without calling advance_step,
-    # so the prompt kept re-asking consent. The objective must track need.
+def test_system_prompt_exposes_all_unfilled_objectives_without_ordering() -> None:
     state = InterviewState(load_plan(PLAN_PATH))
     state.record("consent", True, quote="yes")
     state.record("rn_license_state", "Texas", quote="Texas")
-    prompt = build_system_prompt(state)                       # cursor still at consent
-    assert "How many years of ICU experience" in prompt       # next ASKABLE step
-    assert "rn_license_active" in prompt                      # still listed as needed
+    prompt = build_system_prompt(state)
+    assert "rn_license_active" in prompt
+    assert "icu_years" in prompt
+    assert "Choose the best next objective" in prompt
+    assert "Next question to get answered" not in prompt
 
 
-def test_fallback_line_speaks_the_plan_verbatim() -> None:
-    # Live regression: tools-only responses produced silent turns. The plan's
-    # own ask text is the deterministic never-silent fallback.
+def test_runtime_limit_changes_prompt_to_closing_only() -> None:
+    state = InterviewState(load_plan(PLAN_PATH))
+    state.caller_turn_count = state.plan.boundaries.max_turns
+    prompt = build_system_prompt(state)
+    assert "interview limit is reached" in prompt
+    assert "Ask no question" in prompt
+
+
+def test_limit_end_call_is_rejected_early_and_accepted_at_boundary() -> None:
+    engine, state = _engine_with_state()
+    call = _tc("limit", "end_call", {
+        "reason": "limit_reached", "closing_message": "Thank you. Goodbye."})
+    early = engine._apply_tools([call], source_text="hello")[-1]
+    assert early["applied"] is False
+
+    state.caller_turn_count = state.plan.boundaries.max_turns
+    accepted = engine._apply_tools([
+        _tc("limit2", "end_call", {
+            "reason": "limit_reached", "closing_message": "Thank you. Goodbye."})
+    ], source_text="hello")[-1]
+    assert accepted["applied"] is True
+
+
+def test_fallback_line_is_non_scripted_and_never_silent() -> None:
     state = InterviewState(load_plan(PLAN_PATH))
     state.record("consent", True, quote="yes")
-    assert fallback_line(state) == "Which state is your RN license in, and is it currently active?"
+    assert fallback_line(state) == "Could you tell me a little more so I can continue?"
     fill = {"bool": True, "float": 1.0, "list": ["x"], "str": "x"}
     for s in state.plan.steps:
         state.record(s.field, fill[s.type], quote="q")
     assert "thank" in fallback_line(state).lower()            # done: wrap-up line
+
+
+def test_live_tool_surface_has_end_call_and_no_step_cursor() -> None:
+    names = {tool["name"] for tool in TOOLS}
+    assert names == {"record_answer", "end_call"}
 
 
 def test_stale_generation_cannot_apply_tool_side_effects() -> None:
@@ -160,13 +187,14 @@ def test_stale_generation_cannot_apply_tool_side_effects() -> None:
     calls = [
         ToolCall("record_answer", "c1", {
             "field": "consent", "value": True, "quote": "yes"}),
-        ToolCall("advance_step", "c2", {}),
+        ToolCall("end_call", "c2", {
+            "reason": "candidate_requested", "closing_message": "Goodbye."}),
     ]
 
     engine._apply_tools(calls, is_current=lambda: False)
 
     assert state.fields == {}
-    assert state.step_idx == 0
+    assert state.end_call_request is None
 
 
 # --- Phase 3: tool execution ledger ---
@@ -192,14 +220,54 @@ def test_ledger_records_applied_and_rejected_calls() -> None:
         _tc("c1", "record_answer", {"field": "consent", "value": "true", "quote": "yes go ahead"}),
         _tc("c2", "record_answer", {"field": "not_a_field", "value": "x", "quote": "q"}),
         _tc("c3", "record_answer", {"field": "icu_years", "value": "5", "quote": ""}),
-        _tc("c4", "advance_step", {}),
-    ], turn_id=3, generation_id=7, source_text="yes go ahead q")
+        _tc("c4", "end_call", {
+            "reason": "candidate_requested",
+            "closing_message": "Understood. Goodbye."}),
+    ], turn_id=3, generation_id=7,
+       source_text="yes go ahead q and I want to end this call")
     ledger = state.tool_ledger
     assert [e["applied"] for e in ledger] == [True, False, False, True]
     assert ledger[1]["reason"] == "rejected by state validation"
     assert "quote" in ledger[2]["reason"]          # evidence required before mutation
     assert state.fields.keys() == {"consent"}      # empty-quote record never mutated
+    assert state.end_call_request.reason == "candidate_requested"
     assert all(e["turn_id"] == 3 and e["generation_id"] == 7 for e in ledger)
+
+
+def test_end_call_requires_evidence_or_complete_coverage() -> None:
+    engine, state = _engine_with_state()
+    unsupported = engine._apply_tools([
+        _tc("end1", "end_call", {
+            "reason": "candidate_requested", "closing_message": "Goodbye."})
+    ], source_text="I have five years.")[-1]
+    assert unsupported["applied"] is False
+    assert "not supported" in unsupported["reason"]
+
+    premature = engine._apply_tools([
+        _tc("end2", "end_call", {
+            "reason": "interview_complete", "closing_message": "Thank you."})
+    ], source_text="I have five years.")[-1]
+    assert premature["applied"] is False
+    assert "still missing" in premature["reason"]
+
+
+def test_final_evidence_applies_before_completion_regardless_of_item_order() -> None:
+    engine, state = _engine_with_state()
+    fill = {"bool": True, "float": 1.0, "list": ["BLS"], "str": "known"}
+    for step in state.plan.steps:
+        if step.field != "pay_expectation":
+            state.record(step.field, fill[step.type], quote="known")
+
+    results = engine._apply_tools([
+        _tc("finish-first", "end_call", {
+            "reason": "interview_complete", "closing_message": "Thank you. Goodbye."}),
+        _tc("final-answer", "record_answer", {
+            "field": "pay_expectation", "value": "55 per hour", "quote": "55 per hour"}),
+    ], source_text="55 per hour")
+
+    assert [item["name"] for item in results] == ["record_answer", "end_call"]
+    assert all(item["applied"] for item in results)
+    assert state.end_call_request.reason == "interview_complete"
 
 
 def test_ledger_skips_duplicate_tool_call_ids() -> None:
