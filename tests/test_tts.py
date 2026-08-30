@@ -141,3 +141,42 @@ def test_synthesize_times_out_typed_when_provider_stalls(monkeypatch) -> None:
             client._reader.cancel()
 
     asyncio.run(run())
+
+
+def test_synthesize_raises_when_context_finalizes_with_zero_audio() -> None:
+    # Live regression: with the ElevenLabs quota exhausted the provider accepts
+    # every context and immediately finalizes it with NO audio. synthesize()
+    # returned cleanly, the reply pipeline reported success, and whole calls
+    # went out silent — caught only because the stage metrics vanished.
+    from server.realtime import tts as tts_module
+
+    class QuietWs:
+        async def send(self, data) -> None:
+            pass
+
+    async def run() -> None:
+        client = object.__new__(tts_module.MultiContextTts)
+        client._api_key = "k"
+        client._url = "wss://unused"
+        client._ws = QuietWs()
+        client._queues = {}
+        client._counter = 0
+        client._connect_lock = asyncio.Lock()
+        client._reader = asyncio.create_task(asyncio.sleep(3600))
+
+        async def no_connect() -> None:
+            return None
+
+        client.ensure_connected = no_connect
+        try:
+            gen = client.synthesize("hello")
+            task = asyncio.ensure_future(anext(gen))
+            await asyncio.sleep(0)  # let synthesize register its context queue
+            queue = next(iter(client._queues.values()))
+            queue.put_nowait((b"", True))  # isFinal, zero audio ever
+            with pytest.raises(tts_module.TtsNoAudio):
+                await task
+        finally:
+            client._reader.cancel()
+
+    asyncio.run(run())

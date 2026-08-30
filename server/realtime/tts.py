@@ -58,6 +58,14 @@ class TtsTimeout(RuntimeError):
     """The provider stopped delivering audio for one context in time."""
 
 
+class TtsNoAudio(RuntimeError):
+    """The provider finalized a context without ever sending audio.
+
+    Seen live with an exhausted quota: every context is accepted and
+    immediately closed with isFinal and no audio. Treating that as success
+    ships a silent call — fail loud instead."""
+
+
 def build_url(voice_id: str, model_id: str = DEFAULT_MODEL) -> str:
     params = {"model_id": model_id, "output_format": "pcm_16000"}
     return (
@@ -173,6 +181,7 @@ class MultiContextTts:
         queue: asyncio.Queue = asyncio.Queue(maxsize=TTS_CONTEXT_QUEUE_SIZE)
         self._queues[ctx] = queue
         finished = False
+        yielded_any = False
         try:
             await self._ws.send(json.dumps({
                 "text": " ",
@@ -194,8 +203,13 @@ class MultiContextTts:
                     raise item
                 audio, is_final = item
                 if audio:
+                    yielded_any = True
                     yield audio
                 if is_final:
+                    if not yielded_any:
+                        raise TtsNoAudio(
+                            f"context {ctx} finalized with zero audio "
+                            "(quota exhausted or provider rejection)")
                     finished = True
                     return
         finally:
