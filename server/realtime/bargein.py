@@ -14,6 +14,13 @@ States: guard arms on vad_start while agent audio plays; disarms on vad_stop
 or after firing once. Re-arms fresh for the agent's next reply. tick() returns
 True exactly once per genuine interruption; call.py then cancels TTS, tells the
 client to flush, and truncates the transcript.
+
+"While agent audio plays" means AUDIBLE audio: on_agent_audio_start fires on
+the first frame actually sent (reply.py's _send_audio), not when the reply
+generation starts. Those differ by ~2 s of LLM + TTS work, and arming early
+let caller noise cancel replies that were never heard — a silent, dead-looking
+call. Speech before the first frame is not an interruption; it commits a turn
+and replaces the pending reply through the normal path.
 """
 
 
