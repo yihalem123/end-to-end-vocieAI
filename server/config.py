@@ -20,6 +20,11 @@ class Settings(BaseSettings):
     # "Sarah", a premade voice available to free API accounts. (The classic
     # "Rachel" id is a library voice now — the API rejects it on free tiers.)
     elevenlabs_voice_id: str = "EXAVITQu4vr4xnSDxMaL"
+    # TTS is swappable behind Speaker's synthesize() interface. "aura" rides
+    # the Deepgram key (measured warm ttfb 349-384 ms vs ElevenLabs 472 ms);
+    # "elevenlabs" needs its own key and quota.
+    tts_provider: str = "elevenlabs"
+    aura_model: str = "aura-2-thalia-en"
     turn_model: str = "gpt-5.6-luna"
     flux_eot_threshold: float = 0.85  # higher = more patient with pauses
     flux_eager_eot_threshold: float = 0.6  # early draft; EndOfTurn still commits

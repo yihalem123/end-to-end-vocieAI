@@ -35,6 +35,7 @@ from server.realtime.protocol import encode_audio_frame
 from server.realtime.speaker import Speaker
 from server.realtime.supervisor import GenerationSupervisor, GenerationToken
 from server.realtime.tts import MultiContextTts
+from server.realtime.tts_aura import AuraTts
 
 log = logging.getLogger(__name__)
 
@@ -143,12 +144,17 @@ class ReplyController:
         self._spec: dict | None = None  # in-flight speculative generation
         self._active_voice_generation: int | None = None
         self._browser_turn_anchors: dict[int, float] = {}
-        self._tts: MultiContextTts | None = None
+        self._tts: MultiContextTts | AuraTts | None = None
         self._prewarm: asyncio.Task | None = None
         self._speaker: Speaker | None = None
-        if settings.elevenlabs_api_key:
+        # Providers are interchangeable behind Speaker's synthesize() surface;
+        # TTS_PROVIDER picks one (aura rides the Deepgram key).
+        if settings.tts_provider == "aura" and settings.deepgram_api_key:
+            self._tts = AuraTts(settings.deepgram_api_key, settings.aura_model)
+        elif settings.elevenlabs_api_key:
             self._tts = MultiContextTts(settings.elevenlabs_api_key,
                                         settings.elevenlabs_voice_id)
+        if self._tts is not None:
             self._speaker = Speaker(self._send_audio, self._tts)
             self._prewarm = asyncio.create_task(self._tts.ensure_connected())
         self._filler_idx = 0

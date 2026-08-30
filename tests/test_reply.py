@@ -442,3 +442,34 @@ def test_on_script_speaks_and_finalizes(monkeypatch) -> None:
         assert len([e for e in log if isinstance(e, tuple)]) == 1  # audio released
 
     asyncio.run(run())
+
+
+def test_controller_selects_tts_provider_from_settings(monkeypatch) -> None:
+    from server.config import Settings
+    from server.realtime.tts_aura import AuraTts
+
+    async def no_connect(self) -> None:
+        return None
+
+    monkeypatch.setattr(AuraTts, "ensure_connected", no_connect)
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        settings = Settings(_env_file=None, deepgram_api_key="dg",
+                            tts_provider="aura")
+        controller = reply_module.ReplyController(
+            send, send, settings, SimpleNamespace(conversation=[]))
+        assert isinstance(controller._tts, AuraTts)
+        assert controller._speaker is not None
+        controller._prewarm.cancel()
+
+        # elevenlabs stays the default path when its key is present
+        settings = Settings(_env_file=None, elevenlabs_api_key="el")
+        controller = reply_module.ReplyController(
+            send, send, settings, SimpleNamespace(conversation=[]))
+        assert isinstance(controller._tts, reply_module.MultiContextTts)
+        controller._prewarm.cancel()
+
+    asyncio.run(run())
