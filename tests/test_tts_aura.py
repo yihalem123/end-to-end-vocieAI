@@ -94,6 +94,29 @@ def test_provider_stall_raises_typed_timeout(monkeypatch) -> None:
     asyncio.run(run())
 
 
+def test_provider_trickle_cannot_exceed_total_utterance_timeout(monkeypatch) -> None:
+    from server.realtime import tts_aura
+    monkeypatch.setattr(tts_aura, "AURA_UTTERANCE_TIMEOUT_SEC", 0.03)
+    monkeypatch.setattr(tts_aura, "TTS_CHUNK_TIMEOUT_SEC", 1.0)
+
+    class TricklingWs(ScriptedWs):
+        def __init__(self) -> None:
+            super().__init__([])
+
+        async def recv(self):
+            await asyncio.sleep(0.01)
+            return b"still-going"
+
+    client = _client(TricklingWs())
+
+    async def run() -> None:
+        with pytest.raises(TtsTimeout, match="total timeout"):
+            async for _ in client.synthesize("A provider that never flushes."):
+                pass
+
+    asyncio.run(run())
+
+
 def test_aborted_synthesis_clears_and_releases_after_cleared() -> None:
     # Barge-in: the generator is closed mid-stream. The adapter must send
     # Clear, swallow the utterance's residual audio, and only then free the

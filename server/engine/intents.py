@@ -21,12 +21,26 @@ def classify_end_call_intent(text: str) -> EndCallIntent | None:
     direct = (
         r"\b(?:end|stop) (?:this |the )?(?:call|interview|screening)\b",
         r"\bhang up\b",
-        r"\b(?:do not|don t|no longer) want to continue\b",
-        r"\bi want (?:you )?to (?:end|stop)\b",
-        r"\bplease (?:end|stop)\b",
+        r"\b(?:do not|don t|no longer) want to continue (?:with )?"
+        r"(?:this |the )?(?:call|interview|screening)\b",
+        r"\bi want (?:you )?to (?:end|stop) (?:this |the )?"
+        r"(?:call|interview|screening)\b",
+        r"\bplease (?:end|stop) (?:this |the )?"
+        r"(?:call|interview|screening)\b",
     )
     if normalized == "stop" or any(re.search(pattern, normalized) for pattern in direct):
         return EndCallIntent.END
+
+    # Without an explicit call/interview object these phrases are destructive
+    # ambiguities: "stop working nights" and "continue night shifts" are
+    # ordinary screening answers. Only a complete bare request is confirmable.
+    ambiguous_request = (
+        r"^(?:i )?(?:do not|don t|no longer) want to continue$",
+        r"^i want (?:you )?to (?:end|stop)$",
+        r"^please (?:end|stop)$",
+    )
+    if any(re.fullmatch(pattern, normalized) for pattern in ambiguous_request):
+        return EndCallIntent.CONFIRM
 
     # Narrow phonetic neighborhoods observed in live calls. These only request
     # confirmation; they never terminate by themselves.

@@ -147,11 +147,16 @@ class FakeLlm(reply_module.LlmEngine):
     """isinstance-compatible engine double; no network, records transcripts."""
     def __init__(self):  # parent initialization deliberately skipped
         self.transcripts = []
+        self.extractions = []
         self.last_ttft_ms = None
 
     async def respond(self, transcript, **_kw):
         self.transcripts.append(transcript)
         yield f"Reply to: {transcript}"
+
+    async def extract(self, transcript, **_kw):
+        self.extractions.append(transcript)
+        return []
 
 
 class GatedSpeaker:
@@ -182,6 +187,10 @@ def _controller(events, engine):
     controller._active_voice_generation = None
     controller._audible_generation = None
     controller._browser_turn_anchors = {}
+    controller._committed_turns = set()
+    controller._extraction_tasks = set()
+    controller._extraction_tail = None
+    controller._closed = False
     controller._metric_prefix = ""
     controller._call_id = "test-call"
     controller._state = SimpleNamespace(conversation=[])
@@ -239,6 +248,81 @@ def test_speculation_promotes_without_restart_and_gates_audio(monkeypatch) -> No
         assert released == [("released", turn.commit_t)]  # anchors from the commit
         assert controller._supervisor._next_generation_id == spec_generation  # no restart
         assert controller._state.conversation[0]["text"] == "Spoken reply."
+        assert controller._engine.extractions == ["Hello there."]
+
+    asyncio.run(run())
+
+
+def test_committed_extraction_survives_agent_reply_interruption() -> None:
+    class SlowExtractionLlm(FakeLlm):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.applied = False
+
+        async def extract(self, transcript, **_kw):
+            self.started.set()
+            await self.release.wait()
+            self.applied = True
+            return []
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        engine = SlowExtractionLlm()
+        controller = _controller({"send": send, "log": []}, engine)
+        token = await controller._supervisor.start(
+            8, lambda _owned: asyncio.sleep(10))
+        controller._queue_extraction(token, "Night shifts work for me.")
+        await engine.started.wait()
+
+        # Barge-in invalidates agent playback, not the committed caller turn.
+        await controller._supervisor.cancel_current()
+        engine.release.set()
+        await controller._extraction_tail
+        assert engine.applied is True
+
+    asyncio.run(run())
+
+
+def test_committed_extractions_run_in_caller_turn_order() -> None:
+    class OrderedExtractionLlm(FakeLlm):
+        def __init__(self):
+            super().__init__()
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def extract(self, transcript, **_kw):
+            self.extractions.append(transcript)
+            if transcript == "first answer":
+                self.first_started.set()
+                await self.release_first.wait()
+            return []
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        engine = OrderedExtractionLlm()
+        controller = _controller({"send": send, "log": []}, engine)
+        first = await controller._supervisor.start(
+            10, lambda _owned: asyncio.sleep(10))
+        controller._queue_extraction(first, "first answer")
+        await engine.first_started.wait()
+
+        await controller._supervisor.cancel_current()
+        second = await controller._supervisor.start(
+            11, lambda _owned: asyncio.sleep(10))
+        controller._queue_extraction(second, "second answer")
+        await asyncio.sleep(0)
+        assert engine.extractions == ["first answer"]
+
+        engine.release_first.set()
+        await controller._extraction_tail
+        assert engine.extractions == ["first answer", "second answer"]
+        await controller._supervisor.cancel_current()
 
     asyncio.run(run())
 
@@ -316,9 +400,9 @@ def test_tool_failures_are_returned_to_reply_orchestration() -> None:
             super().__init__()
             self.last_tool_results = []
 
-        async def respond(self, transcript, **_kw):
-            yield "Please clarify."
-            self.last_tool_results = [{
+        async def extract(self, transcript, **_kw):
+            self.extractions.append(transcript)
+            return [{
                 "tool_call_id": "tc1", "name": "record_answer",
                 "applied": False, "reason": "quote not supported",
             }]
@@ -332,8 +416,10 @@ def test_tool_failures_are_returned_to_reply_orchestration() -> None:
         controller = _controller({"send": send, "log": log}, RejectingLlm())
         token = await controller._supervisor.start(7, lambda _owned: asyncio.sleep(10))
         lines = [line async for line in controller._sentences_for(token, "unclear")]
+        controller._queue_extraction(token, "unclear")
+        await controller._extraction_tail
         await controller._supervisor.cancel_current()
-        assert lines == ["Please clarify."]
+        assert lines == ["Reply to: unclear"]
         assert sent[0]["type"] == "tool_failures"
         assert "arguments" not in sent[0]["failures"][0]
 

@@ -411,15 +411,16 @@ class CallSession:
                     await self._send_state()
                     self._close_when_idle = True
                 elif self._replies.interview.done:
-                    # Safety fallback when the model covers every objective but
-                    # omits its end_call tool. The LLM still generated every
-                    # substantive interview question; this is fixed lifecycle
-                    # copy, not a scripted interview step.
-                    await self._finish_interview(
+                    # Speech already responded to the final answer. Extraction
+                    # completing later must close lifecycle state without
+                    # injecting a second, duplicate goodbye.
+                    self._replies.interview.request_end_call(
                         "interview_complete",
-                        "Thanks, that covers everything I needed for this screening.",
-                        self._next_turn_id,
+                        "The interview objectives were completed.",
                     )
+                    self.state.session.transition(SessionStatus.CLOSING)
+                    await self._send_state()
+                    self._close_when_idle = True
                 elif (self._replies.interview.elapsed_seconds >=
                       self._replies.interview.plan.boundaries.max_duration_minutes * 60):
                     await self._finish_interview(

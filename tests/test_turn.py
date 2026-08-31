@@ -300,14 +300,13 @@ def test_ledger_rejects_quote_not_in_committed_utterance() -> None:
     assert results[0]["execution_id"].endswith(":1:2:invented")
 
 
-def test_speculative_engine_waits_for_commit_before_tools_and_history() -> None:
+def test_speculative_engine_waits_for_commit_before_history() -> None:
     engine, state = _engine_with_state()
     gate = asyncio.Event()
 
     async def stream(_body):
-        events = _events_for_tool_call()
-        for event in events:
-            yield "data: " + json.dumps(event)
+        yield ('data: {"type":"response.output_text.delta",'
+               '"delta":"Natural reply."}')
         yield "data: [DONE]"
 
     engine._stream_lines = stream
@@ -315,13 +314,10 @@ def test_speculative_engine_waits_for_commit_before_tools_and_history() -> None:
     async def run() -> None:
         task = asyncio.create_task(_collect())
         await asyncio.sleep(0)
-        assert state.fields == {}
-        assert state.tool_ledger == []
         assert state.recent_history(8) == []
         gate.set()
         lines = await task
-        assert lines
-        assert state.fields["icu_years"].value == 5.0
+        assert lines == ["Natural reply."]
         assert len(state.recent_history(8)) == 2
         await engine.close()
 
@@ -333,13 +329,15 @@ def test_speculative_engine_waits_for_commit_before_tools_and_history() -> None:
     asyncio.run(run())
 
 
-def test_tool_only_response_continues_with_function_output_not_canned_fallback() -> None:
+def test_speech_is_one_tool_free_request_and_extraction_never_gates_it() -> None:
     engine, state = _engine_with_state()
     requests = []
+    release_extraction = asyncio.Event()
 
     async def stream(body):
         requests.append(body)
-        if len(requests) == 1:
+        if "tools" in body:
+            await release_extraction.wait()
             for event in _events_for_tool_call():
                 yield "data: " + json.dumps(event)
         else:
@@ -352,25 +350,29 @@ def test_tool_only_response_continues_with_function_output_not_canned_fallback()
     engine._stream_lines = stream
 
     async def run() -> None:
-        lines = [line async for line in engine.respond(
-            "I have five years", turn_id=4, generation_id=9)]
+        extraction = asyncio.create_task(engine.extract(
+            "I have five years", turn_id=4, generation_id=9))
+        lines = await asyncio.wait_for(_spoken(), timeout=0.2)
         assert lines == [
             "Five years gives me useful context.",
             "What kinds of ICU patients have you worked with most recently?",
         ]
+        assert state.fields == {}, "background extraction is still deliberately blocked"
+        release_extraction.set()
+        results = await extraction
         assert state.fields["icu_years"].value == 5.0
         assert len(requests) == 2
-        continuation_items = requests[1]["input"]
-        assert any(item.get("type") == "function_call"
-                   for item in continuation_items)
-        outputs = [item for item in continuation_items
-                   if item.get("type") == "function_call_output"]
-        assert len(outputs) == 1
-        assert json.loads(outputs[0]["output"])["applied"] is True
-        assert requests[1]["tools"] == TOOLS
-        assert requests[1]["tool_choice"] == "none"
+        speech_request = next(body for body in requests if "tools" not in body)
+        extraction_request = next(body for body in requests if "tools" in body)
+        assert "tool_choice" not in speech_request
+        assert extraction_request["tools"] == TOOLS
+        assert results[0]["applied"] is True
         assert "tell me a little more" not in " ".join(lines).lower()
         await engine.close()
+
+    async def _spoken() -> list[str]:
+        return [line async for line in engine.respond(
+            "I have five years", turn_id=4, generation_id=9)]
 
     asyncio.run(run())
 
@@ -395,6 +397,7 @@ def test_response_request_has_cache_key_low_verbosity_and_real_text_ttft() -> No
         assert engine.last_ttft_ms is not None
         assert engine.last_cached_tokens == 42
         assert captured["prompt_cache_key"].startswith("screener-")
+        assert "tools" not in captured
         # verbosity "low" was reverted after a live A/B: it suppressed
         # record_answer diligence (fields went unrecorded; re-ask loop).
         assert "verbosity" not in captured.get("text", {})

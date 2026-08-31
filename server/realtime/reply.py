@@ -96,6 +96,12 @@ class ReplyController:
         self._active_voice_generation: int | None = None
         self._audible_generation: int | None = None
         self._browser_turn_anchors: dict[int, float] = {}
+        # Evidence extraction is owned by committed caller turns, not agent
+        # playback. Requests apply in turn order and never gate speech.
+        self._committed_turns: set[int] = set()
+        self._extraction_tasks: set[asyncio.Task] = set()
+        self._extraction_tail: asyncio.Task | None = None
+        self._closed = False
         self._tts: MultiContextTts | AuraTts | None = None
         self._prewarm: asyncio.Task | None = None
         self._speaker: Speaker | None = None
@@ -150,19 +156,6 @@ class ReplyController:
                 if not is_current():
                     return
                 yield sentence
-            failures = [
-                {"tool_call_id": result.get("tool_call_id"),
-                 "name": result.get("name"), "reason": result.get("reason")}
-                for result in getattr(self._engine, "last_tool_results", [])
-                if (not result.get("applied")
-                    and not str(result.get("reason", "")).startswith("duplicate"))
-            ]
-            if failures and is_current():
-                await self._send({
-                    "type": "tool_failures", "turn_id": token.turn_id,
-                    "generation_id": token.generation_id,
-                    "failures": failures,
-                })
         else:
             for sentence in self._engine.reply(transcript):
                 if not is_current():
@@ -188,18 +181,21 @@ class ReplyController:
             self._drained[token.generation_id] = asyncio.Event()
             self._active_voice_generation = token.generation_id
             self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
+            self._queue_extraction(token, turn.transcript)
             spec["release"].set()
             return
         await self._replace_current()
         if self._speaker is None:
-            await self._supervisor.start(
+            token = await self._supervisor.start(
                 turn_id, lambda token: self._reply_text_only(token, turn.transcript))
+            self._queue_extraction(token, turn.transcript)
             return
         token = await self._supervisor.start(
             turn_id, lambda owned: self._speak_reply(owned, turn))
         self._drained[token.generation_id] = asyncio.Event()
         self._active_voice_generation = token.generation_id
         self._remember_browser_anchor(token.generation_id, turn.vad_stop_t)
+        self._queue_extraction(token, turn.transcript)
 
     async def _speak_reply(self, token: GenerationToken, turn: TurnComplete) -> None:
         sentences = self._voiced_sentences(token, turn.transcript)
@@ -341,16 +337,77 @@ class ReplyController:
 
     async def on_chat(self, text: str, turn_id: int) -> None:
         await self._replace_current()
-        await self._supervisor.start(
+        token = await self._supervisor.start(
             turn_id, lambda token: self._reply_text_only(token, text))
+        self._queue_extraction(token, text)
+
+    def _queue_extraction(self, token: GenerationToken, transcript: str) -> None:
+        """Run provisional evidence extraction beside speech, in turn order.
+
+        Only committed turns reach this method. Once committed, their evidence
+        remains valid even if the caller interrupts the agent's reply, so the
+        validity check is intentionally separate from GenerationSupervisor.
+        """
+        if not isinstance(self._engine, LlmEngine) or self._closed:
+            return
+        if token.turn_id in self._committed_turns:
+            return
+        self._committed_turns.add(token.turn_id)
+        if self.interview is not None:
+            self.interview.add_history("user", transcript)
+        previous = self._extraction_tail
+
+        def is_valid() -> bool:
+            return not self._closed and token.turn_id in self._committed_turns
+
+        async def run() -> None:
+            if previous is not None:
+                try:
+                    await previous
+                except asyncio.CancelledError:
+                    if self._closed:
+                        return
+                except Exception:
+                    # The prior runner normally contains its own failures. Keep
+                    # later committed evidence moving if it failed unexpectedly.
+                    pass
+            if not is_valid():
+                return
+            try:
+                results = await self._engine.extract(
+                    transcript, is_valid=is_valid, turn_id=token.turn_id,
+                    generation_id=token.generation_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("background evidence extraction failed")
+                return
+            failures = [
+                {"tool_call_id": result.get("tool_call_id"),
+                 "name": result.get("name"), "reason": result.get("reason")}
+                for result in results
+                if (not result.get("applied")
+                    and not str(result.get("reason", "")).startswith("duplicate"))
+            ]
+            if failures and is_valid():
+                await self._send({
+                    "type": "tool_failures", "turn_id": token.turn_id,
+                    "generation_id": token.generation_id,
+                    "failures": failures,
+                })
+
+        task = asyncio.create_task(run())
+        self._extraction_tail = task
+        self._extraction_tasks.add(task)
+        task.add_done_callback(self._extraction_tasks.discard)
 
     # --- barge-in ---
 
     async def speculate(self, transcript: str, turn_id: int) -> None:
         """Start LLM+TTS for the expected turn BEFORE the endpointer commits.
-        Safe by construction: audio is release-gated, tools apply only at
-        stream end under an is_current check, and the supervisor cancels the
-        generation if the caller resumes or the transcript changes."""
+        Audio is release-gated and the supervisor cancels the generation if the
+        caller resumes or the transcript changes. Speculation cannot extract or
+        mutate evidence; extraction begins only after this draft is promoted."""
         if self._speaker is None or not isinstance(self._engine, LlmEngine):
             return
         if self._spec is not None:
@@ -464,6 +521,15 @@ class ReplyController:
         await self._send({"type": "error", "message": "playback buffer overflow"})
 
     async def close(self) -> None:
+        self._closed = True
+        for task in tuple(self._extraction_tasks):
+            if not task.done():
+                task.cancel()
+        if self._extraction_tasks:
+            await asyncio.gather(*tuple(self._extraction_tasks),
+                                 return_exceptions=True)
+        self._extraction_tasks.clear()
+        self._extraction_tail = None
         await self._supervisor.close()
         self.guard.on_agent_audio_end()
         if self._prewarm is not None:

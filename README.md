@@ -2,7 +2,7 @@
 
 A local browser Voice AI prototype built with **no voice platform and no agent framework**:
 browser mic → WebSocket → FastAPI → VAD → streaming ASR (Deepgram)
-→ bounded objective engine (OpenAI, streaming + tools) → streaming TTS (Deepgram
+→ bounded objective engine (OpenAI, speech + concurrent extraction) → streaming TTS (Deepgram
 Aura or ElevenLabs, selectable via `TTS_PROVIDER`) → back to the caller.
 Includes barge-in, per-turn latency metrics, post-call evidence extraction, and deterministic scoring.
 
@@ -23,9 +23,11 @@ uvicorn server.app:app --reload --port 8080
 browser mic ──ws──▶ /ws/call ─▶ recv → VAD ─▶ ASR task (Deepgram ws) ─▶ endpointer
                                                                           │ turn_complete
                                                                           ▼
-        audio ◀── TTS task (ElevenLabs) ◀── sentence chunker ◀── engine (OpenAI stream + tools)
+        audio ◀── TTS task ◀── sentence chunker ◀── tool-free OpenAI speech stream
+                                                     └── committed-turn extraction tools
         generation supervisor invalidates, cancels, and awaits before replacement
-        speculative audio + tools + history share one promotion/ownership gate
+        speculative speech/audio are promotion-gated; extraction starts only on commit
+        committed caller evidence applies in turn order and never gates speech
         reliable events outrank one replaceable latest-partial slot
         bounded playback acks clear/drained/overflow with the same generation id
         on hangup → caller-utterance evidence verification → deterministic score/report
@@ -33,8 +35,10 @@ browser mic ──ws──▶ /ws/call ─▶ recv → VAD ─▶ ASR task (Deep
 
 The ONNX VAD session is process-shared, while recurrent state, context, frame
 carry, gate state, and reset lifetime are owned by each call. Reply generations
-are per-call and monotonic: stale audio, tool effects, transcript updates, and
-delayed playback acknowledgements are rejected by ownership checks.
+are per-call and monotonic: stale audio, transcript updates, and delayed playback
+acknowledgements are rejected by ownership checks. Evidence extraction belongs
+to immutable committed caller turns, so interrupting agent playback cannot erase
+a real answer; speculative text can never mutate evidence.
 
 Each WebSocket receives one stable call ID and follows an explicit consent-first
 session lifecycle. The agent initiates with truthful transcription/analysis
@@ -53,7 +57,8 @@ The YAML plan contains evidence objectives, time/turn limits, and prohibited
 topics—not interview question text. The LLM responds to the caller's intent and
 uses those objectives as coverage goals rather than a questionnaire; it owns
 wording, order, clarifications, and contextual follow-ups. Validated
-`record_answer` and `end_call` tools keep evidence and lifecycle state
+`record_answer` and `end_call` tools run concurrently as provisional extraction,
+so they never delay caller-facing speech while evidence and lifecycle state stay
 backend-owned. Explicit stop requests
 bypass ordinary dialogue generation; a narrow ASR-confusion path asks for
 confirmation rather than continuing the interview or hanging up speculatively.
@@ -64,7 +69,7 @@ first_audio, turn_latency (p50/p95), prompt-cache tokens, barge-ins, turns.
 Measured results and their history: see `REHEARSAL.md`.
 
 ## Verification
-`python -m pytest -q` — 252 offline tests (no vendor calls; the browser capture
+`python -m pytest -q` — 264 offline tests (no vendor calls; the browser capture
 worklet runs as real JS under Node, since no Python test can reach it).
 `python scripts/simulate_caller.py [--flux]` — live end-to-end gate: a synthesized
 rambling caller with mid-thought pauses asserts turn integrity, extraction, and

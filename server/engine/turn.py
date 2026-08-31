@@ -1,4 +1,4 @@
-"""One bounded, goal-driven engine turn: Responses stream -> tools -> speech.
+"""One bounded, goal-driven turn: speech now, provisional extraction alongside.
 
 ## How this works
 We speak the Responses API over raw SSE (httpx) — consistent with the project's
@@ -8,11 +8,11 @@ raw-protocol ethos, and the typed events are the whole lesson:
   response.function_call_arguments.delta/.done -> its JSON args accumulate/finish
 StreamAssembler turns that event soup into text deltas + completed ToolCalls.
 
-Tool calls are validated by the backend and their outputs are returned to the
-model when it emitted no speech. That continuation is essential: a tool-only
-Responses turn is an intermediate function-calling step, not a complete spoken
-reply. These live captures are provisional interview memory only; post-call
-caller-utterance verification is the sole authority for scores and knockouts.
+The caller-facing request has no tools, so its first text can stream directly to
+TTS. A separate extraction request runs concurrently after the caller turn is
+committed and may call record_answer/end_call without gating speech. These live
+captures are provisional interview memory only; post-call caller-utterance
+verification is the sole authority for scores and knockouts.
 
 LlmEngine.respond() is an async generator of SENTENCES: text deltas stream into
 the chunker (abbreviation + decimal guards) and each complete sentence is
@@ -194,7 +194,7 @@ class StreamAssembler:
 
 
 def fallback_line(state: InterviewState) -> str:
-    """Last-resort speech if both model passes produce no caller-facing text."""
+    """Last-resort speech if the dialogue request produces no text."""
     if state.end_call_request is not None:
         return state.end_call_request.closing_message
     if state.remaining:
@@ -238,18 +238,40 @@ Rules:
 - Ask ONE concise question at a time. Keep speech to one or two short sentences.
 - Avoid empty acknowledgements such as "Okay", "Got it", or "Alright". Only
   acknowledge something when the acknowledgement adds useful meaning.
-- ALWAYS include a spoken reply for the caller. Never respond with only tool
-  calls — a silent turn is a broken phone call.
-- Every time the caller answers, call record_answer with the field name, the
-  answer, and their VERBATIM words as the quote. If they volunteer other
-  fields' answers, record those too.
-- If the caller asks to stop, speak only a brief goodbye and call end_call with
-  reason candidate_requested. Do not ask another interview question.
-- When every objective is covered, briefly close and call end_call with reason
-  interview_complete.
+- ALWAYS provide a spoken reply for the caller. This request has no tools.
+- Treat information in the latest caller message as already known when choosing
+  your reply, even if it still appears in the missing-objectives state block.
+  Never re-ask for information the caller just supplied.
+- If the latest message appears to satisfy the final missing objective, close
+  naturally without asking another question; the backend verifies coverage.
+- If the caller asks to stop, speak only a brief goodbye. Do not ask another
+  interview question.
+- When every objective is covered, briefly close without another question.
 - Never invent answers. Never promise pay, benefits, or hiring decisions.
 - A system message states what is established and what remains; it never gives
   you a required question or question order."""
+
+
+def build_extraction_instructions(plan) -> str:
+    """Static prompt for the non-speaking provisional evidence pass."""
+    objectives = "\n".join(
+        f"- {s.field} ({s.type}): {s.objective}" for s in plan.steps)
+    return f"""Extract provisional interview evidence. Produce no spoken reply.
+
+Evidence objectives:
+{objectives}
+
+Rules:
+- Call record_answer for every objective supported by the caller's verbatim
+  words. Use the exact supported words as quote; never infer unsupported facts.
+- The latest caller message may answer multiple objectives. Record each one.
+- Do not call record_answer for uncertainty or an unanswered objective.
+- Call end_call with candidate_requested only for an explicit request to end
+  the call, interview, or screening.
+- After recording evidence, call end_call with interview_complete only when all
+  objectives are covered. Call it with limit_reached only when the supplied
+  runtime budget says a limit is reached.
+- Output tool calls only. Backend validation is authoritative."""
 
 
 def build_state_block(state: InterviewState) -> str:
@@ -269,7 +291,7 @@ def build_state_block(state: InterviewState) -> str:
     elif turns_left == 0 or seconds_left == 0:
         objective = (
             "The interview limit is reached. Ask no question. Give a brief "
-            "closing statement and call end_call with reason limit_reached.")
+            "closing statement; the backend owns the lifecycle transition.")
     elif state.remaining:
         objective = (
             "Treat the missing evidence as coverage goals, not a questionnaire. "
@@ -279,7 +301,7 @@ def build_state_block(state: InterviewState) -> str:
     else:
         objective = (
             "All evidence objectives are covered. Give a brief closing statement "
-            "and call end_call with reason interview_complete.")
+            "without another question; the backend owns lifecycle state.")
     return f"""Recorded so far:
 {filled}
 Evidence objectives still missing:
@@ -294,6 +316,19 @@ def build_system_prompt(state: InterviewState) -> str:
     """Composition kept for tests and offline inspection; the live request
     sends the two halves separately for cacheability."""
     return build_instructions(state.plan) + "\n\n" + build_state_block(state)
+
+
+def _turn_input(state: InterviewState, user_text: str) -> list[dict[str, str]]:
+    """Bounded history plus the latest caller message, without duplication.
+
+    ReplyController journals committed caller turns immediately. Direct engine
+    callers and speculative drafts do not, so they still need the explicit item.
+    """
+    history = state.recent_history(8)
+    if (history and history[-1].get("role") == "user"
+            and history[-1].get("content") == user_text):
+        return history
+    return history + [{"role": "user", "content": user_text}]
 
 
 class LlmEngine:
@@ -337,21 +372,19 @@ class LlmEngine:
         generation_id: int | None = None,
         commit_gate: asyncio.Event | None = None,
     ) -> AsyncIterator[str]:
-        """Yield reply sentences as they stream; apply tool calls as they land."""
+        """Stream caller-facing speech from exactly one tool-free request."""
         current = is_current or (lambda: True)
         if not current():
             return
         state = self.state
         request_input = ([{"role": "system", "content": build_state_block(state)}]
-                         + state.recent_history(8)
-                         + [{"role": "user", "content": user_text}])
+                         + _turn_input(state, user_text))
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             # Static prefix in instructions (cache-friendly); per-turn state
             # rides as a system input message ahead of the history window.
             "instructions": build_instructions(state.plan),
             "input": request_input,
-            "tools": TOOLS,
             "stream": True,
             "store": False,
             "prompt_cache_key": "screener-" + hashlib.sha256(
@@ -360,10 +393,6 @@ class LlmEngine:
         }
         if self._settings.turn_model.startswith("gpt-5"):
             body["reasoning"] = {"effort": "none"}  # TTFT is dominated by effort
-        # NOTE: verbosity "low" was trialed here per the model guide and
-        # reverted after a live A/B: it suppressed record_answer diligence
-        # (shift_availability never recorded across four asks; loop). Short
-        # replies are already enforced by the prompt's one-question rule.
         chunker = SentenceChunker()
         assembler = StreamAssembler()
         reply_parts: list[str] = []
@@ -392,100 +421,74 @@ class LlmEngine:
         tail = chunker.flush()
         if tail:
             yield tail
-        if commit_gate is not None:
-            # Speculation is pure computation until the caller turn commits.
-            # Cancellation while waiting discards every pending side effect.
-            await commit_gate.wait()
-        if not current():
-            return
-        # Apply validated side effects only after speculative ownership commits.
-        self.last_tool_results = self._apply_tools(
-            assembler.tool_calls, current, turn_id=turn_id,
-            generation_id=generation_id, source_text=user_text)
-        if not current():
-            return
-        if not "".join(reply_parts).strip() and assembler.tool_calls:
-            if state.end_call_request is not None:
-                # end_call already carries its short, model-authored closing.
-                line = state.end_call_request.closing_message
-                reply_parts.append(line)
-                yield line
-            else:
-                # Responses function calling is request -> call -> output ->
-                # response. A tool-only first pass expects this continuation;
-                # canned speech here made the agent appear scripted.
-                by_call_id = {
-                    item.get("tool_call_id"): item
-                    for item in self.last_tool_results
-                }
-                tool_exchange: list[dict[str, Any]] = []
-                for call in assembler.tool_calls:
-                    args = call.arguments if call.arguments is not None else {}
-                    tool_exchange.append({
-                        "type": "function_call", "call_id": call.call_id,
-                        "name": call.name,
-                        "arguments": json.dumps(args, separators=(",", ":")),
-                    })
-                for call in assembler.tool_calls:
-                    result = by_call_id.get(call.call_id, {})
-                    tool_exchange.append({
-                        "type": "function_call_output", "call_id": call.call_id,
-                        "output": json.dumps({
-                            "applied": bool(result.get("applied")),
-                            "reason": result.get("reason") or "recorded",
-                        }, separators=(",", ":")),
-                    })
-                continuation = dict(body)
-                # Keep the same tool definitions in context as prescribed by
-                # the Responses flow, but force this bounded continuation to
-                # produce caller-facing speech rather than start another loop.
-                continuation["tool_choice"] = "none"
-                continuation["input"] = request_input + tool_exchange + [{
-                    "role": "system",
-                    "content": (
-                        build_state_block(state)
-                        + "\nNow give the caller a natural spoken response to their "
-                          "latest message. Do not mention tools or internal fields."
-                    ),
-                }]
-                next_chunker = SentenceChunker()
-                next_assembler = StreamAssembler()
-                async for line in self._stream_lines(continuation):
-                    if not line.startswith("data:"):
-                        continue
-                    payload = line[5:].strip()
-                    if payload == "[DONE]":
-                        break
-                    deltas = next_assembler.feed(json.loads(payload))
-                    if deltas and self.last_ttft_ms is None:
-                        self.last_ttft_ms = (time.monotonic() - t0) * 1000
-                    for delta in deltas:
-                        if not current():
-                            return
-                        reply_parts.append(delta)
-                        for sentence in next_chunker.push(delta):
-                            yield sentence
-                if not current():
-                    return
-                next_tail = next_chunker.flush()
-                if next_tail:
-                    yield next_tail
-                if next_assembler.usage:
-                    assembler.usage = next_assembler.usage
         if not "".join(reply_parts).strip():
             line = fallback_line(state)
             reply_parts.append(line)
             yield line
+        if commit_gate is not None:
+            # Speculative speech/TTS may run warm, but history cannot persist
+            # until the guessed caller turn really commits.
+            await commit_gate.wait()
         if not current():
             return
-        # Persisted only now, under the same ownership gate as the tools: a
-        # discarded speculative generation leaves no phantom history entries.
-        state.add_history("user", user_text)
+        # Persisted only under reply ownership: a discarded speculative
+        # generation leaves no phantom history entries.
+        if (not state.history or state.history[-1].get("role") != "user"
+                or state.history[-1].get("content") != user_text):
+            state.add_history("user", user_text)
         state.add_history("assistant", "".join(reply_parts))
         details = (assembler.usage.get("input_tokens_details")
                    or assembler.usage.get("prompt_tokens_details") or {})
         self.last_cached_tokens = int(details.get("cached_tokens") or 0)
         self.last_cache_write_tokens = int(details.get("cache_write_tokens") or 0)
+
+    async def extract(
+        self,
+        user_text: str,
+        is_valid: Callable[[], bool] | None = None,
+        turn_id: int | None = None,
+        generation_id: int | None = None,
+    ) -> list[dict]:
+        """Extract provisional evidence without delaying caller-facing speech.
+
+        Callers invoke this only for a committed caller turn. `is_valid` is
+        turn ownership, deliberately independent of agent playback ownership:
+        interrupting Sarah must not erase evidence the caller already supplied.
+        """
+        valid = is_valid or (lambda: True)
+        if not valid():
+            return []
+        state = self.state
+        instructions = build_extraction_instructions(state.plan)
+        body: dict[str, Any] = {
+            "model": self._settings.turn_model,
+            "instructions": instructions,
+            "input": ([{"role": "system", "content": build_state_block(state)}]
+                      + _turn_input(state, user_text)),
+            "tools": TOOLS,
+            "stream": True,
+            "store": False,
+            "prompt_cache_key": "screener-extract-" + hashlib.sha256(
+                instructions.encode("utf-8")
+            ).hexdigest()[:24],
+        }
+        if self._settings.turn_model.startswith("gpt-5"):
+            body["reasoning"] = {"effort": "none"}
+        assembler = StreamAssembler()
+        async for line in self._stream_lines(body):
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            assembler.feed(json.loads(payload))
+        if not valid():
+            return []
+        results = self._apply_tools(
+            assembler.tool_calls, valid, turn_id=turn_id,
+            generation_id=generation_id, source_text=user_text)
+        self.last_tool_results = results
+        return results
 
     def _apply_tools(
         self,

@@ -45,7 +45,8 @@ _TRAILING_WORDS = frozenset(
 _TRAILING_CONTRACTIONS = frozenset({
     "i'm", "im", "it's", "its", "we're", "were", "they're", "theyre",
     "you're", "youre", "i've", "ive", "we've", "weve", "i'd", "id",
-    "we'd", "wed", "can't", "cant", "don't", "dont",
+    "we'd", "wed", "can't", "cant", "don't", "dont", "that's", "thats",
+    "there's", "theres", "he's", "hes", "she's", "shes",
 })
 
 

@@ -98,6 +98,17 @@ def test_dangling_contraction_gets_extra_patience() -> None:
     assert turn is not None and turn.reason == "trailing"
 
 
+def test_other_dangling_contractions_get_extra_patience() -> None:
+    for ending in ("that's", "there's", "he's", "she's"):
+        ep = make()
+        ep.on_vad_start(t=0.0)
+        ep.on_asr_final(f"I think {ending}", t=1.0)
+        ep.on_vad_stop(t=1.0)
+        assert ep.tick(t=1.0 + SLOW + 0.1) is None
+        turn = ep.tick(t=1.0 + TRAILING + 0.01)
+        assert turn is not None and turn.reason == "trailing"
+
+
 def test_trailing_comma_gets_extra_patience() -> None:
     # Live regression (2026-08-30 #2): "Yeah. I mean," was committed at the
     # slow tier — but a trailing comma is the strongest "still going" cue.
