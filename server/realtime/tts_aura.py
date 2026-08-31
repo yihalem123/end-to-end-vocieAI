@@ -17,6 +17,7 @@ raises TtsNoAudio (an exhausted quota must fail loud, not ship a silent call).
 import asyncio
 import json
 import logging
+import time
 from contextlib import suppress
 from typing import AsyncIterator
 from urllib.parse import urlencode
@@ -33,7 +34,7 @@ from server.realtime.tts import (
 log = logging.getLogger(__name__)
 
 RECLAIM_TIMEOUT_SEC = 3  # max wait for Cleared while flushing stale audio
-AURA_UTTERANCE_TIMEOUT_SEC = 15  # total cap; trickling chunks cannot run forever
+AURA_RECEIVE_WAIT_BUDGET_SEC = 15  # cumulative provider wait; excludes pacing
 
 
 def build_aura_url(model: str) -> str:
@@ -68,39 +69,48 @@ class AuraTts:
         release_here = True
         try:
             try:
-                try:
-                    async with asyncio.timeout(AURA_UTTERANCE_TIMEOUT_SEC):
-                        await self._send_utterance(text)
-                        yielded_any = False
-                        while True:
-                            try:
-                                msg = await asyncio.wait_for(
-                                    self._ws.recv(), timeout=TTS_CHUNK_TIMEOUT_SEC)
-                            except TimeoutError as exc:
-                                await self._drop_connection()  # stream state unknown
-                                raise TtsTimeout(
-                                    f"no aura audio within {TTS_CHUNK_TIMEOUT_SEC}s"
-                                ) from exc
-                            if isinstance(msg, bytes):
-                                yielded_any = True
-                                yield msg
-                                continue
-                            event = json.loads(msg)
-                            if event.get("type") == "Flushed":
-                                if not yielded_any:
-                                    raise TtsNoAudio(
-                                        "aura flushed with zero audio "
-                                        "(quota exhausted or provider rejection)")
-                                return
-                            if event.get("type") == "Warning":
-                                log.warning("aura warning: %s",
-                                            event.get("description"))
-                except TimeoutError as exc:
-                    await self._drop_connection()
-                    raise TtsTimeout(
-                        "aura utterance exceeded total timeout of "
-                        f"{AURA_UTTERANCE_TIMEOUT_SEC}s"
-                    ) from exc
+                await self._send_utterance(text)
+                yielded_any = False
+                receive_wait_sec = 0.0
+                while True:
+                    remaining = AURA_RECEIVE_WAIT_BUDGET_SEC - receive_wait_sec
+                    if remaining <= 0:
+                        await self._drop_connection()
+                        raise TtsTimeout(
+                            "aura exceeded cumulative receive-wait budget of "
+                            f"{AURA_RECEIVE_WAIT_BUDGET_SEC}s")
+                    budget_limited = remaining <= TTS_CHUNK_TIMEOUT_SEC
+                    started = time.monotonic()
+                    try:
+                        msg = await asyncio.wait_for(
+                            self._ws.recv(),
+                            timeout=min(TTS_CHUNK_TIMEOUT_SEC, remaining),
+                        )
+                    except TimeoutError as exc:
+                        await self._drop_connection()  # stream state unknown
+                        if budget_limited:
+                            raise TtsTimeout(
+                                "aura exceeded cumulative receive-wait budget of "
+                                f"{AURA_RECEIVE_WAIT_BUDGET_SEC}s"
+                            ) from exc
+                        raise TtsTimeout(
+                            f"no aura audio within {TTS_CHUNK_TIMEOUT_SEC}s"
+                        ) from exc
+                    receive_wait_sec += time.monotonic() - started
+                    if isinstance(msg, bytes):
+                        yielded_any = True
+                        yield msg
+                        continue
+                    event = json.loads(msg)
+                    if event.get("type") == "Flushed":
+                        if not yielded_any:
+                            raise TtsNoAudio(
+                                "aura flushed with zero audio "
+                                "(quota exhausted or provider rejection)")
+                        return
+                    if event.get("type") == "Warning":
+                        log.warning("aura warning: %s",
+                                    event.get("description"))
             except (asyncio.CancelledError, GeneratorExit):
                 # Aborted mid-utterance (barge-in): hand the lock to a reclaim
                 # task that scrubs the stream, then let the abort propagate.

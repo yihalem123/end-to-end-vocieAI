@@ -94,9 +94,9 @@ def test_provider_stall_raises_typed_timeout(monkeypatch) -> None:
     asyncio.run(run())
 
 
-def test_provider_trickle_cannot_exceed_total_utterance_timeout(monkeypatch) -> None:
+def test_provider_trickle_cannot_exceed_receive_wait_budget(monkeypatch) -> None:
     from server.realtime import tts_aura
-    monkeypatch.setattr(tts_aura, "AURA_UTTERANCE_TIMEOUT_SEC", 0.03)
+    monkeypatch.setattr(tts_aura, "AURA_RECEIVE_WAIT_BUDGET_SEC", 0.03)
     monkeypatch.setattr(tts_aura, "TTS_CHUNK_TIMEOUT_SEC", 1.0)
 
     class TricklingWs(ScriptedWs):
@@ -110,9 +110,29 @@ def test_provider_trickle_cannot_exceed_total_utterance_timeout(monkeypatch) -> 
     client = _client(TricklingWs())
 
     async def run() -> None:
-        with pytest.raises(TtsTimeout, match="total timeout"):
+        with pytest.raises(TtsTimeout, match="receive-wait budget"):
             async for _ in client.synthesize("A provider that never flushes."):
                 pass
+
+    asyncio.run(run())
+
+
+def test_slow_consumer_pacing_does_not_spend_provider_wait_budget(
+    monkeypatch,
+) -> None:
+    """Speaker deliberately paces PCM after each yield; that is not a stall."""
+    from server.realtime import tts_aura
+    monkeypatch.setattr(tts_aura, "AURA_RECEIVE_WAIT_BUDGET_SEC", 0.02)
+    monkeypatch.setattr(tts_aura, "TTS_CHUNK_TIMEOUT_SEC", 1.0)
+    ws = ScriptedWs([b"one", b"two", json.dumps({"type": "Flushed"})])
+    client = _client(ws)
+
+    async def run() -> None:
+        chunks = []
+        async for chunk in client.synthesize("A healthy long utterance."):
+            chunks.append(chunk)
+            await asyncio.sleep(0.03)  # longer than the entire provider budget
+        assert chunks == [b"one", b"two"]
 
     asyncio.run(run())
 
