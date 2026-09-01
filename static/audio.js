@@ -402,6 +402,11 @@ window.addEventListener("DOMContentLoaded", () => {
   els.agentPartialCard = agentGhost;
   els.agentPartialText = agentGhost.querySelector("#agentPartialText");
 
+  // Ask the server to open a TTS socket now. Connecting measured a median
+  // ~2.4 s and is otherwise paid on the greeting — the first thing the caller
+  // hears. Best effort: if it fails the call just connects on demand.
+  fetch("/prewarm", { method: "POST" }).catch(() => {});
+
   buildLatencyCards();
   els.btn.addEventListener("click", () =>
     start().catch((err) => addLine("system", `mic failed: ${err.message}`, "error")));

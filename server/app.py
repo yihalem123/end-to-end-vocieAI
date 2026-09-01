@@ -24,7 +24,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from server.config import Settings, get_settings
@@ -38,6 +38,7 @@ from server.postcall.report import (
 from server.engine.plan import load_plan_cached
 from server.realtime.call import CallSession
 from server.realtime.session import SessionStatus
+from server.realtime import tts_aura
 from server.realtime.vad import SileroRuntime
 
 _postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
@@ -69,9 +70,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         log.info("startup warm: plan %r validated, vad runtime loaded",
                  resolved.plan_path)
         yield
+        await tts_aura.warm_sockets.close()
 
     app = FastAPI(title="screener", lifespan=lifespan)
     app.state.settings = resolved
+
+    @app.post("/prewarm", status_code=204)
+    async def prewarm() -> Response:
+        """Open a TTS socket before a call exists.
+
+        The console calls this on page load: the Aura connect measured a median
+        2377 ms and is otherwise paid on the greeting, the first thing anyone
+        hears. Fire-and-forget — a failed warm just means the call connects on
+        demand, exactly as it did before."""
+        if resolved.tts_provider == "aura" and resolved.deepgram_api_key:
+            tts_aura.warm_sockets.prewarm(
+                tts_aura.build_aura_url(resolved.aura_model),
+                resolved.deepgram_api_key)
+        return Response(status_code=204)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:

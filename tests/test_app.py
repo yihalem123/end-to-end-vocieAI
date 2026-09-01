@@ -89,3 +89,54 @@ def test_console_assets_are_never_cached() -> None:
             resp = client.get(path)
             assert resp.status_code == 200, path
             assert "no-store" in resp.headers.get("cache-control", ""), path
+
+
+def test_prewarm_endpoint_opens_a_speak_socket_ahead_of_the_call() -> None:
+    # The Aura connect measured a median 2377 ms and is paid on a call's FIRST
+    # utterance — the greeting. The console calls this on page load so that
+    # cost lands before anyone clicks "Start session".
+    from server.realtime import tts_aura
+
+    calls: list[tuple[str, str]] = []
+
+    class Recorder:
+        def prewarm(self, url: str, api_key: str) -> None:
+            calls.append((url, api_key))
+
+        async def close(self) -> None:   # released by the app lifespan
+            pass
+
+    original = tts_aura.warm_sockets
+    tts_aura.warm_sockets = Recorder()
+    try:
+        settings = Settings(_env_file=None, deepgram_api_key="dg",
+                            tts_provider="aura")
+        with TestClient(create_app(settings)) as client:
+            assert client.post("/prewarm").status_code == 204
+        assert len(calls) == 1
+        assert "/v1/speak" in calls[0][0] and calls[0][1] == "dg"
+    finally:
+        tts_aura.warm_sockets = original
+
+
+def test_prewarm_is_a_no_op_without_the_aura_provider() -> None:
+    from server.realtime import tts_aura
+
+    calls: list = []
+
+    class Recorder:
+        def prewarm(self, url: str, api_key: str) -> None:
+            calls.append(url)
+
+        async def close(self) -> None:
+            pass
+
+    original = tts_aura.warm_sockets
+    tts_aura.warm_sockets = Recorder()
+    try:
+        settings = Settings(_env_file=None, elevenlabs_api_key="el")
+        with TestClient(create_app(settings)) as client:
+            assert client.post("/prewarm").status_code == 204
+        assert calls == []            # nothing to warm for this provider
+    finally:
+        tts_aura.warm_sockets = original

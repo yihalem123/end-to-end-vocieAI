@@ -244,3 +244,109 @@ def test_cancellation_during_connect_does_not_crash_the_reclaim() -> None:
         assert client._reclaim_task is None
 
     asyncio.run(run())
+
+
+# --- warm socket cache: keep the ~2.4 s connect off the first utterance ---
+
+class FakeSocket:
+    def __init__(self) -> None:
+        self.close_code = None
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+        self.close_code = 1000
+
+
+def _cache(**kw):
+    from server.realtime.tts_aura import WarmSocketCache
+    made: list[FakeSocket] = []
+
+    async def connect(_url, _key):
+        made.append(FakeSocket())
+        return made[-1]
+
+    return WarmSocketCache(connect=connect, **kw), made
+
+
+def test_warm_socket_is_handed_over_once() -> None:
+    async def run() -> None:
+        cache, made = _cache()
+        cache.prewarm("wss://a", "key")
+        await asyncio.sleep(0)
+        assert await cache.take("wss://a") is made[0]
+        assert await cache.take("wss://a") is None   # handed over, not shared
+        await cache.close()
+
+    asyncio.run(run())
+
+
+def test_stale_warm_socket_is_closed_rather_than_handed_over() -> None:
+    # Measured: an idle speak stream's first byte degrades (364 ms fresh vs
+    # 614 ms after 25 s), so an old socket is worse than a fresh connect.
+    async def run() -> None:
+        cache, made = _cache(max_age_sec=0.0)
+        cache.prewarm("wss://a", "key")
+        await asyncio.sleep(0)
+        assert await cache.take("wss://a") is None
+        assert made[0].closed
+        await cache.close()
+
+    asyncio.run(run())
+
+
+def test_dead_or_mismatched_warm_socket_is_never_handed_over() -> None:
+    async def run() -> None:
+        cache, made = _cache()
+        cache.prewarm("wss://a", "key")
+        await asyncio.sleep(0)
+        made[0].close_code = 1006                    # provider dropped it
+        assert await cache.take("wss://a") is None
+
+        cache.prewarm("wss://a", "key")
+        await asyncio.sleep(0)
+        assert await cache.take("wss://different-voice") is None
+        await cache.close()
+
+    asyncio.run(run())
+
+
+def test_prewarm_does_not_stack_connections() -> None:
+    async def run() -> None:
+        cache, made = _cache()
+        for _ in range(4):
+            cache.prewarm("wss://a", "key")
+        await asyncio.sleep(0.01)
+        assert len(made) == 1                        # one in flight, one kept
+        await cache.close()
+        assert made[0].closed                        # shutdown releases it
+
+    asyncio.run(run())
+
+
+def test_ensure_connected_prefers_the_warm_socket() -> None:
+    from server.realtime import tts_aura
+
+    async def run() -> None:
+        cache, made = _cache()
+        cache.prewarm("wss://unused", "k")
+        await asyncio.sleep(0)
+
+        client = object.__new__(tts_aura.AuraTts)
+        client._api_key = "k"
+        client._url = "wss://unused"
+        client._ws = None
+        client._connect_lock = asyncio.Lock()
+        client._warm = cache
+
+        async def explode(*_a, **_kw):  # a real connect would cost ~2.4 s
+            raise AssertionError("should have used the warm socket")
+
+        tts_aura.websockets.connect = explode
+        try:
+            await client.ensure_connected()
+            assert client._ws is made[0]
+        finally:
+            tts_aura.websockets = __import__("websockets")
+
+    asyncio.run(run())
