@@ -15,6 +15,7 @@ from collections import OrderedDict
 
 from server.config import Settings
 from server.engine.plan import load_plan_cached
+from server.metrics import registry
 from server.postcall.analyze import analyze_call
 from server.postcall.extract import Extracted, extract_call
 from server.postcall.report_view import render_report_html
@@ -31,7 +32,8 @@ def build_report(call_id: str, conversation: list[dict], turns: list,
                  extracted: dict[str, Extracted], result: ScoreResult,
                  session_state: str = SessionStatus.COMPLETED,
                  tool_ledger: list[dict] | None = None,
-                 analyses: list[dict] | None = None) -> dict:
+                 analyses: list[dict] | None = None,
+                 latency: dict | None = None) -> dict:
     return {
         "analyses": list(analyses or []),
         "call_id": call_id,
@@ -52,6 +54,9 @@ def build_report(call_id: str, conversation: list[dict], turns: list,
         "tool_ledger": list(tool_ledger or []),
         "turn_count": len(turns),
         "endpoint_delays_ms": [round(t.endpoint_delay * 1000) for t in turns],
+        # Every measured stage, so the report can decompose turn latency
+        # instead of showing only where the endpointer spent its time.
+        "latency": dict(latency or {}),
         "conversation": conversation,
     }
 
@@ -90,7 +95,7 @@ async def run_postcall(call_id: str, conversation: list[dict], turns: list,
         report = build_report(
             call_id, conversation, turns, extracted, result,
             session_state=SessionStatus.COMPLETED, tool_ledger=tool_ledger,
-            analyses=[])
+            analyses=[], latency=registry.snapshot(call_id)["stages"])
         if lifecycle is not None:
             lifecycle.transition(SessionStatus.COMPLETED)
         _store(call_id, report)

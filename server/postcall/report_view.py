@@ -144,6 +144,21 @@ details[open].card summary::after { content:"▴" }
 .au-tool { font:500 12px ui-monospace,Menlo,monospace; color:var(--dim) }
 .au-reason { font:400 12.5px/1.5 'Space Grotesk'; color:var(--dim2) }
 .dl-body { padding:0 32px 20px; display:flex; flex-wrap:wrap; gap:8px }
+.lat-body { padding:0 32px 20px; display:flex; flex-direction:column; gap:2px }
+.lat-row { display:grid; grid-template-columns:minmax(96px,1.1fr) minmax(0,2fr) 82px 96px;
+           align-items:baseline; gap:10px; padding:7px 0;
+           border-bottom:1px solid var(--line-soft) }
+.lat-row:last-child { border-bottom:none }
+.lat-name { font:500 12.5px 'Space Grotesk'; color:var(--ink) }
+.lat-meaning { font:400 11.5px 'Space Grotesk'; color:var(--dim) }
+.lat-val { font:500 13px ui-monospace,Menlo,monospace; color:var(--ink); text-align:right }
+.lat-p95 { font:400 11.5px ui-monospace,Menlo,monospace; color:var(--dim); text-align:right }
+@media (max-width:560px) {
+  /* Drop the explanation, keep name + p50 + p95 on ONE line: a 2-column
+     fallback wrapped p95 onto a row of its own. */
+  .lat-row { grid-template-columns:1fr auto auto; gap:12px }
+  .lat-meaning { display:none }
+}
 .dl { padding:6px 11px; border-radius:100px; background:var(--sub-card);
       border:1px solid; font:500 12px ui-monospace,Menlo,monospace; white-space:nowrap }
 .flags { padding:14px 32px; font:400 13px 'Space Grotesk'; color:var(--dim) }
@@ -287,6 +302,42 @@ def _audit(report: dict) -> str:
             f'<div class="au-body">{"".join(rows)}</div></details>')
 
 
+_STAGE_LABELS = (
+    # Ordered as the caller experiences them; turn latency is the whole wait.
+    ("endpoint_delay_ms", "endpoint delay", "vad stop → commit"),
+    ("llm_ttft_ms", "llm ttft", "commit → first token"),
+    ("tts_ttfb_ms", "tts ttfb", "sentence → first audio byte"),
+    ("first_audio_ms", "first audio", "commit → first frame sent"),
+    ("turn_latency_ms", "turn latency", "vad stop → first frame sent"),
+)
+
+
+def _latency(report: dict) -> str:
+    """Per-stage p50/p95, so turn latency can be decomposed, not just quoted."""
+    stages = report.get("latency") or {}
+    rows = []
+    for key, label, meaning in _STAGE_LABELS:
+        for prefix in ("", "flux_"):
+            stat = stages.get(prefix + key)
+            if not stat:
+                continue
+            name = label + " (flux)" if prefix else label
+            weight = "600" if key == "turn_latency_ms" else "400"
+            rows.append(
+                '<div class="lat-row">'
+                f'<span class="lat-name" style="font-weight:{weight}">{name}</span>'
+                f'<span class="lat-meaning">{meaning}</span>'
+                f'<span class="lat-val" style="font-weight:{weight}">'
+                f'{stat["p50"]:.0f} ms</span>'
+                f'<span class="lat-p95">p95 {stat["p95"]:.0f} ms</span>'
+                '</div>')
+    if not rows:
+        return ""
+    return ('<details class="card" open><summary><span class="label">Call quality '
+            '· latency by stage</span></summary>'
+            f'<div class="lat-body">{"".join(rows)}</div></details>')
+
+
 def _quality(report: dict) -> str:
     delays = report.get("endpoint_delays_ms", [])
     if not delays:
@@ -361,5 +412,6 @@ def render_report_html(report: dict) -> str:
 {_breakdown(report, big)}
 {_ai_notes(report)}
 {_audit(report)}
+{_latency(report)}
 {_quality(report)}
 </div></div></body></html>"""

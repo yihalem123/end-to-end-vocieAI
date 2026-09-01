@@ -169,3 +169,48 @@ def test_core_report_is_available_before_advisory_analysis_finishes(monkeypatch)
         asyncio.run(run())
     finally:
         reports.pop("early-report", None)
+
+
+def test_report_carries_every_measured_latency_stage() -> None:
+    # The report showed only per-turn endpoint delay — 1 of the 5 stages we
+    # measure — so the artifact you show can't decompose turn latency.
+    from server.metrics import MetricsRegistry
+    from server.postcall.report import build_report
+    from server.postcall.score import ScoreResult
+
+    reg = MetricsRegistry()
+    reg.record_turn("c1", endpoint_delay_ms=300.0, llm_ttft_ms=1300.0,
+                    tts_ttfb_ms=430.0, first_audio_ms=1990.0,
+                    turn_latency_ms=2300.0)
+    reg.record_turn("c1", endpoint_delay_ms=400.0, llm_ttft_ms=1500.0,
+                    tts_ttfb_ms=450.0, first_audio_ms=2100.0,
+                    turn_latency_ms=2500.0)
+    reg.record_turn("other-call", endpoint_delay_ms=9999.0)
+
+    report = build_report(
+        "c1", conversation=[], turns=[],
+        extracted={}, result=ScoreResult(None, True, None, "v1", [], {}),
+        latency=reg.snapshot("c1")["stages"])
+
+    latency = report["latency"]
+    assert set(latency) == {"endpoint_delay_ms", "llm_ttft_ms", "tts_ttfb_ms",
+                            "first_audio_ms", "turn_latency_ms"}
+    assert latency["turn_latency_ms"]["p50"] == 2400  # interpolated, this call only
+    assert "endpoint_delay_ms" in latency and latency["endpoint_delay_ms"]["p95"] < 9999
+    assert latency["llm_ttft_ms"]["count"] == 2
+
+
+def test_report_view_renders_the_latency_breakdown() -> None:
+    from server.postcall.report_view import render_report_html
+
+    html = render_report_html({
+        "call_id": "c1", "session_state": "completed", "score": 0.9,
+        "fields": {}, "conversation": [], "endpoint_delays_ms": [300, 400],
+        "latency": {
+            "turn_latency_ms": {"count": 2, "p50": 2300.4, "p95": 2500.0},
+            "llm_ttft_ms": {"count": 2, "p50": 1300.0, "p95": 1500.0},
+        },
+    })
+    assert "turn latency" in html.lower()
+    assert "2300" in html and "1300" in html   # p50s rendered, rounded
+    assert "llm ttft" in html.lower()
