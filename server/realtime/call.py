@@ -298,6 +298,84 @@ class CallSession:
 
     # --- pipeline events -> endpointer + guard -> replies ---
 
+    async def _handle_event(self, event, now: float) -> TurnComplete | None:
+        """Route one pipeline event; return a turn if this event committed one.
+
+        Split out of _event_loop so the routing table can be tested without
+        driving the loop's timing, audio pump and teardown side effects.
+        """
+        turn: TurnComplete | None = None
+        match event:
+            case VadEvent(kind="start", t=t):
+                self._endpointer.on_vad_start(t)
+                self._replies.guard.on_vad_start(t)
+                await self._replies.cancel_speculation()  # guess voided
+                await self._send({"type": "vad", "state": "speech"})
+            case VadEvent(kind="stop", t=t):
+                self._endpointer.on_vad_stop(t)
+                self._replies.guard.on_vad_stop(t)
+                self._last_vad_stop_t = t
+                if self.mode == "custom":
+                    self._offer_audio(FINALIZE)  # flush v1 finals now
+                await self._send({"type": "vad", "state": "silence"})
+            case AsrPartial(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
+                if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
+                    self._last_partial_sent_t = now
+                    await self._send({"type": "partial", "text": text})
+            case AsrFinal(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
+                self._endpointer.on_asr_final(text, now)
+                if text:
+                    await self._send({"type": "final", "text": text})
+            case AsrUtteranceEnd(epoch=epoch) if self._accept_asr_epoch(epoch):
+                turn = self._endpointer.on_utterance_end(now)
+            case AsrReconnected(epoch=epoch):
+                # Continuity: accumulated finals survive; next partial
+                # supersedes any stale one. The caller sees a brief notice.
+                if epoch <= self._asr_epoch:
+                    return None
+                self._asr_epoch = epoch
+                log.warning("asr reconnected (epoch %d) call %s",
+                            epoch, self.state.call_id)
+                await self._send({"type": "notice",
+                                  "text": "transcription reconnected"})
+            case ClientCleared(generation_id=generation, played_samples=played):
+                await self._replies.on_cleared(generation, played)
+            case ClientPlaybackDrained(generation_id=generation):
+                await self._replies.on_playback_drained(generation)
+            case ClientPlaybackStarted(generation_id=generation):
+                await self._replies.on_playback_started(generation)
+            case ClientPlaybackOverflow(
+                generation_id=generation, played_samples=played
+            ):
+                await self._replies.on_playback_overflow(generation, played)
+            case ClientChat(text=text):
+                turn_id = self._new_turn_id()
+                await self._commit_caller_text(text, turn_id, turn=None)
+            case FluxUpdate(transcript=text, epoch=epoch) if self._accept_asr_epoch(epoch):
+                if text:  # Flux emits empty updates during silence
+                    if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
+                        self._last_partial_sent_t = now
+                        await self._send({"type": "partial", "text": text})
+            case FluxEagerEndOfTurn(transcript=text, epoch=epoch) \
+                    if self._accept_asr_epoch(epoch):
+                if (text and self.state.session.status
+                        == SessionStatus.INTERVIEWING):
+                    await self._replies.speculate(text, self._next_turn_id + 1)
+            case FluxTurnResumed(epoch=epoch) if self._accept_asr_epoch(epoch):
+                await self._replies.cancel_speculation()
+            case FluxEndOfTurn(transcript=text, epoch=epoch) \
+                    if self._accept_asr_epoch(epoch):
+                if text:  # empty end-of-turn = silence, not a turn
+                    anchor = self._last_vad_stop_t or now
+                    turn = TurnComplete(
+                        transcript=text, endpoint_delay=max(0.0, now - anchor),
+                        vad_stop_t=anchor, commit_t=now, reason="flux")
+            case FluxStartOfTurn(epoch=epoch) if self._accept_asr_epoch(epoch):
+                pass  # local VAD already drives the UI + barge-in guard
+            case None:
+                pass
+        return turn
+
     async def _event_loop(self) -> None:
         await self._replies.on_script(self._replies.interview.plan.consent, turn_id=0)
         self.state.session.transition(SessionStatus.AWAITING_CONSENT)
@@ -311,76 +389,7 @@ class CallSession:
             started = getattr(self, "_interview_started_t", None)
             if started is not None:
                 self._replies.interview.update_elapsed(now - started)
-            turn: TurnComplete | None = None
-            match event:
-                case VadEvent(kind="start", t=t):
-                    self._endpointer.on_vad_start(t)
-                    self._replies.guard.on_vad_start(t)
-                    await self._replies.cancel_speculation()  # guess voided
-                    await self._send({"type": "vad", "state": "speech"})
-                case VadEvent(kind="stop", t=t):
-                    self._endpointer.on_vad_stop(t)
-                    self._replies.guard.on_vad_stop(t)
-                    self._last_vad_stop_t = t
-                    if self.mode == "custom":
-                        self._offer_audio(FINALIZE)  # flush v1 finals now
-                    await self._send({"type": "vad", "state": "silence"})
-                case AsrPartial(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
-                    if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
-                        self._last_partial_sent_t = now
-                        await self._send({"type": "partial", "text": text})
-                case AsrFinal(text=text, epoch=epoch) if self._accept_asr_epoch(epoch):
-                    self._endpointer.on_asr_final(text, now)
-                    if text:
-                        await self._send({"type": "final", "text": text})
-                case AsrUtteranceEnd(epoch=epoch) if self._accept_asr_epoch(epoch):
-                    turn = self._endpointer.on_utterance_end(now)
-                case AsrReconnected(epoch=epoch):
-                    # Continuity: accumulated finals survive; next partial
-                    # supersedes any stale one. The caller sees a brief notice.
-                    if epoch <= self._asr_epoch:
-                        continue
-                    self._asr_epoch = epoch
-                    log.warning("asr reconnected (epoch %d) call %s",
-                                epoch, self.state.call_id)
-                    await self._send({"type": "notice",
-                                      "text": "transcription reconnected"})
-                case ClientCleared(generation_id=generation, played_samples=played):
-                    await self._replies.on_cleared(generation, played)
-                case ClientPlaybackDrained(generation_id=generation):
-                    await self._replies.on_playback_drained(generation)
-                case ClientPlaybackStarted(generation_id=generation):
-                    await self._replies.on_playback_started(generation)
-                case ClientPlaybackOverflow(
-                    generation_id=generation, played_samples=played
-                ):
-                    await self._replies.on_playback_overflow(generation, played)
-                case ClientChat(text=text):
-                    turn_id = self._new_turn_id()
-                    await self._commit_caller_text(text, turn_id, turn=None)
-                case FluxUpdate(transcript=text, epoch=epoch) if self._accept_asr_epoch(epoch):
-                    if text:  # Flux emits empty updates during silence
-                        if now - self._last_partial_sent_t >= PARTIAL_UI_INTERVAL_SEC:
-                            self._last_partial_sent_t = now
-                            await self._send({"type": "partial", "text": text})
-                case FluxEagerEndOfTurn(transcript=text, epoch=epoch) \
-                        if self._accept_asr_epoch(epoch):
-                    if (text and self.state.session.status
-                            == SessionStatus.INTERVIEWING):
-                        await self._replies.speculate(text, self._next_turn_id + 1)
-                case FluxTurnResumed(epoch=epoch) if self._accept_asr_epoch(epoch):
-                    await self._replies.cancel_speculation()
-                case FluxEndOfTurn(transcript=text, epoch=epoch) \
-                        if self._accept_asr_epoch(epoch):
-                    if text:  # empty end-of-turn = silence, not a turn
-                        anchor = self._last_vad_stop_t or now
-                        turn = TurnComplete(
-                            transcript=text, endpoint_delay=max(0.0, now - anchor),
-                            vad_stop_t=anchor, commit_t=now, reason="flux")
-                case FluxStartOfTurn(epoch=epoch) if self._accept_asr_epoch(epoch):
-                    pass  # local VAD already drives the UI + barge-in guard
-                case None:
-                    pass
+            turn = await self._handle_event(event, now)
             if self.mode == "custom":
                 turn = turn or self._endpointer.tick(now)
             if turn is not None:
