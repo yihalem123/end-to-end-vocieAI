@@ -26,6 +26,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
@@ -45,6 +46,11 @@ RESPONSES_URL = "https://api.openai.com/v1/responses"
 ENGINE_CONNECT_TIMEOUT_SEC = 10.0
 ENGINE_READ_TIMEOUT_SEC = 20.0
 _ABBREVIATIONS = ("dr.", "st.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "vs.", "etc.")
+# Dotted acronyms/initialisms: "U.S.", "a.m.", "R.N.". Free-form model text uses
+# these constantly where the old scripted plan text never did, and splitting on
+# the final dot synthesizes a fragment ("Which U.S.") as its own utterance.
+# Merging two sentences is a far cheaper error than chopping one in half.
+_DOTTED_ACRONYM = re.compile(r"^(?:[a-z]\.){2,}$")
 _TERMINAL = ".!?"
 
 TOOLS = [
@@ -124,7 +130,7 @@ class SentenceChunker:
                 return None  # boundary may still be an abbreviation; wait for more
             head = self._buf[: i + 1]
             last_word = head.rsplit(None, 1)[-1].lower() if head.split() else ""
-            if last_word in _ABBREVIATIONS:
+            if last_word in _ABBREVIATIONS or _DOTTED_ACRONYM.match(last_word):
                 continue
             return i + 1
         return None
@@ -596,7 +602,6 @@ class LlmEngine:
 
 def _quote_supported(quote: str, source_text: str) -> bool:
     """Loose lexical anchoring: punctuation/case may differ, words may not."""
-    import re
 
     def normalize(value: str) -> str:
         return " ".join(re.findall(r"[a-z0-9]+", value.lower()))

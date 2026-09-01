@@ -420,3 +420,30 @@ def test_evidence_from_an_earlier_committed_turn_is_accepted() -> None:
         source_text="Somewhere around fifty five dollars an hour.")
     entry = state.tool_ledger[-1]
     assert entry["applied"] is True, entry["reason"]
+
+
+def test_chunker_does_not_split_inside_dotted_acronyms() -> None:
+    # Live regression: free-form model text says "U.S." where the old scripted
+    # plan text never did. "Which U.S. state issued your RN license?" was cut
+    # into "Which U.S." + "state issued your RN license?" and synthesized as
+    # two utterances â€” audibly chopped mid-sentence.
+    ch = SentenceChunker()
+    # Followed by more text, so the boundary resolves inside push() rather than
+    # via the trailing-terminal hold — the split, if any, would show here.
+    assert list(ch.push("Which U.S. state issued your RN license? Thanks.")) == [
+        "Which U.S. state issued your RN license?"]
+    assert ch.flush() == "Thanks."
+
+    ch = SentenceChunker()
+    out = list(ch.push("Call me at 9 a.m. tomorrow. Thanks."))
+    assert out == ["Call me at 9 a.m. tomorrow."]
+    assert ch.flush() == "Thanks."
+
+
+def test_chunker_still_splits_normal_sentences_after_the_acronym_guard() -> None:
+    ch = SentenceChunker()
+    out = list(ch.push("Dr. Smith works at St. Mary's hospital. Great. "))
+    assert out == ["Dr. Smith works at St. Mary's hospital.", "Great."]
+    ch = SentenceChunker()
+    assert list(ch.push("You mentioned 4.5 years. Noted. ")) == [
+        "You mentioned 4.5 years.", "Noted."]

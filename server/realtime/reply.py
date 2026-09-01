@@ -26,7 +26,7 @@ import logging
 from server.config import Settings
 from server.engine.plan import InterviewPlan, InterviewState, load_plan_cached
 from server.engine.stub import StubEngine
-from server.engine.turn import LlmEngine
+from server.engine.turn import LlmEngine, SentenceChunker
 from server.metrics import registry
 from server.realtime.bargein import BargeInGuard
 from server.realtime.endpoint import TurnComplete
@@ -320,14 +320,23 @@ class ReplyController:
                 turn_id, lambda token: self._append_agent(token, text, audio=False))
             return
 
-        async def one_sentence():
-            yield text
+        async def script_sentences():
+            """Same chunking as engine output: the caller hears sentence one
+            while the rest is still synthesizing, the transcript grows with
+            her voice, and no single utterance has to carry a whole
+            paragraph."""
+            chunker = SentenceChunker()
+            for sentence in chunker.push(text):
+                yield sentence
+            tail = chunker.flush()
+            if tail:
+                yield tail
 
         now = asyncio.get_running_loop().time()
         token = await self._supervisor.start(
             turn_id,
             lambda owned: self._deliver_voice(
-                owned, one_sentence(),
+                owned, script_sentences(),
                 {"commit_t": now, "vad_stop_t": now}, record_metrics=False),
         )
         self._drained[token.generation_id] = asyncio.Event()

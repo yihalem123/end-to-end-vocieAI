@@ -621,3 +621,58 @@ def test_barge_in_still_fires_once_audio_is_actually_going_out(monkeypatch) -> N
         await controller._supervisor.cancel_current()
 
     asyncio.run(run())
+
+
+def test_script_copy_is_spoken_and_announced_sentence_by_sentence(monkeypatch) -> None:
+    # The disclosure was handed to TTS as ONE paragraph, so its whole text hit
+    # the transcript the instant her first frame went out (measured live: text
+    # at 2.6 s, she stopped talking at 16.7 s) and one utterance had to carry
+    # ~14 s of audio. Chunk it like engine output instead.
+    _spec_env(monkeypatch)
+
+    class RecordingSpeaker:
+        def __init__(self):
+            self.spoken = []
+
+        async def speak(self, sentences, anchors, generation_id, is_current,
+                        release=None, on_sentence=None):
+            async for sentence in sentences:
+                self.spoken.append(sentence)
+                if on_sentence is not None:
+                    await on_sentence(sentence)
+            return {"_playback_remaining_sec": 0.0}
+
+        def text(self, _generation_id):
+            return " ".join(self.spoken)
+
+    async def run() -> None:
+        sent = []
+        done = asyncio.Event()
+
+        async def send(ev):
+            sent.append(ev)
+            if ev["type"] == "agent":
+                done.set()
+
+        controller = _controller({"send": send, "log": []}, FakeLlm())
+        speaker = RecordingSpeaker()
+        controller._speaker = speaker
+        text = ("Hi, this is Sarah. I will transcribe what you say. "
+                "No audio recording is stored. Do you consent to continue now?")
+        await controller.on_script(text, turn_id=0)
+        await asyncio.wait_for(done.wait(), timeout=0.5)
+
+        assert speaker.spoken == [
+            "Hi, this is Sarah.",
+            "I will transcribe what you say.",
+            "No audio recording is stored.",
+            "Do you consent to continue now?",
+        ]
+        partials = [e["text"] for e in sent if e["type"] == "agent_partial"]
+        assert len(partials) == 4                  # transcript grows with her
+        assert partials[0] == "Hi, this is Sarah."
+        assert partials[-1] == text                # and ends up complete
+        committed = next(e for e in sent if e["type"] == "agent")
+        assert committed["text"] == text           # nothing lost in the split
+
+    asyncio.run(run())
