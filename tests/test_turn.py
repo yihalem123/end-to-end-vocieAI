@@ -447,3 +447,37 @@ def test_chunker_still_splits_normal_sentences_after_the_acronym_guard() -> None
     ch = SentenceChunker()
     assert list(ch.push("You mentioned 4.5 years. Noted. ")) == [
         "You mentioned 4.5 years.", "Noted."]
+
+
+def test_volatile_state_rides_behind_the_stable_history_prefix() -> None:
+    # Cache-friendly layout: anything that changes per turn must come AFTER
+    # everything that does not. (This does not achieve cache hits on its own -
+    # see _cacheable_input for the measured reasons - but the reverse ordering
+    # makes them impossible, and state reads better next to the turn it
+    # describes.)
+    engine, state = _engine_with_state()
+    captured = {}
+
+    async def stream(body):
+        captured.update(body)
+        yield 'data: {"type":"response.output_text.delta","delta":"Okay."}'
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        state.add_history("user", "Yes, I consent.")
+        state.add_history("assistant", "Thanks. Which state issued your license?")
+        [line async for line in engine.respond("Delaware.")]
+        roles = [item["role"] for item in captured["input"]]
+        contents = [item["content"] for item in captured["input"]]
+
+        # history first, then the volatile state block, then the newest turn
+        assert roles[0] == "user" and contents[0] == "Yes, I consent."
+        state_at = next(i for i, c in enumerate(contents) if "consent" in c
+                        and roles[i] == "system")
+        assert state_at == len(contents) - 2
+        assert contents[-1] == "Delaware."
+        await engine.close()
+
+    asyncio.run(run())

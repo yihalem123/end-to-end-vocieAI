@@ -337,6 +337,26 @@ def _turn_input(state: InterviewState, user_text: str) -> list[dict[str, str]]:
     return history + [{"role": "user", "content": user_text}]
 
 
+def _cacheable_input(state: InterviewState, user_text: str) -> list[dict[str, str]]:
+    """Static -> stable history -> volatile state -> newest turn.
+
+    This is the cache-friendly layout (the per-turn state block used to sit
+    FIRST, which caps any shared prefix at the instructions), and it puts the
+    coverage state next to the turn it applies to. It does NOT buy prompt
+    caching here, and the measurements say why: the stable prefix reaches only
+    ~849 tokens after six turns, under the provider's ~1024-token threshold,
+    and recent_history() is a SLIDING window - once it slides the prefix
+    changes, so no prefix can ever stabilise. Reaching the threshold would mean
+    padding the instructions or keeping unbounded history; neither is worth a
+    cost optimisation that showed no latency benefit in a direct A/B.
+    cached_tokens stays 0, measured over six live turns.
+    """
+    items = _turn_input(state, user_text)
+    newest = items[-1:] if items and items[-1].get("role") == "user" else []
+    stable = items[:len(items) - len(newest)]
+    return stable + [{"role": "system", "content": build_state_block(state)}] + newest
+
+
 class LlmEngine:
     def __init__(self, settings: Settings, state: InterviewState,
                  call_id: str = "unassigned") -> None:
@@ -383,8 +403,7 @@ class LlmEngine:
         if not current():
             return
         state = self.state
-        request_input = ([{"role": "system", "content": build_state_block(state)}]
-                         + _turn_input(state, user_text))
+        request_input = _cacheable_input(state, user_text)
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             # Static prefix in instructions (cache-friendly); per-turn state
@@ -469,8 +488,7 @@ class LlmEngine:
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             "instructions": instructions,
-            "input": ([{"role": "system", "content": build_state_block(state)}]
-                      + _turn_input(state, user_text)),
+            "input": _cacheable_input(state, user_text),
             "tools": TOOLS,
             "stream": True,
             "store": False,
