@@ -676,3 +676,26 @@ def test_script_copy_is_spoken_and_announced_sentence_by_sentence(monkeypatch) -
         assert committed["text"] == text           # nothing lost in the split
 
     asyncio.run(run())
+
+
+def test_controller_warms_the_engine_connection_during_the_greeting(monkeypatch) -> None:
+    from server.config import Settings
+
+    warmed = asyncio.Event()
+
+    async def fake_warm(self) -> None:
+        warmed.set()
+
+    monkeypatch.setattr(reply_module.LlmEngine, "warm_connection", fake_warm)
+
+    async def run() -> None:
+        async def send(_ev):
+            pass
+
+        settings = Settings(_env_file=None, openai_api_key="sk-test")
+        controller = reply_module.ReplyController(
+            send, send, settings, SimpleNamespace(conversation=[]))
+        await asyncio.wait_for(warmed.wait(), timeout=0.5)
+        await controller.close()          # must cancel cleanly, not warn
+
+    asyncio.run(run())

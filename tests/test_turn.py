@@ -481,3 +481,40 @@ def test_volatile_state_rides_behind_the_stable_history_prefix() -> None:
         await engine.close()
 
     asyncio.run(run())
+
+
+def test_warm_connection_opens_the_api_connection_before_the_first_turn() -> None:
+    # Measured (paired, n=10): a brand-new client pays ~660 ms of handshake on
+    # its first Responses request, and the client is per call — so the caller's
+    # FIRST answer always paid it. The greeting is TTS-only and runs ~14 s,
+    # which is exactly the window to get the connection established.
+    engine, _state = _engine_with_state()
+    got: list[str] = []
+
+    class FakeClient:
+        async def get(self, url, headers=None):
+            got.append(url)
+            return None
+
+    engine._client = FakeClient()
+
+    async def run() -> None:
+        await engine.warm_connection()
+        assert got and got[0].startswith("https://api.openai.com/")
+
+    asyncio.run(run())
+
+
+def test_warm_connection_never_fails_a_call() -> None:
+    engine, _state = _engine_with_state()
+
+    class BrokenClient:
+        async def get(self, url, headers=None):
+            raise OSError("no route to host")
+
+    engine._client = BrokenClient()
+
+    async def run() -> None:
+        await engine.warm_connection()      # best effort: must not raise
+
+    asyncio.run(run())

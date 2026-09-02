@@ -22,6 +22,7 @@ turn_latency from the Speaker.
 """
 import asyncio
 import logging
+from contextlib import suppress
 
 from server.config import Settings
 from server.engine.plan import InterviewPlan, InterviewState, load_plan_cached
@@ -118,8 +119,13 @@ class ReplyController:
         plan = plan if plan is not None else load_plan_cached(str(settings.plan_path))
         self.interview = InterviewState(plan)
         self._engine: LlmEngine | StubEngine
+        self._engine_warm: asyncio.Task | None = None
         if settings.openai_api_key:
             self._engine = LlmEngine(settings, self.interview, call_id=call_id)
+            # The greeting is TTS-only, so the API connection is idle for
+            # seconds: open it now and the caller's first answer stops paying
+            # the ~660 ms handshake (measured paired, n=10).
+            self._engine_warm = asyncio.create_task(self._engine.warm_connection())
         else:
             self._engine = StubEngine()
 
@@ -531,6 +537,11 @@ class ReplyController:
 
     async def close(self) -> None:
         self._closed = True
+        if self._engine_warm is not None:
+            self._engine_warm.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._engine_warm
+            self._engine_warm = None
         for task in tuple(self._extraction_tasks):
             if not task.done():
                 task.cancel()
