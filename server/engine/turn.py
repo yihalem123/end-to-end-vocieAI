@@ -1,42 +1,41 @@
-"""One bounded, goal-driven turn: speech now, provisional extraction alongside.
+"""The streaming LLM turn: speech now, provisional extraction alongside.
 
 ## How this works
-We speak the Responses API over raw SSE (httpx) — consistent with the project's
-raw-protocol ethos, and the typed events are the whole lesson:
-  response.output_text.delta          -> spoken text, fed to the SentenceChunker
-  response.output_item.added          -> a function_call item opens (name, ids)
-  response.function_call_arguments.delta/.done -> its JSON args accumulate/finish
-StreamAssembler turns that event soup into text deltas + completed ToolCalls.
-
-The caller-facing request has no tools, so its first text can stream directly to
-TTS. A separate extraction request runs concurrently after the caller turn is
-committed and may call record_answer/end_call without gating speech. These live
-captures are provisional interview memory only; post-call caller-utterance
-verification is the sole authority for scores and knockouts.
-
-LlmEngine.respond() is an async generator of SENTENCES: text deltas stream into
-the chunker (abbreviation + decimal guards) and each complete sentence is
-yielded immediately — the Speaker starts TTS on sentence one while the model is
-still writing sentence three. llm_ttft (request start -> first text delta)
-is recorded per turn. The system prompt is rendered fresh every turn from
-InterviewState, so the model always sees current coverage; the engine, not the
-model, remains the authority on scope, evidence and termination (see plan.py).
+We speak the Responses API over raw SSE (httpx) - the project's raw-protocol
+ethos; stream.py holds the typed-event assembly and prompt.py the prompts.
+Two requests per caller turn:
+- respond(): tool-free, so its first text streams straight to TTS. An async
+  generator of SENTENCES - the Speaker starts TTS on sentence one while the
+  model is still writing sentence three. llm_ttft is the first TEXT delta.
+  History is persisted only under reply ownership and only after a
+  speculative draft's commit gate opens, so a discarded draft leaves nothing.
+- extract(): the concurrent evidence pass with tools, applied through
+  evidence.apply_tools() under TURN ownership (a barge-in must not erase what
+  the caller already said). Measured: it does not slow speech (+12 ms, n=12).
+One httpx client per call; warm_connection() opens it during the TTS-only
+greeting so the caller's first answer does not pay the ~660 ms handshake.
 """
 import asyncio
 import hashlib
 import json
 import logging
-import re
 import time
-from collections.abc import AsyncIterator, Callable, Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import httpx
 
 from server.config import Settings
-from server.engine.intents import EndCallIntent, classify_end_call_intent
+from server.engine.evidence import apply_tools
 from server.engine.plan import InterviewState
+from server.engine.prompt import (
+    TOOLS,
+    build_extraction_instructions,
+    build_instructions,
+    cacheable_input,
+    fallback_line,
+)
+from server.engine.stream import EngineTimeout, SentenceChunker, StreamAssembler, ToolCall
 
 log = logging.getLogger(__name__)
 
@@ -48,316 +47,6 @@ MODELS_URL = "https://api.openai.com/v1/models"
 # streamed chunks — a stalled stream fails typed instead of hanging a turn.
 ENGINE_CONNECT_TIMEOUT_SEC = 10.0
 ENGINE_READ_TIMEOUT_SEC = 20.0
-_ABBREVIATIONS = ("dr.", "st.", "mr.", "mrs.", "ms.", "e.g.", "i.e.", "vs.", "etc.")
-# Dotted acronyms/initialisms: "U.S.", "a.m.", "R.N.". Free-form model text uses
-# these constantly where the old scripted plan text never did, and splitting on
-# the final dot synthesizes a fragment ("Which U.S.") as its own utterance.
-# Merging two sentences is a far cheaper error than chopping one in half.
-_DOTTED_ACRONYM = re.compile(r"^(?:[a-z]\.){2,}$")
-_TERMINAL = ".!?"
-
-TOOLS = [
-    {
-        "type": "function",
-        "name": "record_answer",
-        "description": "Record one answered field with the caller's verbatim words.",
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["field", "value", "quote"],
-            "properties": {
-                "field": {"type": "string", "description": "Plan field name."},
-                "value": {"type": "string",
-                          "description": "The answer; lists comma-separated, booleans true/false."},
-                "quote": {"type": "string",
-                          "description": "Verbatim words the caller said."},
-            },
-        },
-    },
-    {
-        "type": "function",
-        "name": "end_call",
-        "description": (
-            "Request a graceful end after the caller asks to stop or all "
-            "interview objectives are covered. The backend validates and owns "
-            "the actual session transition."),
-        "strict": True,
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["reason", "closing_message"],
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "enum": [
-                        "candidate_requested", "interview_complete",
-                        "limit_reached",
-                    ],
-                },
-                "closing_message": {
-                    "type": "string",
-                    "description": (
-                        "One short final statement, with no question, to speak "
-                        "before the backend closes the call."),
-                },
-            },
-        },
-    },
-]
-
-
-class SentenceChunker:
-    def __init__(self) -> None:
-        self._buf = ""
-
-    def push(self, delta: str) -> Iterator[str]:
-        self._buf += delta
-        while True:
-            cut = self._find_boundary()
-            if cut is None:
-                return
-            sentence = self._buf[:cut].strip()
-            self._buf = self._buf[cut:]
-            if sentence:
-                yield sentence
-
-    def _find_boundary(self) -> int | None:
-        for i, ch in enumerate(self._buf):
-            if ch not in _TERMINAL:
-                continue
-            after = self._buf[i + 1: i + 2]
-            if after and not after.isspace():
-                continue  # mid-token: decimals like "4.5", or no space yet
-            if not after:
-                return None  # boundary may still be an abbreviation; wait for more
-            head = self._buf[: i + 1]
-            last_word = head.rsplit(None, 1)[-1].lower() if head.split() else ""
-            if last_word in _ABBREVIATIONS or _DOTTED_ACRONYM.match(last_word):
-                continue
-            return i + 1
-        return None
-
-    def flush(self) -> str | None:
-        tail = self._buf.strip()
-        self._buf = ""
-        return tail or None
-
-
-class EngineStreamError(RuntimeError):
-    """The Responses stream reported a failure event (arrives inside HTTP 200)."""
-
-
-class EngineTimeout(EngineStreamError):
-    """The provider exceeded a stage timeout (connect or inter-chunk read)."""
-
-
-@dataclass
-class ToolCall:
-    name: str
-    call_id: str
-    arguments: dict | None  # None = args were malformed JSON
-
-
-class StreamAssembler:
-    def __init__(self) -> None:
-        self.tool_calls: list[ToolCall] = []
-        self._open: dict[str, dict] = {}  # item_id -> {name, call_id, buf}
-        self.usage: dict = {}
-
-    def feed(self, event: dict) -> list[str]:
-        """Consume one typed event; return any text deltas it carried."""
-        match event.get("type"):
-            case "error":
-                err = event.get("error", {})
-                raise EngineStreamError(err.get("message", "stream error"))
-            case "response.failed" | "response.incomplete":
-                err = event.get("response", {}).get("error") or {}
-                raise EngineStreamError(err.get("message", "response failed"))
-            case "response.completed":
-                self.usage = event.get("response", {}).get("usage") or {}
-            case "response.output_text.delta":
-                return [event.get("delta", "")]
-            case "response.output_item.added":
-                item = event.get("item", {})
-                if item.get("type") == "function_call":
-                    self._open[item["id"]] = {"name": item.get("name", ""),
-                                              "call_id": item.get("call_id", ""),
-                                              "buf": item.get("arguments", "")}
-            case "response.function_call_arguments.delta":
-                entry = self._open.get(event.get("item_id", ""))
-                if entry is not None:
-                    entry["buf"] += event.get("delta", "")
-            case "response.function_call_arguments.done":
-                entry = self._open.pop(event.get("item_id", ""), None)
-                if entry is not None:
-                    raw = event.get("arguments") or entry["buf"]
-                    try:
-                        args: dict | None = json.loads(raw)
-                    except json.JSONDecodeError:
-                        args = None
-                    self.tool_calls.append(ToolCall(name=entry["name"],
-                                                    call_id=entry["call_id"],
-                                                    arguments=args))
-        return []
-
-
-def fallback_line(state: InterviewState) -> str:
-    """Last-resort speech if the dialogue request produces no text."""
-    if state.end_call_request is not None:
-        return state.end_call_request.closing_message
-    if state.remaining:
-        return "I'm sorry, I lost my place for a moment. What would you like me to clarify?"
-    return "Thanks, that covers everything I needed for this screening."
-
-
-def build_instructions(plan) -> str:
-    """The STATIC per-call prefix (persona + rules). Kept byte-identical across
-    turns so provider prompt caching can hit; everything that changes per turn
-    lives in build_state_block and travels as an input message instead."""
-    objectives = "\n".join(
-        f"- {s.field} ({s.type}): {s.objective}" for s in plan.steps)
-    prohibited = ", ".join(plan.boundaries.prohibited_topics) or "none configured"
-    one_at_a_time = "yes" if plan.boundaries.ask_one_question_at_a_time else "no"
-    return f"""{plan.persona}
-
-You are conducting an open but bounded screening interview. You choose every
-substantive question and its wording; there is no scripted question order.
-
-Evidence objectives:
-{objectives}
-
-Boundaries:
-- Maximum caller turns: {plan.boundaries.max_turns}
-- Maximum duration: {plan.boundaries.max_duration_minutes:g} minutes
-- Ask one question at a time: {one_at_a_time}
-- Prohibited topics: {prohibited}
-
-Rules:
-- Respond to the caller's latest meaning first. Evidence objectives are coverage
-  goals, not a script, required order, or whitelist of allowed conversation.
-- Handle questions, corrections, uncertainty, requests for clarification, and
-  brief role-relevant conversation before naturally returning to screening.
-- If the caller asks what you need from them, explain the relevant screening
-  goal plainly instead of using a generic prompt or immediately re-asking it.
-- When it is natural to continue collecting evidence, choose the most useful
-  question yourself. It may clarify context rather than directly fill a field.
-- Do not repeat established information. If part of a compound topic was
-  answered, ask only for what remains missing.
-- Ask ONE concise question at a time. Keep speech to one or two short sentences.
-- Avoid empty acknowledgements such as "Okay", "Got it", or "Alright". Only
-  acknowledge something when the acknowledgement adds useful meaning.
-- ALWAYS provide a spoken reply for the caller. This request has no tools.
-- Treat information in the latest caller message as already known when choosing
-  your reply, even if it still appears in the missing-objectives state block.
-  Never re-ask for information the caller just supplied.
-- If the latest message appears to satisfy the final missing objective, close
-  naturally without asking another question; the backend verifies coverage.
-- If the caller asks to stop, speak only a brief goodbye. Do not ask another
-  interview question.
-- When every objective is covered, briefly close without another question.
-- Never invent answers. Never promise pay, benefits, or hiring decisions.
-- A system message states what is established and what remains; it never gives
-  you a required question or question order."""
-
-
-def build_extraction_instructions(plan) -> str:
-    """Static prompt for the non-speaking provisional evidence pass."""
-    objectives = "\n".join(
-        f"- {s.field} ({s.type}): {s.objective}" for s in plan.steps)
-    return f"""Extract provisional interview evidence. Produce no spoken reply.
-
-Evidence objectives:
-{objectives}
-
-Rules:
-- Call record_answer for every objective supported by the caller's verbatim
-  words. Use the exact supported words as quote; never infer unsupported facts.
-- The latest caller message may answer multiple objectives. Record each one.
-- Do not call record_answer for uncertainty or an unanswered objective.
-- Call end_call with candidate_requested only for an explicit request to end
-  the call, interview, or screening.
-- After recording evidence, call end_call with interview_complete only when all
-  objectives are covered. Call it with limit_reached only when the supplied
-  runtime budget says a limit is reached.
-- Output tool calls only. Backend validation is authoritative."""
-
-
-def build_state_block(state: InterviewState) -> str:
-    plan = state.plan
-    # Quotes are truncated in the PROMPT only (full text stays in state for
-    # post-call verification) — the prompt must not grow with caller verbosity.
-    filled = "\n".join(f"- {name}: {rec.value!r} (they said: \"{rec.quote[:60]}\")"
-                       for name, rec in state.fields.items()) or "- none yet"
-    remaining = "\n".join(
-        f"- {s.field} ({s.type}): {s.objective}"
-        for s in state.remaining) or "- none"
-    turns_left = max(0, plan.boundaries.max_turns - state.caller_turn_count)
-    seconds_left = max(
-        0.0, plan.boundaries.max_duration_minutes * 60 - state.elapsed_seconds)
-    if state.end_call_request is not None:
-        objective = "Termination is already requested. Do not ask another question."
-    elif turns_left == 0 or seconds_left == 0:
-        objective = (
-            "The interview limit is reached. Ask no question. Give a brief "
-            "closing statement; the backend owns the lifecycle transition.")
-    elif state.remaining:
-        objective = (
-            "Treat the missing evidence as coverage goals, not a questionnaire. "
-            "Respond to the caller's latest intent first. When natural, continue "
-            "with one useful question that you formulate yourself; it may answer "
-            "or clarify the conversation before pursuing missing evidence.")
-    else:
-        objective = (
-            "All evidence objectives are covered. Give a brief closing statement "
-            "without another question; the backend owns lifecycle state.")
-    return f"""Recorded so far:
-{filled}
-Evidence objectives still missing:
-{remaining}
-
-Runtime budget: {turns_left} caller turns and {seconds_left:.0f} seconds remain.
-
-{objective}"""
-
-
-def build_system_prompt(state: InterviewState) -> str:
-    """Composition kept for tests and offline inspection; the live request
-    sends the two halves separately for cacheability."""
-    return build_instructions(state.plan) + "\n\n" + build_state_block(state)
-
-
-def _turn_input(state: InterviewState, user_text: str) -> list[dict[str, str]]:
-    """Bounded history plus the latest caller message, without duplication.
-
-    ReplyController journals committed caller turns immediately. Direct engine
-    callers and speculative drafts do not, so they still need the explicit item.
-    """
-    history = state.recent_history(8)
-    if (history and history[-1].get("role") == "user"
-            and history[-1].get("content") == user_text):
-        return history
-    return history + [{"role": "user", "content": user_text}]
-
-
-def _cacheable_input(state: InterviewState, user_text: str) -> list[dict[str, str]]:
-    """Static -> stable history -> volatile state -> newest turn.
-
-    This is the cache-friendly layout (the per-turn state block used to sit
-    FIRST, which caps any shared prefix at the instructions), and it puts the
-    coverage state next to the turn it applies to. It does NOT buy prompt
-    caching here, and the measurements say why: the stable prefix reaches only
-    ~849 tokens after six turns, under the provider's ~1024-token threshold,
-    and recent_history() is a SLIDING window - once it slides the prefix
-    changes, so no prefix can ever stabilise. Reaching the threshold would mean
-    padding the instructions or keeping unbounded history; neither is worth a
-    cost optimisation that showed no latency benefit in a direct A/B.
-    cached_tokens stays 0, measured over six live turns.
-    """
-    items = _turn_input(state, user_text)
-    newest = items[-1:] if items and items[-1].get("role") == "user" else []
-    stable = items[:len(items) - len(newest)]
-    return stable + [{"role": "system", "content": build_state_block(state)}] + newest
 
 
 class LlmEngine:
@@ -426,7 +115,7 @@ class LlmEngine:
         if not current():
             return
         state = self.state
-        request_input = _cacheable_input(state, user_text)
+        request_input = cacheable_input(state, user_text)
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             # Static prefix in instructions (cache-friendly); per-turn state
@@ -511,7 +200,7 @@ class LlmEngine:
         body: dict[str, Any] = {
             "model": self._settings.turn_model,
             "instructions": instructions,
-            "input": _cacheable_input(state, user_text),
+            "input": cacheable_input(state, user_text),
             "tools": TOOLS,
             "stream": True,
             "store": False,
@@ -545,108 +234,6 @@ class LlmEngine:
         generation_id: int | None = None,
         source_text: str = "",
     ) -> list[dict]:
-        """Validate, apply, and LEDGER every tool call. Failures are returned
-        to orchestration as ledger entries (and warnings), never swallowed;
-        duplicate tool_call_ids are idempotently skipped."""
-        current = is_current or (lambda: True)
-        ledger = self.state.tool_ledger
-        seen = {e["idempotency_key"] for e in ledger
-                if e.get("idempotency_key")}
-        results: list[dict] = []
-        # Function-call output order is model-controlled. Evidence mutations
-        # must settle before an interview_complete request is validated, or an
-        # end_call item emitted first can be rejected even though the same
-        # response records the final objective. Stable sort preserves relative
-        # order within each class and keeps the audit deterministic.
-        ordered_calls = sorted(calls, key=lambda call: call.name == "end_call")
-        for call in ordered_calls:
-            if not current():
-                return results
-            tool_identity = call.call_id or hashlib.sha256(
-                (call.name + json.dumps(call.arguments, sort_keys=True,
-                                        default=str)).encode("utf-8")
-            ).hexdigest()[:16]
-            idempotency_key = f"{self._call_id}:{turn_id or 0}:{tool_identity}"
-            execution_id = (f"{self._call_id}:{turn_id or 0}:"
-                            f"{generation_id or 0}:{tool_identity}")
-            entry = {"call_id": self._call_id,
-                     "tool_call_id": call.call_id, "name": call.name,
-                      "turn_id": turn_id, "generation_id": generation_id,
-                     "execution_id": execution_id,
-                     "idempotency_key": idempotency_key,
-                      "arguments": call.arguments, "applied": False, "reason": ""}
-            ledger.append(entry)
-            results.append(entry)
-            if idempotency_key in seen:
-                entry["reason"] = "duplicate idempotency identity (skip)"
-                continue
-            seen.add(idempotency_key)
-            if call.arguments is None:
-                entry["reason"] = "malformed arguments"
-                log.warning("malformed tool args for %s; skipped", call.name)
-                continue
-            if call.name == "record_answer":
-                quote = str(call.arguments.get("quote") or "").strip()
-                if not quote:
-                    entry["reason"] = "empty quote: evidence required before mutation"
-                    log.warning("record_answer without evidence rejected")
-                    continue
-                if not any(_quote_supported(quote, s) for s in
-                           self._caller_sources(source_text)):
-                    entry["reason"] = "quote not supported by any caller utterance"
-                    log.warning("record_answer with unsupported evidence rejected")
-                    continue
-                entry["applied"] = self.state.record(
-                    call.arguments.get("field", ""),
-                    call.arguments.get("value"), quote)
-                if not entry["applied"]:
-                    entry["reason"] = "rejected by state validation"
-                    log.warning("record_answer rejected by state validation")
-            elif call.name == "end_call":
-                reason = str(call.arguments.get("reason") or "")
-                closing = str(call.arguments.get("closing_message") or "")
-                if (reason == "candidate_requested"
-                        and not any(classify_end_call_intent(source)
-                                    == EndCallIntent.END
-                                    for source in self._caller_sources(source_text))):
-                    entry["reason"] = "candidate end request not supported by transcript"
-                    continue
-                if reason == "interview_complete" and self.state.remaining:
-                    entry["reason"] = "interview objectives still missing"
-                    continue
-                if (reason == "limit_reached"
-                        and self.state.caller_turn_count <
-                        self.state.plan.boundaries.max_turns
-                        and self.state.elapsed_seconds <
-                        self.state.plan.boundaries.max_duration_minutes * 60):
-                    entry["reason"] = "interview limit not reached"
-                    continue
-                entry["applied"] = self.state.request_end_call(reason, closing)
-                if not entry["applied"]:
-                    entry["reason"] = "invalid or duplicate end-call request"
-            else:
-                entry["reason"] = "unknown tool"
-        return results
-
-
-    def _caller_sources(self, source_text: str) -> list[str]:
-        """Evidence may come from ANY committed caller utterance, not just the
-        current one — the model legitimately records volunteered or delayed
-        answers a turn late (live finding: single-utterance scoping caused
-        systematic rejects and re-ask loops). History holds only committed,
-        ownership-gated user turns, so this stays anchored to real speech."""
-        sources = [h["content"] for h in self.state.history
-                   if h.get("role") == "user"]
-        sources.append(source_text)
-        return [s for s in sources if s]
-
-
-def _quote_supported(quote: str, source_text: str) -> bool:
-    """Loose lexical anchoring: punctuation/case may differ, words may not."""
-
-    def normalize(value: str) -> str:
-        return " ".join(re.findall(r"[a-z0-9]+", value.lower()))
-
-    evidence = normalize(quote)
-    source = normalize(source_text)
-    return bool(evidence) and evidence in source
+        return apply_tools(
+            self.state, calls, call_id=self._call_id, is_current=is_current,
+            turn_id=turn_id, generation_id=generation_id, source_text=source_text)

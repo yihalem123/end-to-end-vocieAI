@@ -6,16 +6,9 @@ from pathlib import Path
 from server.engine.plan import InterviewState, load_plan
 import pytest
 
-from server.engine.turn import (
-    EngineStreamError,
-    LlmEngine,
-    SentenceChunker,
-    StreamAssembler,
-    ToolCall,
-    build_system_prompt,
-    fallback_line,
-    TOOLS,
-)
+from server.engine.prompt import TOOLS, build_system_prompt, fallback_line
+from server.engine.stream import EngineStreamError, SentenceChunker, StreamAssembler, ToolCall
+from server.engine.turn import LlmEngine
 
 PLAN_PATH = Path(__file__).resolve().parents[1] / "plans" / "icu_nurse.yaml"
 
@@ -212,7 +205,7 @@ def _engine_with_state():
 
 
 def _tc(call_id, name, args):
-    from server.engine.turn import ToolCall
+    from server.engine.stream import ToolCall
     return ToolCall(name=name, call_id=call_id, arguments=args)
 
 

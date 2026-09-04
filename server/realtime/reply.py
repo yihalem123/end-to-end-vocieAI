@@ -29,7 +29,8 @@ from contextlib import suppress
 from server.config import Settings
 from server.engine.plan import InterviewPlan, InterviewState, load_plan_cached
 from server.engine.stub import StubEngine
-from server.engine.turn import LlmEngine, SentenceChunker
+from server.engine.stream import SentenceChunker
+from server.engine.turn import LlmEngine
 from server.metrics import registry
 from server.realtime.bargein import BargeInGuard
 from server.realtime.endpoint import TurnComplete
