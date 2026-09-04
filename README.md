@@ -157,6 +157,12 @@ browser leg never produced, and the fix lives in `endpoint.py`.
 
 ## Deploy
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/yihalem123/end-to-end-vocieAI)
+
+Free tier: `render.yaml` defines the service (Docker, free plan, `/healthz` check) and
+prompts you for the two API keys. Free instances spin down after 15 idle minutes and
+take about a minute to wake, so open the URL a minute before a demo.
+
 The image is a single uvicorn process (`Dockerfile`): metrics and reports are
 in-memory and per process, so scale by machines, not workers.
 

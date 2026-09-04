@@ -1,0 +1,19 @@
+# Render Blueprint: one click from the README's "Deploy to Render" button.
+# Free web service (spins down after 15 min idle, ~1 min to wake). Render
+# provides PORT and TLS; the image binds PORT and TwiML derives its wss origin
+# from the request host, so no PUBLIC_BASE_URL is needed here.
+services:
+  - type: web
+    name: screener
+    runtime: docker
+    plan: free
+    region: virginia          # close to the speech and LLM vendors
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      - key: TTS_PROVIDER
+        value: aura
+      - key: DEEPGRAM_API_KEY
+        sync: false           # prompted for at deploy time, stored as a secret
+      - key: OPENAI_API_KEY
+        sync: false
