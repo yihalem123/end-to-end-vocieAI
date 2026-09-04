@@ -127,6 +127,7 @@ What was measured and **not** adopted, because the numbers said no:
   synthesized rambling caller with mid-thought pauses asserts turn integrity,
   extraction, **and that agent audio actually arrived**. `--protocol-self-test`
   checks the wire format offline.
+  `SCREENER_SERVER=<host>` runs the same gate against a deployment over wss/https.
 
 ## Two turn-taking stacks
 
@@ -170,7 +171,11 @@ in-memory and per process, so scale by machines, not workers.
 docker build -t screener . && docker run --env-file .env -p 8080:8080 screener
 ```
 
-Fly.io (`fly.toml` is included; the app needs a public HTTPS/WSS origin for Twilio):
+Fly.io (`fly.toml` is included; the app needs a public HTTPS/WSS origin for Twilio).
+Deployed in `iad`, next to the speech and LLM vendors, the same simulated call measured
+**turn latency p50 1252 ms** (endpoint 209 · llm first token 812 · tts first byte 46)
+against ~2.1–2.7 s from a developer laptop: the server-to-vendor round trips were the
+hidden cost, so region matters more than provider.
 
 ```bash
 fly launch --no-deploy --copy-config          # pick a name and region

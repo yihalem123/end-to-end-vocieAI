@@ -23,6 +23,7 @@ end, which does not belong in the unit suite.
 """
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -42,7 +43,12 @@ from server.realtime.transport import (  # noqa: E402
     mulaw_decode,
 )
 
-SERVER = "127.0.0.1:8080"
+# Target host: local by default; SCREENER_SERVER=<host> runs the same gate against a
+# deployment (wss/https are used automatically for anything that is not localhost).
+SERVER = os.environ.get("SCREENER_SERVER", "127.0.0.1:8080")
+_LOCAL = SERVER.startswith(("127.", "localhost"))
+WS_SCHEME = "ws" if _LOCAL else "wss"
+HTTP_SCHEME = "http" if _LOCAL else "https"
 MODE = "flux" if "--flux" in sys.argv else "custom"  # same rambler, both stacks
 # --twilio speaks the phone leg's protocol to /ws/twilio: base64 mu-law 8 kHz
 # media events out, media/mark/clear events in, marks echoed back as playback
@@ -181,7 +187,8 @@ async def main() -> int:
     playback = PlaybackTracker()
     heard_phone_samples = 0
     print(f"mode: {'twilio' if TWILIO else MODE}")
-    url = f"ws://{SERVER}/ws/twilio" if TWILIO else f"ws://{SERVER}/ws/call?mode={MODE}"
+    url = (f"{WS_SCHEME}://{SERVER}/ws/twilio" if TWILIO
+           else f"{WS_SCHEME}://{SERVER}/ws/call?mode={MODE}")
     async with websockets.connect(url) as ws:
         if TWILIO:
             await ws.send(json.dumps({"event": "connected"}))
@@ -252,7 +259,7 @@ async def main() -> int:
     assert call_id is not None
     async with httpx.AsyncClient() as client:
         report = (await client.get(
-            f"http://{SERVER}/report/{call_id}")).json()
+            f"{HTTP_SCHEME}://{SERVER}/report/{call_id}")).json()
 
     failures: list[str] = []
     turn_count = report.get("turn_count", 0) if TWILIO else len(turns)
