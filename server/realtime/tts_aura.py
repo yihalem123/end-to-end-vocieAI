@@ -19,7 +19,7 @@ import json
 import logging
 import time
 from contextlib import suppress
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 from urllib.parse import urlencode
 
 import websockets
@@ -48,7 +48,7 @@ def build_aura_url(model: str) -> str:
     return f"wss://api.deepgram.com/v1/speak?{urlencode(params)}"
 
 
-async def _open_socket(url: str, api_key: str):
+async def _open_socket(url: str, api_key: str) -> Any:
     return await websockets.connect(
         url, additional_headers={"Authorization": f"Token {api_key}"},
         open_timeout=TTS_CONNECT_TIMEOUT_SEC,
@@ -104,7 +104,7 @@ class WarmSocketCache:
                 and getattr(self._ws, "close_code", None) is None
                 and time.monotonic() - self._opened_t < self._max_age)
 
-    async def take(self, url: str):
+    async def take(self, url: str) -> Any:
         """Hand over the warm socket, or None if there is nothing fresh."""
         if self._ws is None:
             return None

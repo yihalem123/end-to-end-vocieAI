@@ -2,12 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-.env
 .ruff_cache/
+.env
 
 # local design sources (imported UI reference, not app code)
-Asandia Demo.html
-design_import/
-Call Report.html
-Call Report-light theme.html
-Asandia Demo-light.html
+design/

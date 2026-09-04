@@ -1,4 +1,16 @@
-"""Small control-intent classifiers shared by orchestration and tool validation."""
+"""Small control-intent classifiers shared by orchestration and tool validation.
+
+## How this works
+Ending a call is the one caller intent the LLM is never allowed to decide on its
+own, so it is detected here with plain regex over a normalised transcript and
+handled by the orchestrator before any model sees the turn. Two tiers: an
+explicit request with a call/interview object ("end this call", "hang up")
+terminates; a bare or phonetically-confused form ("I want to stop.", the live
+"in the cold" substitution for "end the call") only asks for confirmation.
+Everything else - "stop working nights", "cold in Delaware" - is an ordinary
+answer. Every phrase in the tests came from a real call, including five false
+positives that once hung up on a candidate describing shift preferences.
+"""
 import re
 from enum import StrEnum
 

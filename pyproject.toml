@@ -1,0 +1,23 @@
+[project]
+name = "screener"
+version = "0.1.0"
+description = "A from-scratch voice screening agent: browser mic -> VAD -> streaming ASR -> LLM engine -> streaming TTS, with barge-in, per-stage latency metrics and evidence-verified scoring."
+requires-python = ">=3.11"
+readme = "README.md"
+license = { file = "LICENSE" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["design", "models"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+# HTML-in-Python; being replaced by a Jinja template.
+"server/postcall/report_view.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

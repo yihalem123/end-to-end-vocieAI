@@ -75,7 +75,8 @@ def build_schema(plan: InterviewPlan) -> dict:
                 "confidence": {"type": "number",
                                 "description": "0-1: how clearly the transcript supports it."},
                 "contradictory": {"type": "boolean",
-                                  "description": "True if caller evidence conflicts or is corrected ambiguously."},
+                                  "description": ("True if caller evidence conflicts "
+                                                  "or is corrected ambiguously.")},
             },
         }
 

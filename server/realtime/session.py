@@ -1,4 +1,16 @@
-"""Explicit per-call candidate-session lifecycle and consent classification."""
+"""Explicit per-call candidate-session lifecycle and consent classification.
+
+## How this works
+A call is a small state machine and the transition table below is the whole
+policy: disclosure -> awaiting consent -> interviewing -> closing -> post
+processing -> completed, with refused / failed / cancelled as terminal exits.
+transition() raises on anything not in the table, so an out-of-order event is
+a loud bug rather than a quietly wrong report. The orchestrator (call.py)
+consults the status before every caller turn: nothing reaches the engine until
+consent is an explicit yes, and refusal ends the call without any extraction.
+Consent classification is deliberately conservative - an ambiguous answer
+re-prompts instead of being coerced to a boolean.
+"""
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum

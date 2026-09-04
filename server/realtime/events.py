@@ -9,6 +9,7 @@ losing a turn boundary or growing memory without limit. Producers never wait,
 so provider socket readers cannot be back-pressured by browser rendering.
 """
 import asyncio
+from typing import Any
 
 from server.realtime.asr import AsrPartial
 from server.realtime.flux import FluxUpdate
@@ -48,7 +49,7 @@ class EventBuffer:
             ) from exc
         self._ready.set()
 
-    async def get(self):
+    async def get(self) -> Any:
         while True:
             try:
                 return self._reliable.get_nowait()

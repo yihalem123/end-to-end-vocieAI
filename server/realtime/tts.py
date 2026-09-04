@@ -31,6 +31,7 @@ Two clients live here:
 """
 import asyncio
 import base64
+from collections.abc import Iterator
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -109,7 +110,7 @@ class FrameChunker:
     def __init__(self) -> None:
         self._pending = b""
 
-    def push(self, chunk: bytes):
+    def push(self, chunk: bytes) -> Iterator[bytes]:
         data = self._pending + chunk
         for off in range(0, len(data) - FRAME_BYTES + 1, FRAME_BYTES):
             yield data[off : off + FRAME_BYTES]

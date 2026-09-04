@@ -22,6 +22,8 @@ turn_latency from the Speaker.
 """
 import asyncio
 import logging
+import re
+from collections.abc import AsyncIterator
 from contextlib import suppress
 
 from server.config import Settings
@@ -46,8 +48,6 @@ def _spoken_eq(a: str, b: str) -> bool:
     Internal punctuation can change meaning ("No, nights" vs "No nights"), so
     it remains part of the identity check.
     """
-    import re
-
     def norm(value: str) -> str:
         return re.sub(r"\s+", " ", value.strip().casefold()).rstrip(".!?")
 
@@ -326,7 +326,7 @@ class ReplyController:
                 turn_id, lambda token: self._append_agent(token, text, audio=False))
             return
 
-        async def script_sentences():
+        async def script_sentences() -> AsyncIterator[str]:
             """Same chunking as engine output: the caller hears sentence one
             while the rest is still synthesizing, the transcript grows with
             her voice, and no single utterance has to carry a whole

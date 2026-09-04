@@ -216,7 +216,6 @@ def test_cancellation_during_connect_does_not_crash_the_reclaim() -> None:
     # Found live: a barge-in landed while the very first Speak was still
     # opening the socket, so there was no connection to scrub. The reclaim task
     # died on None.send() and left a stack trace in the logs each call.
-    from server.realtime import tts_aura
 
     async def run() -> None:
         client = _client(None)

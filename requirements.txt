@@ -1,10 +1,15 @@
-fastapi
-uvicorn[standard]
-pydantic-settings
-httpx
-httpx2
-numpy
-onnxruntime
-websockets
-pytest
-pyyaml
+# Pinned to the versions the offline suite and live gates were run against.
+# websockets 15 (asyncio implementation) and httpx 0.28 have breaking API
+# differences from earlier majors, so exact pins are deliberate.
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic-settings==2.10.1
+httpx==0.28.1
+numpy==2.3.2
+onnxruntime==1.23.1
+websockets==15.0.1
+pyyaml==6.0.2
+Jinja2==3.1.6
+
+# test
+pytest==8.4.2

@@ -28,7 +28,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -111,7 +111,7 @@ class SentenceChunker:
     def __init__(self) -> None:
         self._buf = ""
 
-    def push(self, delta: str):
+    def push(self, delta: str) -> Iterator[str]:
         self._buf += delta
         while True:
             cut = self._find_boundary()
@@ -397,7 +397,7 @@ class LlmEngine:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def _stream_lines(self, body: dict):
+    async def _stream_lines(self, body: dict) -> AsyncIterator[str]:
         """SSE lines with provider timeouts mapped to a typed EngineTimeout."""
         try:
             async with self._client.stream(

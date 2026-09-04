@@ -441,7 +441,8 @@ class CallSession:
                       self._replies.interview.plan.boundaries.max_turns):
                     await self._finish_interview(
                         "max_turns",
-                        "We've reached the interview limit, so I'll end the screening here. Thank you.",
+                        "We've reached the interview limit, so I'll end the "
+                        "screening here. Thank you.",
                         self._next_turn_id,
                     )
             if self._close_when_idle and self._replies.is_idle:

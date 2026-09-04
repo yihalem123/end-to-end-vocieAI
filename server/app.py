@@ -22,6 +22,8 @@ import logging
 from contextlib import asynccontextmanager
 import uuid
 from pathlib import Path
+from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
@@ -56,7 +58,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     resolved = settings if settings is not None else get_settings()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # Fail fast at boot: a broken plan file or missing VAD model must
         # surface at startup, not on call #1. Both loads are cached, so the
         # first call pays nothing.
@@ -187,7 +189,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         work" — it cost one live debugging session already. This is a local
         dev console, so correctness beats the handful of saved requests."""
 
-        def file_response(self, *args, **kwargs):
+        def file_response(self, *args: Any, **kwargs: Any) -> Response:
             response = super().file_response(*args, **kwargs)
             response.headers["cache-control"] = "no-store, must-revalidate"
             return response

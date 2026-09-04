@@ -429,7 +429,7 @@ def test_chunker_does_not_split_inside_dotted_acronyms() -> None:
     # two utterances â€” audibly chopped mid-sentence.
     ch = SentenceChunker()
     # Followed by more text, so the boundary resolves inside push() rather than
-    # via the trailing-terminal hold — the split, if any, would show here.
+    # via the trailing-terminal hold - the split, if any, would show here.
     assert list(ch.push("Which U.S. state issued your RN license? Thanks.")) == [
         "Which U.S. state issued your RN license?"]
     assert ch.flush() == "Thanks."
