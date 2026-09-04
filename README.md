@@ -104,12 +104,12 @@ are in `REHEARSAL.md` under *Measured negative results*.
 
 ## Verification
 
-- `pytest -q` — **302 offline tests**, no vendor calls. The browser capture worklet
+- `pytest -q` — **327 offline tests**, no vendor calls. The browser capture worklet
   runs as real JavaScript under Node (`tests/capture_harness.js`) because the
   simulator can never reach it — a mic regression once shipped while every Python
   test stayed green.
 - `ruff check .` — configured in `pyproject.toml`; both run in CI on every push.
-- `python scripts/simulate_caller.py [--flux]` — the live gate: a synthesized rambling
+- `python scripts/simulate_caller.py [--flux | --twilio]` — the live gate: a synthesized rambling
   caller with mid-thought pauses asserts turn integrity, extraction, **and that agent
   audio actually arrived**. `--protocol-self-test` checks the wire format offline.
 
@@ -121,12 +121,30 @@ A/B reads side by side in the report. Flux's `EagerEndOfTurn` is the only mechan
 that can hide LLM latency (it signals before the final transcript); the custom stack
 commits faster. Both are measured in `REHEARSAL.md`.
 
+## Telephony
+
+The phone leg is a **transport adapter, not a second pipeline**: Twilio Media
+Streams connect to `/ws/twilio`, `TwilioSocket` transcodes 8 kHz μ-law to the
+internal 16 kHz frames and back, maps Twilio `mark`/`clear` onto the browser's
+playback-ack protocol, and `CallSession` never learns which leg it is on.
+
+```bash
+ngrok http 8080                                   # or cloudflared; gives https://<id>.ngrok.app
+# .env: PUBLIC_BASE_URL=https://<id>.ngrok.app  TWILIO_ACCOUNT_SID=…  TWILIO_AUTH_TOKEN=…  TWILIO_FROM_NUMBER=+1…
+python scripts/place_call.py +15551234567         # outbound; or point a number's voice webhook at /twilio/voice
+python scripts/simulate_caller.py --twilio        # the same live gate over the phone protocol, no Twilio account needed
+```
+
+`/twilio/voice` verifies `X-Twilio-Signature` when an auth token is configured.
+Latency on the phone leg adds the carrier's own audio path on top of the numbers
+above; that is the one stage this repo cannot measure without a real call.
+
 ## Deliberately out of scope
 
-Authenticated sessions, durable persistence, containerized deployment and
-telephony ingress were scoped out on day one for a one-week build; the sequencing is
-in `PLAN.md` (kept as history). `docs/reviews/` holds an external review of the
-repository and its verified triage.
+Authenticated sessions, durable persistence and containerized deployment were
+scoped out on day one for a one-week build; the sequencing is in `PLAN.md` (kept
+as history). `docs/reviews/` holds an external review of the repository and its
+verified triage.
 
 ## License
 
