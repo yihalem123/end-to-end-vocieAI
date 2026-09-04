@@ -141,3 +141,27 @@ def test_prewarm_is_a_no_op_without_the_aura_provider() -> None:
         assert calls == []            # nothing to warm for this provider
     finally:
         tts_aura.warm_sockets = original
+
+
+
+def test_twiml_connects_the_call_to_the_media_stream() -> None:
+    settings = Settings(_env_file=None, public_base_url="https://demo.ngrok.app")
+    with TestClient(create_app(settings)) as client:
+        resp = client.post("/twilio/voice", data={"CallSid": "CA1", "From": "+15550001"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/xml")
+    assert '<Stream url="wss://demo.ngrok.app/ws/twilio"/>' in resp.text
+
+
+def test_twiml_rejects_an_unsigned_request_when_a_token_is_configured() -> None:
+    from server.realtime.twilio import twilio_signature
+
+    settings = Settings(_env_file=None, public_base_url="https://demo.ngrok.app",
+                        twilio_auth_token="secret")
+    with TestClient(create_app(settings)) as client:
+        assert client.post("/twilio/voice", data={"CallSid": "CA1"}).status_code == 403
+        good = twilio_signature("https://demo.ngrok.app/twilio/voice",
+                                {"CallSid": "CA1"}, "secret")
+        ok = client.post("/twilio/voice", data={"CallSid": "CA1"},
+                         headers={"X-Twilio-Signature": good})
+    assert ok.status_code == 200

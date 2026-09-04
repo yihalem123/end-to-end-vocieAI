@@ -37,9 +37,19 @@ import websockets
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from server.realtime.protocol import decode_audio_frame, encode_audio_frame  # noqa: E402
+from server.realtime.transport import (  # noqa: E402
+    frame_to_twilio_payload,
+    mulaw_decode,
+)
 
 SERVER = "127.0.0.1:8080"
 MODE = "flux" if "--flux" in sys.argv else "custom"  # same rambler, both stacks
+# --twilio speaks the phone leg's protocol to /ws/twilio: base64 mu-law 8 kHz
+# media events out, media/mark/clear events in, marks echoed back as playback
+# acks. Same persona, same assertions on the report; the browser-only UI
+# events (turn/vad) do not exist on that leg, so the turn count comes from the
+# report and the pause-hold check is skipped there.
+TWILIO = "--twilio" in sys.argv
 FRAME_BYTES = 640
 FRAME_SEC = 0.02
 PAUSE = object()  # mid-answer silence: the endpointer patience test.
@@ -133,15 +143,23 @@ def trim_silence(pcm: bytes, threshold: int = 300) -> bytes:
     return samples[start:end].tobytes()
 
 
+async def send_frame(ws, frame: bytes) -> None:
+    if TWILIO:
+        await ws.send(json.dumps({"event": "media", "streamSid": "MZsim",
+                                  "media": {"payload": frame_to_twilio_payload(frame)}}))
+    else:
+        await ws.send(frame)
+
+
 async def stream_answer(ws, answer: Answer, cache: dict) -> None:
     for part in answer.parts:
         pcm = bytes(int(PAUSE_SEC * 32000)) if part is PAUSE else cache[part]
         for off in range(0, len(pcm) - FRAME_BYTES + 1, FRAME_BYTES):
-            await ws.send(pcm[off:off + FRAME_BYTES])
+            await send_frame(ws, pcm[off:off + FRAME_BYTES])
             await asyncio.sleep(FRAME_SEC)
     # trailing silence so the endpointer can commit the turn
     for _ in range(150):
-        await ws.send(bytes(FRAME_BYTES))
+        await send_frame(ws, bytes(FRAME_BYTES))
         await asyncio.sleep(FRAME_SEC)
 
 
@@ -161,22 +179,47 @@ async def main() -> int:
     call_id: str | None = None
     agent_events = asyncio.Queue()
     playback = PlaybackTracker()
-    print(f"mode: {MODE}")
-    async with websockets.connect(f"ws://{SERVER}/ws/call?mode={MODE}") as ws:
+    heard_phone_samples = 0
+    print(f"mode: {'twilio' if TWILIO else MODE}")
+    url = f"ws://{SERVER}/ws/twilio" if TWILIO else f"ws://{SERVER}/ws/call?mode={MODE}"
+    async with websockets.connect(url) as ws:
+        if TWILIO:
+            await ws.send(json.dumps({"event": "connected"}))
+            await ws.send(json.dumps({"event": "start", "streamSid": "MZsim",
+                                      "start": {"streamSid": "MZsim", "callSid": "CAsim"}}))
+
         async def reader() -> None:
+            nonlocal call_id, vad_stops, heard_phone_samples
             async for msg in ws:
                 if isinstance(msg, bytes):
                     playback.on_audio(msg)  # strips generation header and counts PCM
                     continue
                 ev = json.loads(msg)
+                if TWILIO:
+                    match ev.get("event"):
+                        case "media":
+                            import base64
+                            pcm8k = mulaw_decode(base64.b64decode(ev["media"]["payload"]))
+                            heard_phone_samples += len(pcm8k)
+                        case "mark":
+                            name = ev.get("mark", {}).get("name", "")
+                            if name.startswith("call-"):
+                                call_id = name[len("call-"):]
+                            elif name.startswith("gen-"):
+                                # Twilio echoes a mark once the audio before it
+                                # played; the sim "plays" instantly, like the
+                                # browser tracker acks audio_end.
+                                await ws.send(json.dumps({"event": "mark", "streamSid": "MZsim",
+                                                          "mark": {"name": name}}))
+                                print(f"  agent: [phone leg] reply {name} played")
+                                await agent_events.put(ev)
+                    continue
                 if ev["type"] == "session":
-                    nonlocal call_id
                     call_id = ev["call_id"]
                 ack = playback.acknowledgement(ev)
                 if ack is not None:
                     await ws.send(json.dumps(ack))
                 if ev["type"] == "vad" and ev["state"] == "silence":
-                    nonlocal vad_stops
                     vad_stops += 1
                 if ev["type"] == "turn":
                     turns.append(ev)
@@ -212,14 +255,16 @@ async def main() -> int:
             f"http://{SERVER}/report/{call_id}")).json()
 
     failures: list[str] = []
-    if len(turns) != len(RAMBLER):
-        failures.append(f"expected {len(RAMBLER)} turns, endpointer made {len(turns)} "
+    turn_count = report.get("turn_count", 0) if TWILIO else len(turns)
+    if turn_count != len(RAMBLER):
+        failures.append(f"expected {len(RAMBLER)} turns, endpointer made {turn_count} "
                         "(a mid-answer pause split a turn)")
     # Patience SUCCESS is invisible in commit reasons (a trailing-reason commit
     # means patience ran out). Proof the pauses tested anything: silences that
     # did NOT become commits — VAD stops must exceed turns by ~the pause count.
+    # (The phone leg carries no vad events, so this check is browser-only.)
     held = vad_stops - len(turns)
-    if held < 4:
+    if not TWILIO and held < 4:
         failures.append(f"only {held} mid-turn silences held — pauses tested nothing")
     fields = report.get("fields", {})
     if not (5.5 <= (fields.get("icu_years", {}).get("value") or 0) <= 7):
@@ -232,7 +277,7 @@ async def main() -> int:
     # A silent server can otherwise pass this gate: agent text still streams
     # over JSON while TTS delivers nothing (seen live with an exhausted
     # ElevenLabs quota — every reply finalized with zero audio).
-    heard = sum(playback.played_samples.values())
+    heard = sum(playback.played_samples.values()) + heard_phone_samples
     if heard == 0:
         failures.append("no agent audio received — TTS is silent "
                         "(quota exhausted or provider failure)")
@@ -244,7 +289,7 @@ async def main() -> int:
         for f in failures:
             print(" -", f)
         return 1
-    print(f"PASS: {len(turns)} turns, no premature commits, extraction correct")
+    print(f"PASS: {turn_count} turns, no premature commits, extraction correct")
     return 0
 
 

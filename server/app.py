@@ -1,11 +1,14 @@
 """FastAPI app factory. Phases 0-2.
 
 Endpoints:
-  GET  /            -> static/index.html test console
+  GET  /             -> static/index.html test console
   GET  /healthz
-  WS   /ws/call     -> the call pipeline: VAD + ASR + endpointer (Phase 2)
-  WS   /ws/echo     -> byte-identical echo, kept as a latency diagnostic (Phase 1)
-  GET  /metrics     -> per-stage latency percentiles (Phase 3)
+  POST /prewarm      -> open a TTS socket before a call exists
+  WS   /ws/call      -> the browser call pipeline: VAD + ASR + endpointer + replies
+  WS   /ws/twilio    -> the same pipeline behind the Twilio Media Streams adapter
+  POST /twilio/voice -> TwiML that connects an incoming call to /ws/twilio
+  WS   /ws/echo      -> byte-identical echo, kept as a latency diagnostic
+  GET  /metrics      -> per-stage latency percentiles; /report/{id}[/view]
 
 ## How this works
 create_app(settings) builds the app; tests inject Settings(_env_file=None, ...) to
@@ -25,7 +28,7 @@ from pathlib import Path
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -41,6 +44,7 @@ from server.engine.plan import load_plan_cached
 from server.realtime.call import CallSession
 from server.realtime.session import SessionStatus
 from server.realtime import tts_aura
+from server.realtime.twilio import TwilioSocket, twiml_connect_stream, verify_twilio_signature
 from server.realtime.vad import SileroRuntime
 
 _postcall_tasks: set[asyncio.Task] = set()  # keep refs; tasks self-remove
@@ -115,12 +119,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail="no such call")
         return HTMLResponse(render_html(report_store[call_id]))
 
-    @app.websocket("/ws/call")
-    async def ws_call(ws: WebSocket) -> None:
-        mode = ws.query_params.get("mode", "custom")
-        call_id = uuid.uuid4().hex
+    async def _run_call(sock, mode: str, call_id: str) -> None:
+        """One call runner for every transport: the browser socket and the
+        Twilio adapter both present the same receive()/send contract."""
         session = CallSession(
-            ws, app.state.settings, call_id=call_id, mode=mode,
+            sock, app.state.settings, call_id=call_id, mode=mode,
             plan=getattr(app.state, "plan", None),
             vad_runtime=getattr(app.state, "vad_runtime", None),
         )
@@ -136,7 +139,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             }:
                 session.state.session.transition(SessionStatus.FAILED)
             try:
-                await ws.close(code=1011)
+                await sock.close(code=1011)
             except RuntimeError:
                 pass  # already closed
         finally:
@@ -167,6 +170,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     _postcall_tasks.add(task)
                     task.add_done_callback(_postcall_tasks.discard)
                     log.info("postcall started: /report/%s/view", call_id)
+
+    @app.websocket("/ws/call")
+    async def ws_call(ws: WebSocket) -> None:
+        await _run_call(ws, ws.query_params.get("mode", "custom"), uuid.uuid4().hex)
+
+    @app.websocket("/ws/twilio")
+    async def ws_twilio(ws: WebSocket) -> None:
+        # The phone leg: Twilio Media Streams wrapped to look like the browser.
+        call_id = uuid.uuid4().hex
+        await _run_call(TwilioSocket(ws, call_id), "custom", call_id)
+
+    @app.api_route("/twilio/voice", methods=["GET", "POST"])
+    async def twilio_voice(request: Request) -> Response:
+        """TwiML for an incoming (or REST-placed) call: connect its audio here."""
+        form = (dict(await request.form()) if request.method == "POST"
+                else dict(request.query_params))
+        if resolved.twilio_auth_token:
+            url = (resolved.public_base_url.rstrip("/") + request.url.path
+                   if resolved.public_base_url else str(request.url))
+            if not verify_twilio_signature(url, {k: str(v) for k, v in form.items()},
+                                           resolved.twilio_auth_token,
+                                           request.headers.get("X-Twilio-Signature")):
+                raise HTTPException(status_code=403, detail="bad twilio signature")
+        origin = resolved.public_base_url or f"https://{request.headers.get('host', 'localhost')}"
+        ws_url = origin.replace("https://", "wss://").replace("http://", "ws://").rstrip("/")
+        return Response(twiml_connect_stream(ws_url + "/ws/twilio"), media_type="text/xml")
 
     @app.websocket("/ws/echo")
     async def ws_echo(ws: WebSocket) -> None:
