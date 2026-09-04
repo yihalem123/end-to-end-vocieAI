@@ -1,0 +1,30 @@
+# Fly.io deployment. A public HTTPS/WSS origin is what the Twilio leg needs
+# (PUBLIC_BASE_URL=https://<app>.fly.dev). Secrets go in `fly secrets set`.
+app = "screener"            # rename to your app name after `fly launch --no-deploy`
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  TTS_PROVIDER = "aura"
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A machine stopping mid-call would drop the WebSocket; keep one warm.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "20s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-2x"    # Silero VAD + audio transcoding on the request path
+  memory = "1gb"

@@ -1,4 +1,4 @@
-"""Per-stage latency registry backing /metrics. Phase 3.
+"""Per-stage latency registry backing /metrics.
 
 ## How this works
 Every completed turn records whatever stage timings it has (endpoint_delay_ms,

@@ -1,4 +1,4 @@
-"""Barge-in onset guard: should the agent shut up? Phase 3.
+"""Barge-in onset guard: should the agent shut up?
 
 ## How this works
 Same pattern as endpoint.py: a synchronous state machine fed explicit timestamps,

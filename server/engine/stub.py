@@ -1,12 +1,12 @@
-"""Scripted stand-in for the interview engine. Phase 3 only.
+"""Scripted stand-in for the interview engine, used when no OpenAI key is set.
 
 ## How this works
-The Phase 3 voice loop needs SOMETHING to say so TTS, pacing, and barge-in can
+The voice loop needs SOMETHING to say so TTS, pacing, and barge-in can
 be built and profiled without the LLM. This cycles through a canned ICU-screen
 script, one reply per committed caller turn. Replies are pre-split into
 sentences because the speak task opens one TTS stream per sentence and records
 a frame mark at each boundary — that's what makes barge-in truncation exact.
-Phase 4 replaces this object with the real engine behind the same call shape:
+LlmEngine replaces this object behind the same call shape:
 reply(transcript) -> list of sentences.
 """
 

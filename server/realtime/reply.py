@@ -1,4 +1,4 @@
-"""ReplyController: everything that happens after a caller turn commits. Phase 4.
+"""ReplyController: everything that happens after a caller turn commits.
 
 ## How this works
 Owns the reply side of a call so call.py stays a thin event router. A
@@ -8,7 +8,7 @@ LLM mutation and transcript append checks ownership. Browser clear/drain acks
 carry the same generation id; delayed acks are ignored. Voice completion waits
 for playback_drained, so barge-in remains armed while buffered audio is audible.
 - the ENGINE: LlmEngine (Responses API, plans/icu_nurse.yaml) when an OpenAI key
-  exists, else the Phase 3 StubEngine. Both produce a stream of sentences behind
+  exists, else the StubEngine. Both produce a stream of sentences behind
   one interface (_sentences_for).
 - the SPEAKER + multi-context TTS (when an ElevenLabs key exists), pre-warmed at
   call setup; without it, replies are text-only.

@@ -1,4 +1,4 @@
-"""ElevenLabs streaming TTS client (raw WebSocket, no SDK). Phase 3.
+"""ElevenLabs streaming TTS client (raw WebSocket, no SDK).
 
 ## How this works
 One wss connection per assistant reply to /v1/text-to-speech/{voice}/stream-input

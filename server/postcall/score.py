@@ -1,7 +1,7 @@
-"""Deterministic scoring: verified evidence -> number. Phase 5a.
+"""Deterministic scoring: verified evidence -> number.
 
 ## How this works
-The LLM never computes the score (CLAUDE.md hard rule) — extraction hands over
+The LLM never computes the score (a hard rule of this design) — extraction hands over
 verified {value, quote, confidence} fields and everything below is arithmetic
 on the plan's own rubric ("plan is data" extended to scoring):
 - knockouts first: a disqualifying recorded value zeroes the call outright.

@@ -5,5 +5,9 @@ __pycache__/
 .ruff_cache/
 .env
 
-# local design sources (imported UI reference, not app code)
+# local working notes and design sources: not part of the published repository
 design/
+docs/
+REHEARSAL.md
+PLAN.md
+CLAUDE.md

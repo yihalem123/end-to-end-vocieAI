@@ -1,4 +1,4 @@
-"""Settings load from environment variables (Phase 0: keys + turn model)."""
+"""Settings load from environment variables (keys + turn model)."""
 import pytest
 
 from server.config import Settings

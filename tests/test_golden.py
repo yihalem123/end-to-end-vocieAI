@@ -1,7 +1,7 @@
 """Golden replays: frozen real extractions run through verify + score.
 
 The raw_extraction in each golden is a real gpt-5.6-terra response against the
-Phase-2 utterance-id schema, captured once and frozen — so these tests exercise
+utterance-id schema, captured once and frozen — so these tests exercise
 verification and scoring against genuine model output, deterministically and
 offline. Regenerate via the extraction probe if the plan or schema changes.
 """

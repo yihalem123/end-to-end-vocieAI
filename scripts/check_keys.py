@@ -4,7 +4,7 @@
 Each vendor exposes a free, read-only endpoint that fails with 401/403 on a bad key:
 Deepgram lists projects, OpenAI lists models, ElevenLabs returns the account. We hit
 each with its auth header style (Token / Bearer / xi-api-key) and report per-vendor
-PASS/FAIL without ever printing the key itself (CLAUDE.md: no secrets in logs).
+PASS/FAIL without ever printing the key itself (no secrets in logs).
 Sync httpx is fine here — this is a CLI script, not the async server. Exit code is
 non-zero if any key fails, so it can gate the start of a build session.
 

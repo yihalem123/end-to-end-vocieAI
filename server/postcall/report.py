@@ -1,11 +1,11 @@
-"""Post-call pipeline trigger + in-memory report store. Phase 5b.
+"""Post-call pipeline trigger + in-memory report store.
 
 ## How this works
 After a consented call ends, app.py fires run_postcall() under the call id:
 extract caller-id evidence -> verify -> score deterministically -> store. Refused
 or cancelled sessions get terminal, unscored reports without extraction. The
 store is a bounded in-process dict (oldest-first eviction) — a
-database is a production talking point, not a demo requirement. build_report()
+database is the production follow-up; an in-process store fits one worker. build_report()
 is pure so the report shape is unit-testable without the vendor call; the HTML
 view lives in report_view.py (the Call Report design canvas).
 """

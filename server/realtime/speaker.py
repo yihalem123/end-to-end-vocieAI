@@ -1,4 +1,4 @@
-"""Speaker: streams one assistant reply to the client. Phase 3.
+"""Speaker: streams one assistant reply to the client.
 
 ## How this works
 speak() runs inside one supervisor-owned generation. A bounded producer records

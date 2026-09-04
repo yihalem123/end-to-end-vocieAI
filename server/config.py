@@ -1,4 +1,4 @@
-"""Env-based settings (pydantic-settings). Built in Phase 0.
+"""Env-based settings (pydantic-settings).
 
 ## How this works
 Settings is a pydantic-settings model: each field maps to an env var of the same name
@@ -6,7 +6,7 @@ Settings is a pydantic-settings model: each field maps to an env var of the same
 Keys default to "" rather than raising, so the app boots without credentials and each
 vendor client fails loudly only when actually used (and check_keys.py verifies them
 up front). TURN_MODEL is config, not code, because the turn model is a measured
-choice — Phase 4 benchmarks it and we may swap it without touching the engine.
+choice — it was benchmarked and can be swapped without touching the engine.
 """
 from pydantic_settings import BaseSettings, SettingsConfigDict
 

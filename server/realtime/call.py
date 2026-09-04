@@ -12,7 +12,7 @@ One CallSession per WebSocket, three long-lived tasks under a TaskGroup:
   to the ReplyController (reply.py), which owns engine/TTS/barge-in mechanics.
 Cancellation: client disconnect ends _recv_loop -> ASR gets its CloseStream
 sentinel, the event loop is cancelled, the controller closes engine and TTS —
-every task cleans up in finally/context managers (CLAUDE.md cancellation rules).
+every task cleans up in finally/context managers (the cancellation rules every task follows).
 """
 import asyncio
 import json

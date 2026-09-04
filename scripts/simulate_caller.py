@@ -1,4 +1,4 @@
-"""Simulated caller: a scripted persona speaks to the running server. Phase 5b.
+"""Simulated caller: a scripted persona speaks to the running server.
 
 ## How this works
 The rambling persona is an endpointer stress test: each answer is split into

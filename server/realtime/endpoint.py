@@ -1,4 +1,4 @@
-"""Endpointer: decides WHEN the caller's turn is over. Phase 2.
+"""Endpointer: decides WHEN the caller's turn is over.
 
 ## How this works
 The hardest problem in voice UX: commit too early and you interrupt mid-thought

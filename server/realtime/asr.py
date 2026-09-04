@@ -1,4 +1,4 @@
-"""Deepgram v1 streaming ASR client (raw WebSocket, no SDK). Phase 2.
+"""Deepgram v1 streaming ASR client (raw WebSocket, no SDK).
 
 ## How this works
 We speak Deepgram's wire protocol directly: one wss connection to /v1/listen with

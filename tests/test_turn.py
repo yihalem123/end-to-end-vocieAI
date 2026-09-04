@@ -192,7 +192,7 @@ def test_stale_generation_cannot_apply_tool_side_effects() -> None:
     assert state.end_call_request is None
 
 
-# --- Phase 3: tool execution ledger ---
+# --- tool execution ledger ---
 
 def _engine_with_state():
     from pathlib import Path

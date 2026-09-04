@@ -133,7 +133,7 @@ def test_reset_affects_only_its_call() -> None:
 def test_real_speech_triggers_gate_events() -> None:
     # Regression: without the 64-sample context the v5 model expects prepended
     # to each window, real speech scores ~0.0 and the gate never fires (found
-    # live in Phase 2: transcript flowed but no VAD events, so no turns).
+    # live: transcript flowed but no VAD events, so no turns).
     # tests/assets/speech.wav: 16 kHz mono PCM16, ~6 s of synthesized speech.
     import wave
     from pathlib import Path

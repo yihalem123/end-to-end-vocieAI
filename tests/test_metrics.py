@@ -26,7 +26,7 @@ def test_registry_snapshot_per_stage() -> None:
 
 
 def test_registry_ignores_missing_stages() -> None:
-    # Phase 2 turns have no TTS timings; Phase 4 adds llm_ttft. Turns record
+    # Not every turn records every stage (a text-only turn has no TTS timings). Turns record
     # whatever stages they have, and each stage aggregates independently.
     reg = MetricsRegistry()
     reg.record_turn(endpoint_delay_ms=100)

@@ -1,4 +1,4 @@
-"""Configured post-call ADVISORY analyses. Additive to Phase 5's pipeline.
+"""Configured post-call ADVISORY analyses. Additive to the post-call pipeline.
 
 ## How this works
 The plan's `analyses:` block defines what gets written after each call (plan is

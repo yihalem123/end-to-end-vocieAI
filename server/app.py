@@ -1,4 +1,4 @@
-"""FastAPI app factory. Phases 0-2.
+"""FastAPI app factory.
 
 Endpoints:
   GET  /             -> static/index.html test console

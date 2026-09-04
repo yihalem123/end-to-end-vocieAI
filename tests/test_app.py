@@ -22,7 +22,7 @@ def test_index_page_served() -> None:
 
 
 def test_ws_echo_echoes_binary_frames() -> None:
-    # /ws/echo is the latency diagnostic left over from Phase 1: byte-identical,
+    # /ws/echo is the latency diagnostic kept as a diagnostic: byte-identical,
     # ordered echo of 640-byte frames.
     frame_a = bytes(range(256)) * 2 + bytes(128)
     frame_b = bytes(reversed(frame_a))

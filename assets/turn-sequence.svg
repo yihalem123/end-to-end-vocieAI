@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="540" viewBox="0 0 1000 540" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1000" height="540" fill="#2b2b2b"/>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7aa2f7"/>
+    </marker>
+  </defs>
+
+  <!-- participants -->
+  <g font-size="19" font-weight="600" fill="#f2f2f2" text-anchor="middle">
+    <rect x="95" y="80" width="96" height="48" rx="6" fill="#3b3b3b" stroke="#5a5a5a"/><text x="143" y="110">Caller</text>
+    <rect x="248" y="80" width="124" height="48" rx="6" fill="#3b3b3b" stroke="#5a5a5a"/><text x="310" y="110">Turn-taking</text>
+    <rect x="430" y="80" width="96" height="48" rx="6" fill="#3b3b3b" stroke="#5a5a5a"/><text x="478" y="110">LLM</text>
+    <rect x="598" y="80" width="96" height="48" rx="6" fill="#3b3b3b" stroke="#5a5a5a"/><text x="646" y="110">TTS</text>
+    <rect x="762" y="80" width="104" height="48" rx="6" fill="#3b3b3b" stroke="#5a5a5a"/><text x="814" y="110">Browser</text>
+  </g>
+
+  <!-- lifelines -->
+  <g stroke="#5a5a5a" stroke-dasharray="5 5">
+    <line x1="143" y1="128" x2="143" y2="500"/>
+    <line x1="310" y1="128" x2="310" y2="500"/>
+    <line x1="478" y1="128" x2="478" y2="500"/>
+    <line x1="646" y1="128" x2="646" y2="500"/>
+    <line x1="814" y1="128" x2="814" y2="500"/>
+  </g>
+
+  <!-- messages -->
+  <g font-size="15" fill="#cfcfcf" text-anchor="middle">
+    <line x1="143" y1="158" x2="310" y2="158" stroke="#9a9a9a" marker-end="url(#arrow)"/>
+    <text x="226" y="150">stops speaking</text>
+
+    <rect x="222" y="172" width="176" height="28" rx="3" fill="#161616" stroke="#4a4a4a"/>
+    <text x="310" y="191" fill="#e6e6e6">commit (200 ms – 2.5 s tiered)</text>
+
+    <line x1="310" y1="230" x2="478" y2="230" stroke="#9a9a9a" marker-end="url(#arrow)"/>
+    <text x="394" y="222">speculate (optional, commit-gated)</text>
+
+    <line x1="478" y1="282" x2="646" y2="282" stroke="#9a9a9a" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+    <text x="562" y="274">sentence 1 streams</text>
+
+    <line x1="646" y1="334" x2="814" y2="334" stroke="#9a9a9a" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+    <text x="730" y="326">first audio (turn p50 ≈ 2.1 s)</text>
+
+    <line x1="478" y1="386" x2="646" y2="386" stroke="#9a9a9a" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+    <text x="562" y="378">sentence 2+ while playing</text>
+
+    <line x1="814" y1="438" x2="310" y2="438" stroke="#9a9a9a" stroke-dasharray="6 4" marker-end="url(#arrow)"/>
+    <text x="562" y="430">playback acks (cleared / drained) with the generation id</text>
+  </g>
+
+  <text x="500" y="518" font-size="12" fill="#8a8a8a" text-anchor="middle">endpoint ≈ 0.36 s · llm first token ≈ 1.2 s · tts first byte ≈ 0.43 s · greeting to first audio ≈ 0.94 s (pre-warmed socket)</text>
+</svg>

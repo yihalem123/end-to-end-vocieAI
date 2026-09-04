@@ -1,4 +1,4 @@
-"""Silero VAD (ONNX) + hysteresis gate + frame-to-window buffering. Phase 2.
+"""Silero VAD (ONNX) + hysteresis gate + frame-to-window buffering.
 
 ## How this works
 Four layers, separable so each is testable alone:
@@ -7,7 +7,7 @@ Four layers, separable so each is testable alone:
   512-sample 16 kHz window (32 ms) it takes and returns a recurrent state tensor,
   AND each window must be prepended with the last 64 samples of the PREVIOUS
   window (the "context"), so the real model input is 576 samples. Omit the context
-  and the model scores real speech near 0.0 — found the hard way in Phase 2, now
+  and the model scores real speech near 0.0 — found the hard way, now
   pinned by a regression test on real audio. One inference is ~0.1-0.5 ms on CPU.
 - VadGate turns raw per-window speech probabilities into debounced start/stop
   events via hysteresis: `start_windows` consecutive windows >= start_prob to

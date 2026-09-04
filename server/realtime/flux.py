@@ -1,7 +1,7 @@
-"""Deepgram Flux client (v2/listen): model-integrated end-of-turn. Phase 5c.
+"""Deepgram Flux client (v2/listen): model-integrated end-of-turn.
 
 ## How this works
-Flux is the road we deliberately didn't take in Phase 2, now built as a live
+Flux is the alternative to the custom endpointer, built as a live
 A/B: a conversational STT model whose turn-taking is acoustic + semantic and
 lives INSIDE the model. One wss connection to /v2/listen; binary frames go up;
 TurnInfo events come down:
