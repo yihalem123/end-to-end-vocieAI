@@ -26,6 +26,14 @@ from fastapi import WebSocket, WebSocketDisconnect
 from server.config import Settings
 from server.engine.intents import EndCallIntent, classify_end_call_intent
 from server.metrics import registry
+from server.realtime.client_events import (
+    ClientChat,
+    ClientCleared,
+    ClientPlaybackDrained,
+    ClientPlaybackOverflow,
+    ClientPlaybackStarted,
+    parse_client_message,
+)
 from server.realtime.asr import (
     FINALIZE,
     AsrFinal,
@@ -60,33 +68,6 @@ TICK_SEC = 0.025
 AUDIO_QUEUE_FRAMES = 250
 EVENT_RELIABLE_LIMIT = 256
 PARTIAL_UI_INTERVAL_SEC = 0.05
-
-
-@dataclass(frozen=True)
-class ClientCleared:
-    generation_id: int
-    played_samples: int
-
-
-@dataclass(frozen=True)
-class ClientPlaybackDrained:
-    generation_id: int
-
-
-@dataclass(frozen=True)
-class ClientPlaybackStarted:
-    generation_id: int
-
-
-@dataclass(frozen=True)
-class ClientPlaybackOverflow:
-    generation_id: int
-    played_samples: int
-
-
-@dataclass(frozen=True)
-class ClientChat:
-    text: str
 
 
 @dataclass
@@ -229,36 +210,9 @@ class CallSession:
             self._offer_audio(None, force=True)  # ASR must always get CloseStream
 
     def _handle_client_json(self, text: str) -> None:
-        try:
-            msg = json.loads(text)
-        except json.JSONDecodeError:
-            return
-        try:
-            match msg.get("type"):
-                case "cleared":
-                    generation = int(msg.get("generation_id", 0))
-                    if generation > 0:
-                        self._offer_event(ClientCleared(
-                            generation, max(0, int(msg.get("played_samples", 0)))))
-                case "playback_drained":
-                    generation = int(msg.get("generation_id", 0))
-                    if generation > 0:
-                        self._offer_event(ClientPlaybackDrained(generation))
-                case "playback_started":
-                    generation = int(msg.get("generation_id", 0))
-                    if generation > 0:
-                        self._offer_event(ClientPlaybackStarted(generation))
-                case "playback_overflow":
-                    generation = int(msg.get("generation_id", 0))
-                    if generation > 0:
-                        self._offer_event(ClientPlaybackOverflow(
-                            generation, max(0, int(msg.get("played_samples", 0)))))
-                case "chat":
-                    chat_text = str(msg.get("text", "")).strip()
-                    if chat_text:
-                        self._offer_event(ClientChat(chat_text))
-        except (TypeError, ValueError):
-            return  # malformed client control messages never kill the call
+        event = parse_client_message(text)
+        if event is not None:
+            self._offer_event(event)
 
     def _offer_audio(self, frame: bytes | None, force: bool = False) -> None:
         try:
