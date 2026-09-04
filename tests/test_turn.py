@@ -579,3 +579,21 @@ def test_engine_client_speaks_http2(monkeypatch) -> None:
     engine, _state = _engine_with_state()
     assert seen.get("http2") is True
     asyncio.run(engine.close())
+
+
+def test_extraction_instructions_accept_hedged_answers() -> None:
+    # Live: "I guess so." was treated as uncertainty, never recorded, and the
+    # night-shift question was asked three times in a row.
+    from server.engine.plan import load_plan
+    from server.engine.prompt import build_extraction_instructions
+
+    text = build_extraction_instructions(load_plan(PLAN_PATH))
+    assert "hedged but substantive answer is evidence" in text
+    assert "true or false" in text
+
+
+def test_speech_instructions_tell_the_model_a_hedge_is_an_answer() -> None:
+    from server.engine.plan import load_plan
+    from server.engine.prompt import build_instructions
+
+    assert "hedged answer" in build_instructions(load_plan(PLAN_PATH))

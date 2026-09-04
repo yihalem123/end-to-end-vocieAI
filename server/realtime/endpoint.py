@@ -35,6 +35,8 @@ _TERMINAL = (".", "!", "?")
 _TRAILING_WORDS = frozenset(
     "and but or so to of in on at with for from the a an um uh like because "
     "if when while my your our their his her its i "
+    # Approximators are always followed by the number: "I think around".
+    "about around roughly approximately "
     # Copulas/auxiliaries: unpunctuated "...my license is" is nearly always a
     # thought in flight. (Punctuated finals take the fast tier before this
     # check, so "I said that." is unaffected.) Found by the simulated caller.
@@ -56,7 +58,8 @@ _EDGE_PUNCT = '"' + "'" + "()[]{}"  # quote/bracket edges ASR sometimes attaches
 # trailing when unpunctuated ("my license is") but complete short answers
 # when punctuated ("Yes, I can.", "It is."), so they are not listed here.
 _NEVER_FINAL = frozenset(
-    "and but or so to of in on at with for from the a an um uh like because "
+    # "so" is absent on purpose: "I guess so." / "I think so." are complete.
+    "and but or to of in on at with for from the a an um uh like because "
     "if when while my your our their his her its "
     "i'm it's we're they're you're i've we've i'd we'd that's there's he's she's".split()
 )

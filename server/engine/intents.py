@@ -33,6 +33,9 @@ def classify_end_call_intent(text: str) -> EndCallIntent | None:
     direct = (
         r"\b(?:end|stop) (?:this |the )?(?:call|interview|screening)\b",
         r"\bhang up\b",
+        # A farewell as the LAST thing said ("Not sure. Bye.") ends the call;
+        # "bye the way" does not.
+        r"(?:^| )(?:bye|goodbye)(?: now)?$",
         r"\b(?:do not|don t|no longer) want to continue (?:with )?"
         r"(?:this |the )?(?:call|interview|screening)\b",
         r"\bi want (?:you )?to (?:end|stop) (?:this |the )?"

@@ -210,3 +210,26 @@ def test_a_real_sentence_ending_still_takes_the_fast_tier() -> None:
     ep.on_vad_stop(t=1.0)
     turn = ep.tick(t=1.0 + FAST + 0.01)
     assert turn is not None and turn.reason == "fast"
+
+
+def test_a_hedged_sentence_ending_in_so_is_complete() -> None:
+    # Live: "I guess so." / "I think so." took the 2.5 s trailing tier three
+    # turns in a row. Sentence-final "so" is an adverb, not a conjunction.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("I guess so.", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    turn = ep.tick(t=1.0 + FAST + 0.01)
+    assert turn is not None and turn.reason == "fast"
+
+
+def test_an_approximator_holds_for_the_number() -> None:
+    # Live: "I don't know. I think around" was cut at the slow tier and the
+    # caller's "Eight years?" then landed as a barge-in.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("I don't know. I think around", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)
+    assert turn is not None and turn.reason == "trailing"

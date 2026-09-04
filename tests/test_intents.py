@@ -8,6 +8,9 @@ from server.engine.intents import EndCallIntent, classify_end_call_intent
     "I want you to end this call.",
     "Please hang up.",
     "Stop the interview.",
+    "Bye.",
+    "Okay, goodbye.",
+    "And not sure. Bye.",
     "I do not want to continue this interview.",
     "stop",
 ])
@@ -33,6 +36,7 @@ def test_observed_asr_confusion_requires_confirmation(text: str) -> None:
     "It is cold in Delaware.",
     "I worked in the cold storage unit.",
     "Please tell me about the role.",
+    "Bye the way, I have a question.",
     "I want to stop working nights.",
     "I want to stop doing night shifts.",
     "I do not want to continue night shifts.",
