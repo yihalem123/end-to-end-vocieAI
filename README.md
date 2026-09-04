@@ -91,18 +91,22 @@ no question text lives in code or prompts.
 
 ## Measured results
 
-Measured on one developer machine against live vendors; run the simulator to
-reproduce on yours.
+Same simulated call, same code, two places it ran — live vendors both times. The
+deployed instance sits in `iad` next to the speech and LLM vendors; the laptop
+paid the server-to-vendor round trips on every stage.
 
-| Metric | Value | Context |
+| Metric | Deployed on Fly (`iad`) | Developer laptop |
 |---|---|---|
-| endpoint_delay p50 | **~360 ms** | custom endpointer, live |
-| llm_ttft p50 | **~1.2 s** | commit → first text token; the dominant stage (~60%) |
-| tts_ttfb p50 | ~430 ms | Aura-2, warm socket |
-| **turn_latency p50** | **~2.1 s** | vad stop → first audio frame |
-| greeting → first audio | 2735 → **942 ms** | TTS socket pre-opened on page load (paired A/B, 4/4) |
-| first turn's API handshake | 1498 → **838 ms** | connection warmed during the greeting (paired A/B, n=10, 10/10) |
-| browser loopback RTT | ~1 ms | 670 frames, localhost |
+| endpoint_delay p50 (vad stop → commit) | **209 ms** | ~350 ms |
+| llm_ttft p50 (commit → first token) | **812 ms** | ~1.2–1.5 s |
+| tts_ttfb p50 (sentence → first audio byte) | **46 ms** | ~450 ms |
+| **turn_latency p50 (vad stop → first audio frame)** | **1252 ms** | ~2.1–2.7 s |
+| greeting → first audio | — | 2735 → **942 ms** with the TTS socket pre-opened (paired A/B, 4/4) |
+| first turn's API handshake | — | 1498 → **838 ms** by warming during the greeting (paired, n=10, 10/10) |
+| browser loopback RTT | — | ~1 ms, 670 frames |
+
+Try it: `SCREENER_SERVER=<host> python scripts/simulate_caller.py` runs the gate
+against any deployment and `/metrics` reports the per-stage percentiles.
 
 What was measured and **not** adopted, because the numbers said no:
 
