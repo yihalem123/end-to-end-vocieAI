@@ -165,3 +165,11 @@ def test_twiml_rejects_an_unsigned_request_when_a_token_is_configured() -> None:
         ok = client.post("/twilio/voice", data={"CallSid": "CA1"},
                          headers={"X-Twilio-Signature": good})
     assert ok.status_code == 200
+
+
+def test_console_socket_scheme_follows_the_page() -> None:
+    # Served over https (ngrok, Fly) the socket must be wss; a hard-coded ws://
+    # is blocked by the browser as mixed content and the console never connects.
+    source = TestClient(app).get("/ws.js").text
+    assert "ws://${location.host}" not in source
+    assert 'location.protocol === "https:" ? "wss" : "ws"' in source

@@ -80,7 +80,10 @@ function connectWs() {
   callId = null;
   agentInitiated = false;
   sessionState = null;
-  ws = new WebSocket(`ws://${location.host}/ws/call?mode=${activeMode}`);
+  // Scheme follows the page: wss behind https (an ngrok/Fly origin), ws on
+  // plain localhost. A hard-coded ws:// is blocked as mixed content over https.
+  const scheme = location.protocol === "https:" ? "wss" : "ws";
+  ws = new WebSocket(`${scheme}://${location.host}/ws/call?mode=${activeMode}`);
   ws.binaryType = "arraybuffer";
   ws.onmessage = (e) => {
     if (typeof e.data === "string") handleEvent(JSON.parse(e.data));
