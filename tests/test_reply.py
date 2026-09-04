@@ -13,11 +13,13 @@ from server.realtime.reply import (
     drain_wait_seconds,
     wait_for_playback_drain,
 )
+from server.realtime.extraction import ExtractionQueue
+from server.realtime.speculation import SpeculationSlot, spoken_eq
 from server.realtime.supervisor import GenerationSupervisor
 
 def test_speculation_identity_preserves_meaningful_punctuation() -> None:
-    assert reply_module._spoken_eq("Five years", "five years.")
-    assert not reply_module._spoken_eq("No, nights.", "No nights.")
+    assert spoken_eq("Five years", "five years.")
+    assert not spoken_eq("No, nights.", "No nights.")
 
 
 def test_drain_wait_is_expected_remaining_plus_bounded_margin() -> None:
@@ -183,14 +185,11 @@ def _controller(events, engine):
     controller._speaker = GatedSpeaker(events["log"])
     controller._supervisor = GenerationSupervisor()
     controller._drained = {}
-    controller._spec = None
+    controller._speculation = SpeculationSlot(controller._supervisor)
     controller._active_voice_generation = None
     controller._audible_generation = None
     controller._browser_turn_anchors = {}
-    controller._committed_turns = set()
-    controller._extraction_tasks = set()
-    controller._extraction_tail = None
-    controller._closed = False
+    controller._extraction = ExtractionQueue(engine, events["send"], None)
     controller._metric_prefix = ""
     controller._call_id = "test-call"
     controller._state = SimpleNamespace(conversation=[])
@@ -236,7 +235,7 @@ def test_speculation_promotes_without_restart_and_gates_audio(monkeypatch) -> No
         controller = _controller({"send": send, "log": log}, FakeLlm())
         now = time.monotonic()
         await controller.speculate("Hello there.", turn_id=5)
-        spec_generation = controller._spec["token"].generation_id
+        spec_generation = controller._speculation.current["token"].generation_id
         await asyncio.sleep(0.05)  # engine+tts run warm...
         assert "engine-done" in log
         assert not any(isinstance(e, tuple) for e in log)  # ...but NO audio released
@@ -275,13 +274,13 @@ def test_committed_extraction_survives_agent_reply_interruption() -> None:
         controller = _controller({"send": send, "log": []}, engine)
         token = await controller._supervisor.start(
             8, lambda _owned: asyncio.sleep(10))
-        controller._queue_extraction(token, "Night shifts work for me.")
+        controller._extraction.queue(token, "Night shifts work for me.")
         await engine.started.wait()
 
         # Barge-in invalidates agent playback, not the committed caller turn.
         await controller._supervisor.cancel_current()
         engine.release.set()
-        await controller._extraction_tail
+        await controller._extraction.tail
         assert engine.applied is True
 
     asyncio.run(run())
@@ -309,18 +308,18 @@ def test_committed_extractions_run_in_caller_turn_order() -> None:
         controller = _controller({"send": send, "log": []}, engine)
         first = await controller._supervisor.start(
             10, lambda _owned: asyncio.sleep(10))
-        controller._queue_extraction(first, "first answer")
+        controller._extraction.queue(first, "first answer")
         await engine.first_started.wait()
 
         await controller._supervisor.cancel_current()
         second = await controller._supervisor.start(
             11, lambda _owned: asyncio.sleep(10))
-        controller._queue_extraction(second, "second answer")
+        controller._extraction.queue(second, "second answer")
         await asyncio.sleep(0)
         assert engine.extractions == ["first answer"]
 
         engine.release_first.set()
-        await controller._extraction_tail
+        await controller._extraction.tail
         assert engine.extractions == ["first answer", "second answer"]
         await controller._supervisor.cancel_current()
 
@@ -348,7 +347,7 @@ def test_speculation_mismatch_cancels_and_runs_fresh(monkeypatch) -> None:
         await controller.on_turn(turn, 5)
         await asyncio.wait_for(done.wait(), timeout=0.5)
         assert engine.transcripts == ["I think maybe.", "I think maybe not."]
-        assert controller._spec is None
+        assert controller._speculation.current is None
         # exactly one release, for the fresh (non-gated) generation
         assert len([e for e in log if isinstance(e, tuple)]) == 1
 
@@ -416,8 +415,8 @@ def test_tool_failures_are_returned_to_reply_orchestration() -> None:
         controller = _controller({"send": send, "log": log}, RejectingLlm())
         token = await controller._supervisor.start(7, lambda _owned: asyncio.sleep(10))
         lines = [line async for line in controller._sentences_for(token, "unclear")]
-        controller._queue_extraction(token, "unclear")
-        await controller._extraction_tail
+        controller._extraction.queue(token, "unclear")
+        await controller._extraction.tail
         await controller._supervisor.cancel_current()
         assert lines == ["Reply to: unclear"]
         assert sent[0]["type"] == "tool_failures"
