@@ -511,3 +511,71 @@ def test_warm_connection_never_fails_a_call() -> None:
         await engine.warm_connection()      # best effort: must not raise
 
     asyncio.run(run())
+
+
+
+def test_speech_request_can_opt_into_a_priority_tier_and_extraction_never_does() -> None:
+    # The tier is billed at a premium and measured as a wash on the real prompt
+    # (see config.py), so it is opt-in; when set, only the request the caller
+    # is waiting on carries it.
+    engine, state = _engine_with_state()
+    engine._settings.openai_speech_service_tier = "priority"
+    captured: list[dict] = []
+
+    async def stream(body):
+        captured.append(body)
+        yield 'data: {"type":"response.output_text.delta","delta":"Okay."}'
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        [line async for line in engine.respond("yes")]
+        await engine.extract("yes")
+        speech, evidence = captured
+        assert speech["service_tier"] == "priority"
+        assert "service_tier" not in evidence
+        await engine.close()
+
+    asyncio.run(run())
+
+
+def test_no_service_tier_is_sent_by_default() -> None:
+    from server.config import Settings
+    from server.engine.plan import InterviewState, load_plan
+    from server.engine.turn import LlmEngine
+
+    settings = Settings(_env_file=None, openai_api_key="k")
+    assert settings.openai_speech_service_tier == "default"
+    engine = LlmEngine(settings, InterviewState(load_plan(PLAN_PATH)))
+    captured: list[dict] = []
+
+    async def stream(body):
+        captured.append(body)
+        yield "data: [DONE]"
+
+    engine._stream_lines = stream
+
+    async def run() -> None:
+        [line async for line in engine.respond("yes")]
+        assert "service_tier" not in captured[0]
+        await engine.close()
+
+    asyncio.run(run())
+
+
+def test_engine_client_speaks_http2(monkeypatch) -> None:
+    import httpx
+    from server.engine import turn as turn_module
+
+    seen: dict = {}
+    real = httpx.AsyncClient
+
+    def spy(*args, **kwargs):
+        seen.update(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(turn_module.httpx, "AsyncClient", spy)
+    engine, _state = _engine_with_state()
+    assert seen.get("http2") is True
+    asyncio.run(engine.close())

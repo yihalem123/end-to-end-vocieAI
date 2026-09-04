@@ -49,6 +49,15 @@ ENGINE_CONNECT_TIMEOUT_SEC = 10.0
 ENGINE_READ_TIMEOUT_SEC = 20.0
 
 
+def _make_client() -> httpx.AsyncClient:
+    # HTTP/2, not 1.1: on a warm connection the same streamed request reached
+    # its first token in 926 ms vs 1294 ms (paired, n=10, faster 8/10). One
+    # multiplexed connection also lets the concurrent evidence request share
+    # the socket the greeting already warmed.
+    return httpx.AsyncClient(http2=True, timeout=httpx.Timeout(
+        30.0, connect=ENGINE_CONNECT_TIMEOUT_SEC, read=ENGINE_READ_TIMEOUT_SEC))
+
+
 class LlmEngine:
     def __init__(self, settings: Settings, state: InterviewState,
                  call_id: str = "unassigned") -> None:
@@ -59,9 +68,7 @@ class LlmEngine:
         self.last_cached_tokens = 0
         self.last_cache_write_tokens = 0
         self.last_tool_results: list[dict] = []
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(
-            30.0, connect=ENGINE_CONNECT_TIMEOUT_SEC,
-            read=ENGINE_READ_TIMEOUT_SEC))
+        self._client = _make_client()
 
     async def warm_connection(self) -> None:
         """Establish the API connection before the first turn needs it.
@@ -130,6 +137,9 @@ class LlmEngine:
         }
         if self._settings.turn_model.startswith("gpt-5"):
             body["reasoning"] = {"effort": "none"}  # TTFT is dominated by effort
+        tier = self._settings.openai_speech_service_tier
+        if tier and tier != "default":
+            body["service_tier"] = tier  # speech only; see config.py for the numbers
         chunker = SentenceChunker()
         assembler = StreamAssembler()
         reply_parts: list[str] = []
