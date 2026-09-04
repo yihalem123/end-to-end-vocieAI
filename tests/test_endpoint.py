@@ -184,3 +184,29 @@ def test_pending_complete_gates_speculation() -> None:
     assert ep.pending_complete is True         # armed + complete: speculate
     ep.on_asr_final("And also", t=1.2)
     assert ep.pending_complete is False        # transcript no longer complete
+
+
+def test_terminal_punctuation_after_a_trailing_word_is_not_complete() -> None:
+    # Live regression on the phone leg (2026-09-02): on 8 kHz audio Deepgram
+    # punctuated the fragment as "Yeah. Sure. I mean, if." and the fast tier
+    # fired at 250 ms, splitting the answer. A terminal after a conjunction,
+    # preposition, filler or copula is a mid-thought pause the ASR guessed
+    # wrong about, not an ending: it earns the trailing tier, not the fast one.
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("Yeah. Sure. I mean, if.", t=1.0)
+    ep.on_vad_stop(t=1.0)
+    assert ep.tick(t=1.0 + FAST + 0.1) is None           # fast tier must NOT fire
+    assert ep.tick(t=1.0 + SLOW + 0.1) is None           # nor the slow tier
+    turn = ep.tick(t=1.0 + TRAILING + 0.01)
+    assert turn is not None
+    assert turn.reason == "trailing"
+
+
+def test_a_real_sentence_ending_still_takes_the_fast_tier() -> None:
+    ep = make()
+    ep.on_vad_start(t=0.0)
+    ep.on_asr_final("No, nights are fine for me.", t=1.0)   # "me" is not a trailing word
+    ep.on_vad_stop(t=1.0)
+    turn = ep.tick(t=1.0 + FAST + 0.01)
+    assert turn is not None and turn.reason == "fast"

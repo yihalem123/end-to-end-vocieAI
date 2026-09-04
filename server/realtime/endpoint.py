@@ -50,19 +50,45 @@ _TRAILING_CONTRACTIONS = frozenset({
 })
 
 
+_EDGE_PUNCT = '"' + "'" + "()[]{}"  # quote/bracket edges ASR sometimes attaches
+# Words that cannot end a sentence even when the ASR puts a period after
+# them. Deliberately NARROWER than _TRAILING_WORDS: copulas and modals are
+# trailing when unpunctuated ("my license is") but complete short answers
+# when punctuated ("Yes, I can.", "It is."), so they are not listed here.
+_NEVER_FINAL = frozenset(
+    "and but or so to of in on at with for from the a an um uh like because "
+    "if when while my your our their his her its "
+    "i'm it's we're they're you're i've we've i'd we'd that's there's he's she's".split()
+)
+
+
+def _last_word(text: str) -> str:
+    """Last token with surrounding punctuation stripped, lower-cased."""
+    words = text.rstrip().rstrip("".join(_TERMINAL)).split()
+    return words[-1].lower().strip(_EDGE_PUNCT) if words else ""
+
+
 def looks_complete(text: str) -> bool:
-    return text.rstrip().endswith(_TERMINAL)
+    """Terminal punctuation AND a last word that can end a thought.
+
+    ASR punctuates confidently even when it guesses: on narrowband (phone)
+    audio Deepgram produced "Yeah. Sure. I mean, if." and the fast tier cut
+    the answer in half (found by the Twilio-protocol simulator). A period after
+    a conjunction, preposition, article, filler or possessive is a mid-thought
+    pause, so it is handed to the trailing tier instead. Modals and copulas
+    are NOT overridden: "Yes, I can." is a complete answer."""
+    text = text.rstrip()
+    if not text.endswith(_TERMINAL):
+        return False
+    return _last_word(text) not in _NEVER_FINAL
 
 
 def looks_trailing(text: str) -> bool:
     text = text.rstrip()
     if text.endswith((",", ";", ":")):
         return True  # mid-clause punctuation: the strongest "still going" cue
-    words = text.split()
-    if not words:
-        return False
-    last = words[-1].lower().strip('"\'()[]{}')
-    return last in _TRAILING_WORDS or last in _TRAILING_CONTRACTIONS
+    last = _last_word(text)
+    return bool(last) and (last in _TRAILING_WORDS or last in _TRAILING_CONTRACTIONS)
 
 
 @dataclass(frozen=True)
