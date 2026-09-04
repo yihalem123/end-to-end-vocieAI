@@ -14,9 +14,6 @@ extend-exclude = ["design", "models"]
 [tool.ruff.lint]
 select = ["E", "F", "W"]
 
-[tool.ruff.lint.per-file-ignores]
-# HTML-in-Python; being replaced by a Jinja template.
-"server/postcall/report_view.py" = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

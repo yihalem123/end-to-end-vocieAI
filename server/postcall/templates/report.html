@@ -1,0 +1,179 @@
+<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Call report {{ call_id[:12] }}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet">
+<style>
+* { margin:0; padding:0; box-sizing:border-box }
+body {
+  /* light — the main theme */
+  --bg:#f6f7fb; --card:#ffffff; --sub-card:rgba(16,18,30,.03);
+  --line:rgba(16,18,30,.12); --line-soft:rgba(16,18,30,.08);
+  --ink:#171923; --strong:#171923;
+  --dim:rgba(23,25,35,.6); --dim2:rgba(23,25,35,.5); --faint:rgba(23,25,35,.38);
+  --acc:#5b6ae8; --acc-text:#4c5ae0; --acc-strong:#3a46b8;
+  --acc-bg:rgba(91,106,232,.08); --acc-border:rgba(91,106,232,.35);
+  --acc-glow:0 0 12px rgba(91,106,232,.45);
+  --good:#1a9e4b; --good-bg:rgba(26,158,75,.08); --good-border:rgba(26,158,75,.3);
+  --warn:#b07714; --warn-bg:rgba(176,119,20,.07); --warn-border:rgba(176,119,20,.3);
+  --bad:#d13438; --bad-bg:rgba(209,52,56,.06); --bad-border:rgba(209,52,56,.35);
+  --tile-good-bg:linear-gradient(160deg,rgba(91,106,232,.14),rgba(91,106,232,.03));
+  --tile-bad-bg:linear-gradient(160deg,rgba(209,52,56,.1),rgba(209,52,56,.02));
+  --tile-warn-bg:linear-gradient(160deg,rgba(176,119,20,.1),rgba(176,119,20,.02));
+  --dot-idle:#c6cadb; --track:rgba(16,18,30,.06);
+  --bar:linear-gradient(90deg,rgba(91,106,232,.85),rgba(91,106,232,.45));
+  background:var(--bg); color:var(--ink);
+  font-family:'Space Grotesk',system-ui,sans-serif;
+}
+body:has(#themeToggle:checked) {
+  --bg:#0a0b10; --card:#0d0e15; --sub-card:rgba(255,255,255,.02);
+  --line:rgba(255,255,255,.07); --line-soft:rgba(255,255,255,.05);
+  --ink:#e8e9f0; --strong:#f2f3fa;
+  --dim:rgba(232,233,240,.55); --dim2:rgba(232,233,240,.5);
+  --faint:rgba(232,233,240,.4);
+  --acc:#7c8cf8; --acc-text:#a3aefb; --acc-strong:#c3caff;
+  --acc-bg:rgba(124,140,248,.08); --acc-border:rgba(124,140,248,.3);
+  --acc-glow:0 0 12px rgba(124,140,248,.5);
+  --good:#6ee787; --good-bg:rgba(110,231,135,.1); --good-border:rgba(110,231,135,.3);
+  --warn:#e5b96d; --warn-bg:rgba(229,168,72,.06); --warn-border:rgba(229,168,72,.3);
+  --bad:#f28488; --bad-bg:rgba(229,72,77,.07); --bad-border:rgba(229,72,77,.35);
+  --tile-good-bg:linear-gradient(160deg,rgba(124,140,248,.16),rgba(124,140,248,.04));
+  --tile-bad-bg:linear-gradient(160deg,rgba(229,72,77,.14),rgba(229,72,77,.03));
+  --tile-warn-bg:linear-gradient(160deg,rgba(229,168,72,.12),rgba(229,168,72,.03));
+  --dot-idle:#3d4361; --track:rgba(255,255,255,.07);
+  --bar:linear-gradient(90deg,rgba(124,140,248,.85),rgba(124,140,248,.45));
+}
+.wrap { display:flex; justify-content:center; padding:28px 32px 80px }
+.col { width:1080px; max-width:100%; display:flex; flex-direction:column; gap:16px }
+.grid { display:grid; grid-template-columns:200px 1fr 1fr 1fr; gap:14px }
+.card { background:var(--card); border:1px solid var(--line-soft); border-radius:14px }
+.label { font:600 12px 'Space Grotesk'; letter-spacing:.08em; text-transform:uppercase;
+         color:var(--dim2) }
+.score-tile { grid-row:span 2; border-radius:14px; padding:20px; display:flex;
+              flex-direction:column; justify-content:space-between; border:1px solid;
+              min-height:170px }
+.score-big { font:700 52px/1 'Space Grotesk'; color:var(--strong); letter-spacing:-.03em }
+.id-card { grid-column:span 3; padding:16px 20px; display:flex; align-items:center;
+           justify-content:space-between; gap:16px }
+.mark { width:26px; height:26px; border-radius:8px;
+        background:linear-gradient(135deg,#7c8cf8,#4c5ae0); flex:none }
+.stat { padding:14px 18px; display:flex; flex-direction:column; gap:3px }
+.stat b { font:600 26px 'Space Grotesk' }
+.stat small { font-size:15px; color:var(--faint) }
+.state-chip { padding:6px 14px; border-radius:100px; font:500 12.5px 'Space Grotesk';
+              border:1px solid; flex:none }
+.theme-pill { display:flex; align-items:center; gap:8px; padding:6px 8px 6px 12px;
+              border-radius:100px; border:1px solid var(--line);
+              background:var(--sub-card); cursor:pointer; user-select:none; flex:none }
+.theme-pill input { display:none }
+.theme-pill .lbl { font:500 12.5px 'Space Grotesk'; color:var(--dim) }
+.theme-pill .track { position:relative; width:32px; height:18px; border-radius:100px;
+                     background:var(--line); transition:background .2s }
+.theme-pill .knob { position:absolute; top:2px; left:2px; width:14px; height:14px;
+                    border-radius:50%; background:#fff; transition:left .2s }
+.theme-pill:has(input:checked) .track { background:var(--acc) }
+.theme-pill:has(input:checked) .knob { left:16px }
+.tl-wrap { position:relative; padding-left:34px; display:flex; flex-direction:column;
+           gap:22px }
+.tl-line { position:absolute; left:11px; top:6px; bottom:6px; width:2px;
+           background:linear-gradient(180deg,var(--acc-border),transparent) }
+.tl-row { position:relative }
+.tl-dot { position:absolute; left:-30px; top:4px; width:10px; height:10px;
+          border-radius:50%; border:2px solid var(--bg) }
+.tl-who { font:600 10.5px 'Space Grotesk'; letter-spacing:.08em;
+          text-transform:uppercase; margin-bottom:4px }
+.intr { color:var(--warn); text-transform:none; letter-spacing:0 }
+.tl-text { font:400 14.5px/1.55 'Space Grotesk'; max-width:720px }
+.chip { margin-top:10px; max-width:720px; padding:12px 16px; border-radius:12px;
+        border:1px solid; display:flex; align-items:center; gap:16px; flex-wrap:wrap }
+.chip-label { font:600 11px 'Space Grotesk'; letter-spacing:.08em; text-transform:uppercase }
+.chip-val { font:500 12.5px ui-monospace,Menlo,monospace }
+.chip-status { font:500 12px 'Space Grotesk' }
+.pad { padding:22px 32px; display:flex; flex-direction:column; gap:14px }
+.card-head { display:flex; align-items:baseline; justify-content:space-between }
+.sigma { font:600 13px ui-monospace,Menlo,monospace; color:var(--acc-text) }
+.bk-row { display:grid; grid-template-columns:180px 1fr 170px; align-items:center; gap:14px }
+.bk-name { font:500 12.5px ui-monospace,Menlo,monospace; color:var(--dim) }
+.bk-track { height:20px; border-radius:6px; background:var(--track);
+            overflow:hidden; position:relative }
+.bk-fill { position:absolute; inset:0; background:var(--bar); border-radius:6px }
+.bk-math { font:500 12px ui-monospace,Menlo,monospace; color:var(--dim2);
+           text-align:right }
+details.card summary { list-style:none; cursor:pointer; padding:18px 32px;
+                       display:flex; justify-content:space-between }
+details.card summary::-webkit-details-marker { display:none }
+details.card summary::after { content:"▾"; color:var(--faint); font-size:14px }
+details[open].card summary::after { content:"▴" }
+.au-body { padding:0 32px 20px; display:flex; flex-direction:column; gap:8px }
+.au-row { display:grid; grid-template-columns:80px 260px 1fr; gap:12px;
+          align-items:baseline; padding:9px 12px; border-radius:8px;
+          background:var(--sub-card); border:1px solid var(--line-soft) }
+.au-status { font:600 11px 'Space Grotesk'; letter-spacing:.06em; text-transform:uppercase }
+.au-tool { font:500 12px ui-monospace,Menlo,monospace; color:var(--dim) }
+.au-reason { font:400 12.5px/1.5 'Space Grotesk'; color:var(--dim2) }
+.dl-body { padding:0 32px 20px; display:flex; flex-wrap:wrap; gap:8px }
+.lat-body { padding:0 32px 20px; display:flex; flex-direction:column; gap:2px }
+.lat-row { display:grid; grid-template-columns:minmax(96px,1.1fr) minmax(0,2fr) 82px 96px;
+           align-items:baseline; gap:10px; padding:7px 0;
+           border-bottom:1px solid var(--line-soft) }
+.lat-row:last-child { border-bottom:none }
+.lat-name { font:500 12.5px 'Space Grotesk'; color:var(--ink) }
+.lat-meaning { font:400 11.5px 'Space Grotesk'; color:var(--dim) }
+.lat-val { font:500 13px ui-monospace,Menlo,monospace; color:var(--ink); text-align:right }
+.lat-p95 { font:400 11.5px ui-monospace,Menlo,monospace; color:var(--dim); text-align:right }
+@media (max-width:560px) {
+  /* Drop the explanation, keep name + p50 + p95 on ONE line: a 2-column
+     fallback wrapped p95 onto a row of its own. */
+  .lat-row { grid-template-columns:1fr auto auto; gap:12px }
+  .lat-meaning { display:none }
+}
+.dl { padding:6px 11px; border-radius:100px; background:var(--sub-card);
+      border:1px solid; font:500 12px ui-monospace,Menlo,monospace; white-space:nowrap }
+.flags { padding:14px 32px; font:400 13px 'Space Grotesk'; color:var(--dim) }
+.advisory { font:500 11px 'Space Grotesk'; letter-spacing:.06em;
+            text-transform:uppercase; color:var(--warn) }
+.ai-title { font:600 13px 'Space Grotesk'; color:var(--acc-strong); margin-bottom:4px }
+.ai-text { font:400 13.5px/1.6 'Space Grotesk'; color:var(--dim);
+           white-space:pre-line; max-width:860px }
+</style></head><body><div class="wrap"><div class="col">
+<div class="grid">
+  <div class="score-tile" style="background:{{ verdict.tile_bg }};border-color:{{ verdict.tile_border }}">
+    <span class="label" style="color:{{ verdict.tile_label }}">{{ verdict.label }}</span>
+    <span class="score-big">{{ verdict.big }}</span>
+    <span style="font:500 12px 'Space Grotesk';color:{{ verdict.sub_col }}">{{ verdict.sub }}</span>
+  </div>
+  <div class="card id-card">
+    <div style="display:flex;align-items:center;gap:14px"><div class="mark"></div>
+      <div style="display:flex;flex-direction:column;gap:2px">
+        <span style="font:600 20px 'Space Grotesk';color:var(--strong)">Candidate — ICU Registered Nurse</span>
+        <span style="font:400 12.5px 'Space Grotesk';color:var(--faint)">call {{ call_id[:12] }} · {{ created_at }} · {{ turn_count }} turns</span>
+      </div></div>
+    <div style="display:flex;align-items:center;gap:12px">
+      <label class="theme-pill"><input type="checkbox" id="themeToggle">
+        <span class="lbl">Dark</span>
+        <span class="track"><span class="knob"></span></span></label>
+      <span class="state-chip" style="background:{{ state.bg }};border-color:{{ state.border }};color:{{ state.col }}">{{ state.name }}</span>
+    </div>
+  </div>
+  <div class="card stat"><span class="label">Verified fields</span>
+    <b>{{ stats.verified }}<small> / {{ stats.total or "—" }}</small></b></div>
+  <div class="card stat"><span class="label">Knockouts</span>
+    <b style="color:{{ stats.ko_col }}">{{ stats.knockouts }}</b></div>
+  <div class="card stat"><span class="label">Median delay</span>
+    <b>{{ stats.median_delay }}<small> ms</small></b></div>
+</div>
+{% if flags %}<div class="card flags"><span class="label">Flags</span> {{ flags }}</div>{% endif %}
+<div class="card" style="padding:28px 32px">
+  <div class="label" style="padding-bottom:22px">Call replay — every extraction anchored to the moment it was said</div>
+  <div class="tl-wrap"><div class="tl-line"></div>
+  {% for row in timeline %}<div class="tl-row"><span class="tl-dot" style="background:{{ row.dot }};box-shadow:{{ row.glow }}"></span><div class="tl-who" style="color:{{ row.who_col }}">{{ row.who }} {% if row.interrupted %}<span class="intr">⏹ interrupted</span>{% endif %}</div><div class="tl-text" style="color:{{ row.text_col }}">{{ row.text }}</div>{% for chip in row.chips %}{{ chip_html(chip) }}{% endfor %}</div>{% endfor %}
+  </div>
+</div>
+{% if unanchored %}<div class="card pad"><span class="label">Evidence without a transcript anchor</span>{% for chip in unanchored %}{{ chip_html(chip) }}{% endfor %}</div>{% endif %}
+{% if breakdown %}<div class="card pad"><div class="card-head"><span class="label">Score breakdown</span><span class="sigma">Σ {{ verdict.big }}</span></div>{% for row in breakdown %}<div class="bk-row"><span class="bk-name">{{ row.name }}</span><div class="bk-track"><div class="bk-fill" style="width:{{ row.pct }}%"></div></div><span class="bk-math">{{ row.math }}</span></div>{% endfor %}</div>{% endif %}
+{% if ai_notes %}<div class="card pad" style="border-style:dashed;border-color:var(--acc-border)"><div class="card-head"><span class="label">AI notes</span><span class="advisory">advisory — not part of the score</span></div>{% for note in ai_notes %}<div><div class="ai-title">{{ note.title }}</div><div class="ai-text">{{ note.text }}</div></div>{% endfor %}</div>{% endif %}
+{% if audit %}<details class="card"><summary><span class="label">Audit trail · {{ audit|length }} tool calls</span></summary><div class="au-body">{% for row in audit %}<div class="au-row"><span class="au-status" style="color:{{ row.col }}">{{ row.status }}</span><span class="au-tool">{{ row.tool }}</span><span class="au-reason">{{ row.reason }}</span></div>{% endfor %}</div></details>{% endif %}
+{% if latency %}<details class="card" open><summary><span class="label">Call quality · latency by stage</span></summary><div class="lat-body">{% for row in latency %}<div class="lat-row"><span class="lat-name" style="font-weight:{{ row.weight }}">{{ row.name }}</span><span class="lat-meaning">{{ row.meaning }}</span><span class="lat-val" style="font-weight:{{ row.weight }}">{{ row.p50 }} ms</span><span class="lat-p95">p95 {{ row.p95 }} ms</span></div>{% endfor %}</div></details>{% endif %}
+{% if delays %}<details class="card"><summary><span class="label">Call quality · per-turn endpoint delay</span></summary><div class="dl-body">{% for d in delays %}<span class="dl" style="color:{{ d.col }};border-color:{{ d.border }}">T{{ loop.index }} · {{ d.ms }} ms</span>{% endfor %}</div></details>{% endif %}
+</div></div></body></html>

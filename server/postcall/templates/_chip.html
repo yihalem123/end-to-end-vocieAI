@@ -1,0 +1,3 @@
+{% macro chip_html(c) -%}
+<div class="chip" style="background:{{ c.bg }};border-color:{{ c.border }}"><span class="chip-label" style="color:{{ c.label_col }}">{{ c.label }}</span><span class="chip-val" style="color:{{ c.val_col }}">{{ c.name }} = {{ c.value }}</span><span class="chip-status" style="color:{{ c.status_col }}">{{ c.status }}</span></div>
+{%- endmacro %}
