@@ -134,7 +134,7 @@ def test_postcall_completion_keeps_same_call_id_and_lifecycle(monkeypatch) -> No
 
 def test_browser_report_polling_never_uses_global_newest_call() -> None:
     client = TestClient(create_app(Settings(_env_file=None)))
-    source = client.get("/audio.js").text
+    source = client.get("/ws.js").text
     assert 'fetch("/calls")' not in source
     assert "/report/${encodeURIComponent(sessionCallId)}" in source
 

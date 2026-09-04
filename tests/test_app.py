@@ -43,7 +43,7 @@ def test_ws_echo_echoes_text() -> None:
 
 def test_browser_forwards_playback_started_ack() -> None:
     client = TestClient(app)
-    assert '"playback_started"' in client.get("/audio.js").text
+    assert '"playback_started"' in client.get("/audio-graph.js").text
     assert 'type: "playback_started"' in client.get("/playback-processor.js").text
 
 
@@ -85,7 +85,8 @@ def test_console_assets_are_never_cached() -> None:
     # debugging session (a fixed mic worklet appeared still broken), and it is
     # exactly how a demo take goes wrong.
     with TestClient(create_app(Settings(_env_file=None))) as client:
-        for path in ("/", "/audio.js", "/capture-processor.js"):
+        for path in ("/", "/console-ui.js", "/ws.js", "/audio-graph.js",
+                     "/capture-processor.js"):
             resp = client.get(path)
             assert resp.status_code == 200, path
             assert "no-store" in resp.headers.get("cache-control", ""), path
