@@ -104,7 +104,7 @@ are in `REHEARSAL.md` under *Measured negative results*.
 
 ## Verification
 
-- `pytest -q` — **327 offline tests**, no vendor calls. The browser capture worklet
+- `pytest -q` — **329 offline tests**, no vendor calls. The browser capture worklet
   runs as real JavaScript under Node (`tests/capture_harness.js`) because the
   simulator can never reach it — a mic regression once shipped while every Python
   test stayed green.
