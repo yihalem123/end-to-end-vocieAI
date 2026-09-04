@@ -234,6 +234,9 @@ class LlmEngine:
         generation_id: int | None = None,
         source_text: str = "",
     ) -> list[dict]:
+        # call_id defaults to "unassigned" (see __init__); a stale generation
+        # must be able to bail out before any identity is computed.
         return apply_tools(
-            self.state, calls, call_id=self._call_id, is_current=is_current,
+            self.state, calls, call_id=getattr(self, "_call_id", "unassigned"),
+            is_current=is_current,
             turn_id=turn_id, generation_id=generation_id, source_text=source_text)
